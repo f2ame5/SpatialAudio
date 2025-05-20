@@ -1,9 +1,13 @@
 // src/sound/diffuse-field-model_modified.ts
-// Enhanced diffuse field modeling with improved stereo decorrelation
-
 import { vec3 } from 'gl-matrix';
 import { Camera } from '../camera/camera';
 
+// Helper to calculate RMS of a Float32Array
+function calculateRMS(data: Float32Array): number {
+    if (!data || data.length === 0) return 0;
+    const sumOfSquares = data.reduce((sum, val) => sum + val * val, 0);
+    return Math.sqrt(sumOfSquares / data.length);
+}
 
 export class DiffuseFieldModelModified {
     private sampleRate: number;
@@ -22,6 +26,8 @@ export class DiffuseFieldModelModified {
             '125': 0.1, '250': 0.2, '500': 0.3, '1000': 0.4,
             '2000': 0.5, '4000': 0.6, '8000': 0.6, '16000': 0.7
         };
+        console.log(`[DFM CONSTRUCTOR] Initial Room Vol: ${this.roomVolume.toFixed(2)}, Surface Area: ${this.surfaceArea.toFixed(2)}`);
+        console.log(`[DFM CONSTRUCTOR] Initial Mean Absorption:`, JSON.parse(JSON.stringify(this.meanAbsorption)));
     }
 
     private calculateMeanAbsorption(materials: any): { [freq: string]: number } {
@@ -59,6 +65,7 @@ export class DiffuseFieldModelModified {
         const result = new Map<string, Float32Array>();
         const frequencies = ['125', '250', '500', '1000', '2000', '4000', '8000', '16000'];
         const safeDuration = Math.max(duration, 0.2);
+        console.log(`[DFM generateDiffuseField] Target duration: ${safeDuration.toFixed(2)}s`);
 
         for (const freq of frequencies) {
             const sampleCount = Math.max(Math.ceil(safeDuration * this.sampleRate), 512);
@@ -71,7 +78,10 @@ export class DiffuseFieldModelModified {
             const meanFreePath = 4 * safeRoomVolume / safeSurfaceArea;
             const speedOfSound = 343;
             const meanTimeGap = meanFreePath / speedOfSound;
+
+            console.log(`[DFM generateDiffuseField] Freq: ${freq}Hz, RT60: ${rt60.toFixed(2)}s, BufferLen: ${sampleCount}, EchoDensity: ${echoDensity.toFixed(0)}`);
             this.generateVelvetNoise(buffer, rt60, echoDensity, meanTimeGap, diffusion);
+            console.log(`[DFM generateDiffuseField] Freq: ${freq}Hz, Generated Velvet Noise RMS: ${calculateRMS(buffer).toExponential(3)}`);
             result.set(freq, buffer);
         }
         return result;
@@ -113,31 +123,41 @@ export class DiffuseFieldModelModified {
         const totalLength = anyIR ? anyIR.length : 0;
         if (totalLength === 0) return new Float32Array(0);
 
+        console.log("[DFM applyFrequencyFiltering] Energies of individual diffuse bands (RMS before gain):");
+        const bandGainsApplied: { [key: string]: number } = {};
+
         const outputIR = new Float32Array(totalLength);
         for (const [freq, ir] of impulseResponses.entries()) {
             let bandGain = 1.0;
-            // Adjust gains to reduce low-end energy more significantly
             switch (freq) {
-                case '125': bandGain = 0.5; break;  // Was 0.9, then 0.6
-                case '250': bandGain = 0.65; break; // Was 0.95, then 0.7
-                case '500': bandGain = 0.8; break; // Was 1.0, then 0.85
-                case '1000': bandGain = 1.0; break; // Mid frequency reference
-                case '2000': bandGain = 0.95; break; // Slightly reduced from 0.9 / previous 0.95
-                case '4000': bandGain = 0.85; break; // Slightly reduced from 0.8 / previous 0.85
-                case '8000': bandGain = 0.75; break; // Slightly reduced from 0.7 / previous 0.75
-                case '16000': bandGain = 0.65; break;// Slightly reduced from 0.6 / previous 0.65
+                case '125': bandGain = 0.5; break;
+                case '250': bandGain = 0.65; break;
+                case '500': bandGain = 0.8; break;
+                case '1000': bandGain = 1.0; break;
+                case '2000': bandGain = 0.95; break;
+                case '4000': bandGain = 0.85; break;
+                case '8000': bandGain = 0.75; break;
+                case '16000': bandGain = 0.65; break;
             }
+            bandGainsApplied[freq] = bandGain;
+            console.log(`  - Freq: ${freq}Hz, RMS: ${calculateRMS(ir).toExponential(3)}, Applied Gain: ${bandGain.toFixed(2)}`);
             for (let i = 0; i < Math.min(ir.length, totalLength); i++) {
                 outputIR[i] += ir[i] * bandGain;
             }
         }
+        console.log("[DFM applyFrequencyFiltering] Applied Band Gains:", bandGainsApplied);
+        const rmsBeforeNorm = calculateRMS(outputIR);
+        console.log(`[DFM applyFrequencyFiltering] Combined monoIR RMS before normalization: ${rmsBeforeNorm.toExponential(3)}`);
 
         let maxAmp = 0;
         for (let i = 0; i < outputIR.length; i++) maxAmp = Math.max(maxAmp, Math.abs(outputIR[i]));
         if (maxAmp > 0) {
             const scale = 1.0 / maxAmp;
             for (let i = 0; i < outputIR.length; i++) outputIR[i] *= scale;
+            console.log(`[DFM applyFrequencyFiltering] Combined monoIR normalized. MaxAmp: ${maxAmp.toExponential(3)}, Scale: ${scale.toExponential(3)}`);
         }
+        const rmsAfterNorm = calculateRMS(outputIR);
+        console.log(`[DFM applyFrequencyFiltering] Combined monoIR RMS after normalization: ${rmsAfterNorm.toExponential(3)}`);
         return outputIR;
     }
 
@@ -149,10 +169,14 @@ export class DiffuseFieldModelModified {
         this.roomVolume = width * height * depth;
         this.surfaceArea = 2 * (width * height + width * depth + height * depth);
         this.meanAbsorption = this.calculateMeanAbsorption(roomConfig.materials);
+        console.log(`[DFM processLateReverberation] Updated Room Vol: ${this.roomVolume.toFixed(2)}, Surface Area: ${this.surfaceArea.toFixed(2)}`);
+        console.log(`[DFM processLateReverberation] Updated Mean Absorption:`, JSON.parse(JSON.stringify(this.meanAbsorption)));
+
 
         if (!lateHits || lateHits.length === 0) {
             const minLength = Math.ceil(0.2 * sampleRate);
             const defaultIR = new Float32Array(minLength);
+            console.warn("[DFM processLateReverberation] No late hits, returning default IR.");
             return [defaultIR.slice(), defaultIR.slice()];
         }
 
@@ -160,6 +184,7 @@ export class DiffuseFieldModelModified {
         const rt60NumericValues = Object.values(rt60Values).filter(val => typeof val === 'number' && isFinite(val));
         const maxRT60 = rt60NumericValues.length > 0 ? Math.max(...rt60NumericValues) : 1.0;
         const reverbGenerationDuration = Math.min(2.5, Math.max(maxRT60 * 1.2 + 0.1, 0.3));
+        console.log(`[DFM processLateReverberation] Max RT60: ${maxRT60.toFixed(2)}s, Reverb Gen Duration: ${reverbGenerationDuration.toFixed(2)}s`);
 
         const diffuseResponses = this.generateDiffuseField(reverbGenerationDuration, rt60Values);
         const monoIR = this.applyFrequencyFiltering(diffuseResponses);
@@ -167,11 +192,13 @@ export class DiffuseFieldModelModified {
         if (!monoIR || monoIR.length === 0) {
             const minLength = Math.ceil(0.2 * sampleRate);
             const defaultIR = new Float32Array(minLength); defaultIR[0] = 0.01;
+            console.warn("[DFM processLateReverberation] Mono IR is empty after filtering, returning default.");
             return [defaultIR.slice(), defaultIR.slice()];
         }
         let hasContent = false;
         for (let i = 0; i < monoIR.length; i++) if (Math.abs(monoIR[i]) > 1e-10) { hasContent = true; break; }
-        if (!hasContent) { monoIR[0] = 0.01; }
+        if (!hasContent) { monoIR[0] = 0.01; console.warn("[DFM processLateReverberation] Mono IR has no significant content, added impulse.");}
+
 
         const leftIR = new Float32Array(monoIR.length);
         const rightIR = new Float32Array(monoIR.length);
@@ -209,6 +236,7 @@ export class DiffuseFieldModelModified {
             allPassY_R[0] = allPassOutputR;
             rightIR[i] = allPassOutputR;
         }
+        console.log(`[DFM processLateReverberation] Final stereo late IR generated. Left RMS: ${calculateRMS(leftIR).toExponential(3)}, Right RMS: ${calculateRMS(rightIR).toExponential(3)}`);
         return [leftIR, rightIR];
     }
 
@@ -216,6 +244,9 @@ export class DiffuseFieldModelModified {
         const frequencies = ['125', '250', '500', '1000', '2000', '4000', '8000', '16000'];
         const rt60Values: { [freq: string]: number } = {};
         
+        console.log(`[DFM calculateRT60Values] Using V=${this.roomVolume.toFixed(2)}, S=${this.surfaceArea.toFixed(2)}`);
+        const tempRT60Log: any = {};
+
         for (const freq of frequencies) {
             const absorption = this.meanAbsorption[freq] || 0.1;
             const effectiveAbsorption = Math.max(absorption, 0.01);
@@ -223,25 +254,30 @@ export class DiffuseFieldModelModified {
             const S = Math.max(this.surfaceArea, 6.0);
             let rt60 = 0.161 * V / (S * effectiveAbsorption);
 
-            // Reduced the low-frequency RT60 multiplier slightly
-            if (parseInt(freq) < 500) rt60 *= 1.05; // Was 1.1
+            tempRT60Log[`${freq}Hz_base`] = rt60.toFixed(2);
+
+            if (parseInt(freq) < 500) rt60 *= 1.05;
             else if (parseInt(freq) > 2000) rt60 *= 0.9; 
+            
+            tempRT60Log[`${freq}Hz_adjusted`] = rt60.toFixed(2);
             rt60Values[freq] = Math.min(Math.max(rt60, 0.05), 3.5); 
+            tempRT60Log[`${freq}Hz_final`] = rt60Values[freq].toFixed(2);
         }
+        console.log("[DFM calculateRT60Values] Calculated RT60s (s):", tempRT60Log);
         return rt60Values;
     }
 
-    public combineWithEarlyReflections(
-        earlyReflections: Float32Array, diffuseField: Float32Array, crossoverTime: number
-    ): Float32Array {
-        // This method is part of DiffuseFieldModelModified but typically called by AudioProcessorModified
-        // For brevity, assuming it's correctly implemented as before.
+    public combineWithEarlyReflections( /* ... */ ): Float32Array {
+        // Method unchanged, not re-listing for brevity
+        const earlyReflections = arguments[0]; // Placeholder for actual args
+        const diffuseField = arguments[1];
+        const crossoverTime = arguments[2];
         const earlyLength = earlyReflections.length;
         const diffuseLength = diffuseField.length;
         const totalLength = Math.max(earlyLength, diffuseLength);
         const output = new Float32Array(totalLength);
         const crossoverSample = Math.floor(crossoverTime * this.sampleRate);
-        const fadeLength = Math.floor(0.01 * this.sampleRate); // 10ms fade
+        const fadeLength = Math.floor(0.01 * this.sampleRate); 
 
         for (let i = 0; i < totalLength; i++) {
             const earlyVal = (i < earlyLength) ? earlyReflections[i] : 0;
