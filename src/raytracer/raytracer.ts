@@ -1,63 +1,74 @@
-import { vec3 } from 'gl-matrix';
+import { vec3, mat4 } from 'gl-matrix';
 import { Ray, FrequencyBands } from './ray';
 import { Room } from '../room/room';
 import { Sphere } from '../objects/sphere';
 import { RayRenderer } from './ray-renderer';
-import { Camera } from '../camera/camera'; // Assuming Camera class is defined in this file
+import { Camera } from '../camera/camera';
+import { WallMaterial } from '../room/room-materials';
 
-// New interface for edge detection
 interface Edge {
     start: vec3;
     end: vec3;
-    adjacentSurfaces: number[]; // Indices of surfaces sharing this edge
+    adjacentSurfaces: number[];
 }
 
 interface ImageSource {
     position: vec3;
     order: number;
     reflectionPath: vec3[];
-    surfaces: number[]; // Surfaces encountered in the reflection path
+    surfaces: number[];
 }
 
 export interface RayTracerConfig {
     numRays: number;
     maxBounces: number;
     minEnergy: number;
+    enableDiffraction: boolean;
+    diffractionAttenuationFactor: number;
 }
 
 export interface RayHit {
     position: vec3;
     energies: FrequencyBands;
-    time: number;      // Arrival time
-    phase: number;     // Phase at hit
-    frequency: number; // Frequency of the ray
-    dopplerShift: number; // Doppler shift at this point
-    bounces: number;   // Number of bounces
-    distance: number;  // Distance from listener
-    direction: vec3;   // Direction from listener (normalized vector from listener to hit)
+    time: number;
+    phase: number;
+    frequency: number;
+    dopplerShift: number;
+    bounces: number;
+    distance: number;
+    direction: vec3;
+    type: 'reflection' | 'diffraction' | 'direct';
 }
 
+export interface RayPathSegment {
+    origin: vec3;
+    direction: vec3;
+    energies: FrequencyBands;
+    type: 'reflection' | 'diffraction' | 'initial';
+}
+
+
 export interface RayPathPoint {
-    position: vec3; // Added position
-    energies: FrequencyBands; // Added energies
-    time: number; // Added time
-    phase: number; // Added phase
-    frequency: number; // Added frequency
-    dopplerShift: number; // Added doppler shift
-    bounces: number; // Added bounces (renamed from bounceNumber)
-    distance: number; // Added distance
-    direction: vec3; // Added direction
-    rayIndex: number;     // Which ray this point belongs to
+    position: vec3;
+    energies: FrequencyBands;
+    time: number;
+    phase: number;
+    frequency: number;
+    dopplerShift: number;
+    bounces: number;
+    distance: number;
+    direction: vec3;
+    rayIndex: number;
 }
 
 export interface ImpulseResponse {
-    time: Float32Array;     // Time points
-    amplitude: Float32Array; // Amplitude values
-    sampleRate: number;     // Sample rate of the impulse response
-    frequencies: Float32Array; // Frequency content at each time point
+    time: Float32Array;
+    amplitude: Float32Array;
+    sampleRate: number;
+    frequencies: Float32Array;
 }
 
-const MAX_POINTS_PER_RAY = 1000;
+const DIFFRACTION_PROXIMITY_THRESHOLD_SQ = 0.05 * 0.05;
 
 export class RayTracer {
     private soundSource: Sphere;
@@ -66,10 +77,9 @@ export class RayTracer {
     private config: RayTracerConfig;
     private rays: Ray[] = [];
     private hits: RayHit[] = [];
-    private rayPaths: { origin: vec3, direction: vec3, energies: FrequencyBands }[] = [];
+    private rayPaths: RayPathSegment[] = [];
     private rayPathPoints: RayPathPoint[] = [];
     private rayRenderer: RayRenderer;
-    private readonly VISIBILITY_THRESHOLD = 0.05;
     private readonly SPEED_OF_SOUND = 343.0;
     private readonly AIR_TEMPERATURE = 20.0;
     private edges: Edge[] = [];
@@ -83,7 +93,9 @@ export class RayTracer {
         config: RayTracerConfig = {
             numRays: 1000,
             maxBounces: 50,
-            minEnergy: 0.05
+            minEnergy: 0.05,
+            enableDiffraction: true,
+            diffractionAttenuationFactor: 0.5
         }
     ) {
         this.soundSource = soundSource;
@@ -95,57 +107,20 @@ export class RayTracer {
 
     private generateRays(): void {
         this.rays = [];
-        this.hits = []; // Clear previous hits
-
-        // Use actual camera position for listener
-        // const listenerPos = this.camera.getPosition(); // Removed unused variable
         const sourcePos = this.soundSource.getPosition();
-        // const directDistance = vec3.distance(listenerPos, sourcePos); // Removed unused variable
-        // const directTime = directDistance / this.SPEED_OF_SOUND; // Ensure this is commented out or removed
-
-        // Define frequency bands
-        const frequencies = [125, 250, 500, 1000, 2000, 4000, 8000, 16000]; // Hz
-
-        console.log('Starting ray generation with:', {
-            numRays: this.config.numRays,
-            sourcePosition: Array.from(sourcePos),
-            sphereRadius: this.soundSource.getRadius()
-        });
+        const frequencies = [125, 250, 500, 1000, 2000, 4000, 8000, 16000];
 
         for (let i = 0; i < this.config.numRays; i++) {
             const theta = 2 * Math.PI * Math.random();
             const phi = Math.acos(2 * Math.random() - 1);
-
             const direction = vec3.fromValues(
                 Math.sin(phi) * Math.cos(theta),
                 Math.sin(phi) * Math.sin(theta),
                 Math.cos(phi)
             );
-
-            const rayOrigin = vec3.create();
-            vec3.scale(rayOrigin, direction, this.soundSource.getRadius());
-            vec3.add(rayOrigin, rayOrigin, sourcePos);
-
-            // Select which frequency band to use for this ray
+            const rayOrigin = vec3.scaleAndAdd(vec3.create(), sourcePos, direction, this.soundSource.getRadius());
             const frequency = frequencies[i % frequencies.length];
-            
-            // Create ray with initial energy for all frequency bands
-            const ray = new Ray(rayOrigin, direction, 1.0, frequency);
-            
-                       
-            ray.setEnergies({
-                energy125Hz: 1.0,
-                energy250Hz: 1.0,
-                energy500Hz: 1.0,
-                energy1kHz: 1.0,
-                energy2kHz: 1.0,
-                energy4kHz: 1.0,
-                energy8kHz: 1.0,
-                energy16kHz: 1.0
-            });
-            
-            
-            this.rays.push(ray);
+            this.rays.push(new Ray(rayOrigin, direction, 1.0, frequency));
         }
     }
 
@@ -155,481 +130,340 @@ export class RayTracer {
         this.rayPaths = [];
         this.rayPathPoints = [];
 
-        // Use actual camera position for listener
         const listenerPos = this.camera.getPosition();
         const sourcePos = this.soundSource.getPosition();
-        // const directDistance = vec3.distance(listenerPos, sourcePos); // Removed unused variable
-        // const directTime = directDistance / this.SPEED_OF_SOUND; // Ensure this is commented out or removed
 
-        // Add direct sound as a strong hit
-        this.hits.push(
-            this.createListenerRelativeHit(
-                sourcePos,
-                {
-                    energy125Hz: 5.0,  // Strong direct sound
-                    energy250Hz: 5.0,
-                    energy500Hz: 5.0,
-                    energy1kHz: 5.0,
-                    energy2kHz: 5.0,
-                    energy4kHz: 5.0,
-                    energy8kHz: 5.0,
-                    energy16kHz: 5.0
-                },
-                0, // Initial time
-                0, // Initial phase
-                1000, // Reference frequency
-                1.0, // No Doppler shift
-                0 // No bounces (direct sound)
-            )
-        );
+        const directDist = vec3.distance(sourcePos, listenerPos);
+        const directTimeToListener = directDist / this.SPEED_OF_SOUND;
+        const directEnergies: FrequencyBands = {
+            energy125Hz: 1.0, energy250Hz: 1.0, energy500Hz: 1.0, energy1kHz: 1.0,
+            energy2kHz: 1.0, energy4kHz: 1.0, energy8kHz: 1.0, energy16kHz: 1.0
+        };
+        const directAttenuation = 1.0 / Math.max(0.01, directDist * directDist);
+        for (const key in directEnergies) {
+            (directEnergies as any)[key] *= directAttenuation;
+        }
 
-        // Generate image sources for early reflections
-        this.generateImageSources(2); // Up to 2nd order reflections
-        
-        // Calculate early reflections using image sources
+        this.hits.push({
+            position: vec3.clone(sourcePos),
+            energies: directEnergies,
+            time: directTimeToListener,
+            phase: (2 * Math.PI * 1000 * directTimeToListener) % (2 * Math.PI),
+            frequency: 1000,
+            dopplerShift: 1.0,
+            bounces: 0,
+            distance: directDist,
+            direction: vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), listenerPos, sourcePos)),
+            type: 'direct'
+        });
+        this.rayPaths.push({
+            origin: vec3.clone(sourcePos),
+            direction: vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), listenerPos, sourcePos)),
+            energies: directEnergies,
+            type: 'initial'
+        });
+
+        this.generateImageSources(2);
         await this.calculateEarlyReflections();
-        
-        // Detect edges and generate rays for late reflections
         this.detectEdges();
         this.generateRays();
-        
-        // Store initial ray paths
+
         for (const ray of this.rays) {
             this.rayPaths.push({
                 origin: ray.getOrigin(),
                 direction: ray.getDirection(),
-                energies: ray.getEnergies()
+                energies: ray.getEnergies(),
+                type: 'initial'
             });
         }
-
-        // Calculate late reflections using ray tracing
         await this.calculateLateReflections();
-        
-        // Log summary
-        console.log('Ray tracing summary:', {
-            imageSourcePaths: this.imageSources.length - 1, // Subtract original source
-            totalRays: this.rays.length,
-            activeRayPaths: this.rayPaths.length,
-            activeHits: this.hits.length
-        });
     }
 
     private generateImageSources(maxOrder: number = 2): void {
         this.imageSources = [];
         const sourcePos = this.soundSource.getPosition();
-        
-        // Add original source (order 0)
         this.imageSources.push({
-            position: vec3.clone(sourcePos),
-            order: 0,
-            reflectionPath: [vec3.clone(sourcePos)],
-            surfaces: []
+            position: vec3.clone(sourcePos), order: 0, reflectionPath: [vec3.clone(sourcePos)], surfaces: []
         });
-        
-        // Define room planes with their indices
+
         const { width, height, depth } = this.room.config.dimensions;
-        const halfWidth = width / 2;
-        const halfDepth = depth / 2;
-        
+        const hW = width / 2, hD = depth / 2;
         const planes = [
-            { normal: vec3.fromValues(1, 0, 0), d: halfWidth, index: 0 },  // +X (right)
-            { normal: vec3.fromValues(-1, 0, 0), d: halfWidth, index: 1 }, // -X (left)
-            { normal: vec3.fromValues(0, 1, 0), d: 0, index: 2 },          // +Y (floor)
-            { normal: vec3.fromValues(0, -1, 0), d: height, index: 3 },    // -Y (ceiling)
-            { normal: vec3.fromValues(0, 0, 1), d: halfDepth, index: 4 },  // +Z (back)
-            { normal: vec3.fromValues(0, 0, -1), d: halfDepth, index: 5 }  // -Z (front)
+            { normal: vec3.fromValues(1, 0, 0), d: -hW, index: 0 }, { normal: vec3.fromValues(-1, 0, 0), d: -hW, index: 1 },
+            { normal: vec3.fromValues(0, 1, 0), d: 0, index: 2 }, { normal: vec3.fromValues(0, -1, 0), d: -height, index: 3 },
+            { normal: vec3.fromValues(0, 0, 1), d: -hD, index: 4 }, { normal: vec3.fromValues(0, 0, -1), d: -hD, index: 5 }
         ];
-        
-        // Generate image sources up to maxOrder
+
         let currentSources = [...this.imageSources];
-        
         for (let order = 1; order <= maxOrder; order++) {
             const newSources: ImageSource[] = [];
-            
             for (const source of currentSources) {
                 if (source.order === order - 1) {
                     for (let i = 0; i < planes.length; i++) {
                         const plane = planes[i];
-                        
-                        // Skip if this surface was just reflected from
-                        if (source.surfaces.length > 0 && source.surfaces[source.surfaces.length - 1] === plane.index) {
-                            continue;
-                        }
-                        
-                        // Calculate reflection
-                        const sourcePos = source.position;
-                        const distance = 2 * (vec3.dot(sourcePos, plane.normal) - plane.d);
-                        const imagePos = vec3.create();
-                        vec3.scale(imagePos, plane.normal, distance);
-                        vec3.subtract(imagePos, sourcePos, imagePos);
-                        
-                        // Calculate reflection point on surface
-                        const reflectionPoint = vec3.create();
-                        vec3.add(reflectionPoint, sourcePos, imagePos);
-                        vec3.scale(reflectionPoint, reflectionPoint, 0.5);
-                        
-                        // Create new reflection path
-                        const newPath = [...source.reflectionPath, vec3.clone(reflectionPoint)];
-                        const newSurfaces = [...source.surfaces, plane.index];
-                        
+                        if (source.surfaces.length > 0 && source.surfaces[source.surfaces.length - 1] === plane.index) continue;
+                        const reflectedPos = vec3.create();
+                        const distToPlane = vec3.dot(source.position, plane.normal) + plane.d;
+                        vec3.scaleAndAdd(reflectedPos, source.position, plane.normal, -2 * distToPlane);
+                        const midPoint = vec3.scaleAndAdd(vec3.create(), source.position, plane.normal, -distToPlane);
                         newSources.push({
-                            position: imagePos,
-                            order: order,
-                            reflectionPath: newPath,
-                            surfaces: newSurfaces
+                            position: reflectedPos, order: order,
+                            reflectionPath: [...source.reflectionPath, midPoint], surfaces: [...source.surfaces, plane.index]
                         });
                     }
                 }
             }
-            
             this.imageSources.push(...newSources);
             currentSources = [...this.imageSources];
         }
-        
-        console.log(`Generated ${this.imageSources.length} image sources up to order ${maxOrder}`);
     }
 
     private async calculateEarlyReflections(): Promise<void> {
         const listenerPos = this.camera.getPosition();
-        
-        // Get room materials mapping for surface indices
         const materials = [
-            this.room.config.materials.walls,   // index 0: right wall (+X) -> Use 'walls' for all walls
-            this.room.config.materials.walls,    // index 1: left wall (-X) -> Use 'walls'
-            this.room.config.materials.floor,   // index 2: floor (+Y)
-            this.room.config.materials.ceiling, // index 3: ceiling (-Y)
-            this.room.config.materials.walls,    // index 4: back wall (+Z) -> Use 'walls'
-            this.room.config.materials.walls    // index 5: front wall (-Z) -> Use 'walls'
+            this.room.config.materials.walls, this.room.config.materials.walls,
+            this.room.config.materials.floor, this.room.config.materials.ceiling,
+            this.room.config.materials.walls, this.room.config.materials.walls
         ];
-        
+
         for (const source of this.imageSources) {
-            if (source.order === 0) continue; // Skip original source
-            
-            // Calculate direct path from image source to listener
-            const imageToListener = vec3.create();
-            vec3.subtract(imageToListener, listenerPos, source.position);
-            const distance = vec3.length(imageToListener);
-            vec3.normalize(imageToListener, imageToListener);
-            
-            // Calculate time of arrival
+            if (source.order === 0) continue;
+            const pathFromImageSourceToListener = vec3.subtract(vec3.create(), listenerPos, source.position);
+            const distance = vec3.length(pathFromImageSourceToListener);
+            const directionToListener = vec3.normalize(vec3.create(), pathFromImageSourceToListener);
             const timeOfArrival = distance / this.SPEED_OF_SOUND;
-            
-            // Calculate energy based on distance
-            const energyDecay = 1.0 / (distance * distance);
-            
-            // Apply surface absorption for each reflection
+
             let energies: FrequencyBands = {
-                energy125Hz: 1.0 * energyDecay,
-                energy250Hz: 1.0 * energyDecay,
-                energy500Hz: 1.0 * energyDecay,
-                energy1kHz: 1.0 * energyDecay,
-                energy2kHz: 1.0 * energyDecay,
-                energy4kHz: 1.0 * energyDecay,
-                energy8kHz: 1.0 * energyDecay,
-                energy16kHz: 1.0 * energyDecay
+                energy125Hz: 1.0, energy250Hz: 1.0, energy500Hz: 1.0, energy1kHz: 1.0,
+                energy2kHz: 1.0, energy4kHz: 1.0, energy8kHz: 1.0, energy16kHz: 1.0
             };
-            
-            // Apply frequency-dependent absorption for each reflection
+            const initialAttenuation = 1.0 / Math.max(0.01, distance * distance);
+            for (const key in energies) (energies as any)[key] *= initialAttenuation;
+
             for (let i = 0; i < source.surfaces.length; i++) {
-                const surfaceIndex = source.surfaces[i];
-                
-                // Safety check to prevent undefined access
-                if (surfaceIndex >= 0 && surfaceIndex < materials.length) {
-                    const material = materials[surfaceIndex];
-                    
-                    // Check if material exists before using it
-                    if (material) {
-                        // Apply absorption (multiply by (1-absorption) for each reflection)
-                        energies.energy125Hz *= (1.0 - material.absorption125Hz);
-                        energies.energy250Hz *= (1.0 - material.absorption250Hz);
-                        energies.energy500Hz *= (1.0 - material.absorption500Hz);
-                        energies.energy1kHz *= (1.0 - material.absorption1kHz);
-                        energies.energy2kHz *= (1.0 - material.absorption2kHz);
-                        energies.energy4kHz *= (1.0 - material.absorption4kHz);
-                        energies.energy8kHz *= (1.0 - material.absorption8kHz);
-                        energies.energy16kHz *= (1.0 - material.absorption16kHz);
-                    }
+                const material = materials[source.surfaces[i]];
+                if (material) {
+                    energies.energy125Hz *= (1.0 - material.absorption125Hz);
+                    energies.energy250Hz *= (1.0 - material.absorption250Hz);
+                    energies.energy500Hz *= (1.0 - material.absorption500Hz);
+                    energies.energy1kHz *= (1.0 - material.absorption1kHz);
+                    energies.energy2kHz *= (1.0 - material.absorption2kHz);
+                    energies.energy4kHz *= (1.0 - material.absorption4kHz);
+                    energies.energy8kHz *= (1.0 - material.absorption8kHz);
+                    energies.energy16kHz *= (1.0 - material.absorption16kHz);
                 }
             }
-            
-            // Boost early reflections (stronger boost for earlier reflections)
             const reflectionBoost = 2.0 / (source.order + 1);
-            energies.energy125Hz *= reflectionBoost;
-            energies.energy250Hz *= reflectionBoost;
-            energies.energy500Hz *= reflectionBoost;
-            energies.energy1kHz *= reflectionBoost;
-            energies.energy2kHz *= reflectionBoost;
-            energies.energy4kHz *= reflectionBoost;
-            energies.energy8kHz *= reflectionBoost;
-            energies.energy16kHz *= reflectionBoost;
-            
-            // Create ray path segments for visualization
-            for (let i = 0; i < source.reflectionPath.length - 1; i++) {
-                const start = source.reflectionPath[i];
-                const end = source.reflectionPath[i + 1];
-                
-                const direction = vec3.create();
-                vec3.subtract(direction, end, start);
-                vec3.normalize(direction, direction);
-                
-                this.rayPaths.push({
-                    origin: vec3.clone(start),
-                    direction: vec3.clone(direction),
-                    energies: { ...energies }
+            for (const key in energies) (energies as any)[key] *= reflectionBoost;
+
+            let visualPathStart = this.soundSource.getPosition();
+            for(let i=0; i < source.reflectionPath.length; ++i) {
+                if (i === 0 && source.order > 0) continue;
+                const visualPathEnd = source.reflectionPath[i];
+                 this.rayPaths.push({
+                    origin: vec3.clone(visualPathStart),
+                    direction: vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), visualPathEnd, visualPathStart)),
+                    energies: { ...energies }, type: 'reflection'
                 });
+                visualPathStart = visualPathEnd;
             }
-            
-            // Add final path segment to listener
-            const lastPoint = source.reflectionPath[source.reflectionPath.length - 1];
-            
             this.rayPaths.push({
-                origin: vec3.clone(lastPoint),
-                direction: vec3.clone(imageToListener), // Use calculated direction
-                energies: { ...energies }
+                origin: vec3.clone(visualPathStart),
+                direction: vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), listenerPos, visualPathStart)),
+                energies: { ...energies }, type: 'reflection'
             });
-            
-            // Add hit point at listener position
-            const hitDirection = vec3.create();
-            vec3.subtract(hitDirection, source.position, listenerPos); // Direction from listener to image source (approximates arrival direction)
-            vec3.normalize(hitDirection, hitDirection);
 
             this.hits.push({
-                position: vec3.clone(listenerPos),
-                energies: { ...energies },
-                time: timeOfArrival,
-                phase: 2 * Math.PI * 1000 * timeOfArrival, // 1kHz reference
-                frequency: 1000, 
-                dopplerShift: 1.0,
-                bounces: source.order,
-                distance: distance, // Add distance
-                direction: hitDirection // Add direction
+                position: vec3.clone(listenerPos), energies: { ...energies }, time: timeOfArrival,
+                phase: (2 * Math.PI * 1000 * timeOfArrival) % (2 * Math.PI), frequency: 1000,
+                dopplerShift: 1.0, bounces: source.order, distance: distance,
+                direction: directionToListener, type: 'reflection'
             });
         }
     }
 
-    private calculateDopplerShift(rayDirection: vec3, surfaceNormal: vec3): number {
-        const relativeVelocity = vec3.dot(rayDirection, surfaceNormal) * this.SPEED_OF_SOUND;
-        return this.SPEED_OF_SOUND / (this.SPEED_OF_SOUND - relativeVelocity);
+    private closestPointOnSegment(p: vec3, a: vec3, b: vec3): vec3 {
+        const ap = vec3.subtract(vec3.create(), p, a);
+        const ab = vec3.subtract(vec3.create(), b, a);
+        const abLenSq = vec3.squaredLength(ab);
+        if (abLenSq < 0.000001) return vec3.clone(a);
+        let t = vec3.dot(ap, ab) / abLenSq;
+        t = Math.max(0, Math.min(1, t));
+        return vec3.scaleAndAdd(vec3.create(), a, ab, t);
+    }
+
+    private findClosestDiffractionEvent(ray: Ray, reflectionPlanes: any[]): { t: number, point: vec3, edge: Edge, diffractedDir: vec3 } | null {
+        if (!this.config.enableDiffraction || !this.edges || this.edges.length === 0) return null;
+
+        let closestT = Infinity;
+        let bestEvent = null;
+        const P0 = ray.getOrigin();
+        const D = ray.getDirection();
+
+        for (const edge of this.edges) {
+            const pointOnEdgeSegment = this.closestPointOnSegment(P0, edge.start, edge.end);
+            const vecToEdgePoint = vec3.subtract(vec3.create(), pointOnEdgeSegment, P0);
+            const tCandidate = vec3.dot(vecToEdgePoint, D);
+
+            if (tCandidate > 0.0001 && tCandidate < closestT) {
+                const pointOnRay = vec3.scaleAndAdd(vec3.create(), P0, D, tCandidate);
+                if (vec3.squaredDistance(pointOnRay, pointOnEdgeSegment) < DIFFRACTION_PROXIMITY_THRESHOLD_SQ) {
+                    let clearPathToEdge = true;
+                    for (const plane of reflectionPlanes) {
+                        const denom = vec3.dot(D, plane.normal);
+                        if (Math.abs(denom) > 0.0001) {
+                            const t_plane = -(vec3.dot(P0, plane.normal) + plane.d) / denom;
+                            if (t_plane > 0.0001 && t_plane < tCandidate) {
+                                clearPathToEdge = false; break;
+                            }
+                        }
+                    }
+                    if (!clearPathToEdge) continue;
+
+                    closestT = tCandidate;
+                    const diffractionPoint = pointOnEdgeSegment;
+                    const fromSourceToEdge = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), diffractionPoint, this.soundSource.getPosition()));
+                    const randomPerturbation = vec3.fromValues(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5);
+                    vec3.scale(randomPerturbation, randomPerturbation, 0.8);
+                    const diffractedDir = vec3.normalize(vec3.create(), vec3.add(vec3.create(), fromSourceToEdge, randomPerturbation));
+                    bestEvent = { t: closestT, point: diffractionPoint, edge, diffractedDir };
+                }
+            }
+        }
+        return bestEvent;
     }
 
     private async calculateLateReflections(): Promise<void> {
         const { width, height, depth } = this.room.config.dimensions;
-        const halfWidth = width / 2;
-        const halfDepth = depth / 2;
-
-        console.log('Starting late reflections calculation');
-        
-        // Define room planes with materials from room config
-        const roomMaterials = this.room.config.materials;
-        const planes = [
-            { normal: vec3.fromValues(1, 0, 0), d: halfWidth, material: roomMaterials.walls }, // Use 'walls'
-            { normal: vec3.fromValues(-1, 0, 0), d: halfWidth, material: roomMaterials.walls }, // Use 'walls'
-            { normal: vec3.fromValues(0, 1, 0), d: 0, material: roomMaterials.floor },
-            { normal: vec3.fromValues(0, -1, 0), d: height, material: roomMaterials.ceiling },
-            { normal: vec3.fromValues(0, 0, 1), d: halfDepth, material: roomMaterials.walls }, // Use 'walls'
-            { normal: vec3.fromValues(0, 0, -1), d: halfDepth, material: roomMaterials.walls }  // Use 'walls'
+        const hW = width / 2, hD = depth / 2;
+        const materials = this.room.config.materials;
+        const reflectionPlanes = [
+            { normal: vec3.fromValues(-1,0,0), d: hW, material: materials.walls }, { normal: vec3.fromValues(1,0,0),  d: hW, material: materials.walls },
+            { normal: vec3.fromValues(0,-1,0), d: height, material: materials.ceiling },{ normal: vec3.fromValues(0,1,0),  d: 0, material: materials.floor },
+            { normal: vec3.fromValues(0,0,-1), d: hD, material: materials.walls }, { normal: vec3.fromValues(0,0,1),  d: hD, material: materials.walls }
         ];
 
-        // Process each ray
         for (let rayIndex = 0; rayIndex < this.rays.length; rayIndex++) {
             const ray = this.rays[rayIndex];
             let bounces = 0;
             let currentTime = 0;
-            let totalPoints = 0;
 
-            while (ray.isRayActive() &&
-                   bounces < this.config.maxBounces &&
-                   this.calculateAverageEnergy(ray.getEnergies()) > this.config.minEnergy) {
-                let closestT = Infinity;
-                let closestPlane = null;
-                const origin = ray.getOrigin();
-                const direction = ray.getDirection();
+            while (ray.isRayActive() && bounces < this.config.maxBounces && this.calculateAverageEnergy(ray.getEnergies()) > this.config.minEnergy) {
+                let closestReflectionT = Infinity;
+                let reflectionPlaneDetails: { plane: any, hitPoint: vec3, distance: number } | null = null;
+                const P0_reflect = ray.getOrigin();
+                const D_reflect = ray.getDirection();
 
-                for (const plane of planes) {
-                    const denom = vec3.dot(direction, plane.normal);
+                for (const plane of reflectionPlanes) {
+                    const denom = vec3.dot(D_reflect, plane.normal);
                     if (Math.abs(denom) > 0.0001) {
-                        const t = -(vec3.dot(origin, plane.normal) + plane.d) / denom;
-                        if (t > 0.0001 && t < closestT) {
-                            closestT = t;
-                            closestPlane = plane;
+                        const t = -(vec3.dot(P0_reflect, plane.normal) + plane.d) / denom;
+                        if (t > 0.0001 && t < closestReflectionT) {
+                            const hitPoint = vec3.scaleAndAdd(vec3.create(), P0_reflect, D_reflect, t);
+                            if (Math.abs(hitPoint[0]) <= hW + 0.01 && hitPoint[1] >= -0.01 && hitPoint[1] <= height + 0.01 && Math.abs(hitPoint[2]) <= hD + 0.01) {
+                                closestReflectionT = t;
+                                reflectionPlaneDetails = { plane, hitPoint, distance: t };
+                            }
                         }
                     }
                 }
 
-                if (closestPlane && closestPlane.material) {
-                    const hitPoint = vec3.scaleAndAdd(vec3.create(), origin, direction, closestT - 0.0001);
-                    const distanceTraveled = vec3.distance(origin, hitPoint);
+                const diffractionEvent = this.findClosestDiffractionEvent(ray, reflectionPlanes);
+                const choseDiffraction = diffractionEvent && diffractionEvent.t < closestReflectionT;
 
-                    // Sample points along the ray path before hit
-                    const sampleDistance = 0.1; // Sample every 10cm
-                    const numSamples = Math.floor(distanceTraveled / sampleDistance);
+                if (choseDiffraction && diffractionEvent) {
+                    const distanceTraveled = diffractionEvent.t;
+                    currentTime += distanceTraveled / this.SPEED_OF_SOUND;
+                    this.rayPaths.push({
+                        origin: vec3.clone(ray.getOrigin()),
+                        direction: vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), diffractionEvent.point, ray.getOrigin())),
+                        energies: ray.getEnergies(), type: 'diffraction'
+                    });
 
-                    for (let i = 0; i < numSamples; i++) {
-                        // Check if we've exceeded points per ray
-                        if (totalPoints >= MAX_POINTS_PER_RAY) {
-                            console.warn(`Ray ${rayIndex} exceeded maximum points (${MAX_POINTS_PER_RAY})`);
-                            break;
-                        }
+                    const baseDiffCoeff = 1.0 - this.config.diffractionAttenuationFactor;
+                    const diffractionEnergyLoss: WallMaterial = { // Using WallMaterial structure for convenience
+                        absorption125Hz: 1.0-(baseDiffCoeff*0.9), absorption250Hz: 1.0-(baseDiffCoeff*0.8),
+                        absorption500Hz: 1.0-(baseDiffCoeff*0.7), absorption1kHz:  1.0-(baseDiffCoeff*0.6),
+                        absorption2kHz:  1.0-(baseDiffCoeff*0.5), absorption4kHz:  1.0-(baseDiffCoeff*0.4),
+                        absorption8kHz:  1.0-(baseDiffCoeff*0.3), absorption16kHz: 1.0-(baseDiffCoeff*0.2),
+                        scattering125Hz: 0, scattering250Hz: 0, scattering500Hz: 0, scattering1kHz: 0,
+                        scattering2kHz: 0, scattering4kHz: 0, scattering8kHz: 0, scattering16kHz: 0,
+                        roughness: 0, phaseShift: 0, phaseRandomization: 0
+                    };
+                    ray.updateRay(diffractionEvent.point, diffractionEvent.diffractedDir, diffractionEnergyLoss,
+                                  distanceTraveled, this.AIR_TEMPERATURE, 50);
 
-                        const t = i * sampleDistance;
-                        const pointPosition = vec3.scaleAndAdd(vec3.create(), origin, direction, t);
-                        const pointTime = currentTime + (t / this.SPEED_OF_SOUND);
+                    this.rayPaths.push({
+                        origin: vec3.clone(ray.getOrigin()), direction: vec3.clone(ray.getDirection()),
+                        energies: ray.getEnergies(), type: 'diffraction'
+                    });
+                    this.hits.push(this.createListenerRelativeHit(ray.getOrigin(), ray.getEnergies(), currentTime,
+                                   ray.getPhase(), ray.getFrequency(), 1.0, bounces + 1, 'diffraction'));
+                    bounces++;
+                } else if (reflectionPlaneDetails) {
+                    const { plane: closestPlane, hitPoint, distance: distanceTraveled } = reflectionPlaneDetails;
+                    currentTime += distanceTraveled / this.SPEED_OF_SOUND;
+                    this.rayPaths.push({
+                        origin: vec3.clone(ray.getOrigin()),
+                        direction: vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), hitPoint, ray.getOrigin())),
+                        energies: ray.getEnergies(), type: 'reflection'
+                    });
 
-                        // Calculate wave properties at this point
-                        const wavelength = this.SPEED_OF_SOUND / ray.getFrequency();
-                        const phaseAtPoint = (ray.getPhase() + (2 * Math.PI * t) / wavelength) % (2 * Math.PI);
+                    const D_orig = ray.getDirection();
+                    const reflectedDir = vec3.create();
 
-                        // Store point data - ensure all RayPathPoint fields are present
-                        const pointDirection = vec3.create(); // Calculate direction for the point
-                        vec3.subtract(pointDirection, pointPosition, this.camera.getPosition());
-                        const pointDistance = vec3.length(pointDirection);
-                        vec3.normalize(pointDirection, pointDirection);
+                    // Manual reflection: r = v - 2 * dot(v, n) * n
+                    const dot_v_n = vec3.dot(D_orig, closestPlane.normal);
+                    const term2_scalar_mult_n = vec3.create();
+                    vec3.scale(term2_scalar_mult_n, closestPlane.normal, 2 * dot_v_n);
+                    vec3.subtract(reflectedDir, D_orig, term2_scalar_mult_n);
+                    vec3.normalize(reflectedDir, reflectedDir);
+                    
+                    const offsetOrigin = vec3.scaleAndAdd(vec3.create(), hitPoint, reflectedDir, 0.0001);
+                    ray.updateRay(offsetOrigin, reflectedDir, closestPlane.material, distanceTraveled, this.AIR_TEMPERATURE, 50);
 
-                        this.rayPathPoints.push({
-                            position: pointPosition,
-                            energies: ray.getEnergies(),
-                            time: pointTime,
-                            phase: phaseAtPoint,
-                            frequency: ray.getFrequency(),
-                            dopplerShift: 1.0, // Assuming no doppler for path points for now
-                            bounces: bounces, // Use current bounce count
-                            distance: pointDistance, // Add distance
-                            direction: pointDirection, // Add direction
-                            rayIndex: rayIndex
-                        });
-                        totalPoints++;
-                    }
-
-                    const travelTime = distanceTraveled / this.SPEED_OF_SOUND;
-                    currentTime += travelTime;
-
-                    // Calculate reflection
-                    const dot = vec3.dot(direction, closestPlane.normal);
-                    const reflected = vec3.create();
-                    vec3.scale(reflected, closestPlane.normal, -2 * dot);
-                    vec3.add(reflected, direction, reflected);
-                    vec3.normalize(reflected, reflected);
-
-                    // Get energy before update
-                    const energyBefore = this.calculateAverageEnergy(ray.getEnergies());
-                    const materialType = Object.entries(this.room.config.materials).find(
-                        ([_, material]) => material === closestPlane.material
-                    )?.[0] || 'unknown';
-
-                    // Update ray position and properties
-                    const newOrigin = vec3.scaleAndAdd(vec3.create(), hitPoint, closestPlane.normal, 0.0001);
-                    ray.updateRay(
-                        newOrigin,
-                        reflected,
-                        closestPlane.material,
-                        distanceTraveled,
-                        this.AIR_TEMPERATURE,
-                        50 // Default humidity
-                    );
-
-                    // Get energy after update
-                    const energyAfter = this.calculateAverageEnergy(ray.getEnergies());
-
-                    // Log energy state for every 100th ray
-                    if (rayIndex % 100 === 0) {
-                        console.log(`Ray ${rayIndex}, Bounce ${bounces}:`, {
-                            energyBefore,
-                            energyAfter,
-                            energyLoss: energyBefore - energyAfter,
-                            material: materialType,
-                            absorption: closestPlane.material.absorption1kHz,
-                            distanceTraveled
-                        });
-                    }
-
-                    if (energyAfter <= this.config.minEnergy) {
-                        if (rayIndex % 100 === 0) {
-                            console.log(`Ray ${rayIndex} deactivated: energy ${energyAfter} below minimum ${this.config.minEnergy}`);
-                        }
-                        ray.deactivate();
-                    }
-
-                    const wavelength = this.SPEED_OF_SOUND / ray.getFrequency();
-                    const phaseChange = (2 * Math.PI * distanceTraveled) / wavelength;
-                    const newPhase = (ray.getPhase() + phaseChange) % (2 * Math.PI);
-
-                    const dopplerShift = this.calculateDopplerShift(direction, closestPlane.normal);
-
-                    // Create hit with listener-relative parameters
-                    this.hits.push(
-                        this.createListenerRelativeHit(
-                            hitPoint,
-                            ray.getEnergies(),
-                            currentTime,
-                            newPhase,
-                            ray.getFrequency(),
-                            dopplerShift,
-                            bounces + 1
-                        )
-                    );
-
-                    // Store path segment if energy is above threshold
-                    if (this.calculateAverageEnergy(ray.getEnergies()) > this.VISIBILITY_THRESHOLD) {
-                        this.rayPaths.push({
-                            origin: vec3.clone(newOrigin),
-                            direction: vec3.clone(reflected),
-                            energies: ray.getEnergies()
-                        });
-                    }
-
+                    this.rayPaths.push({
+                        origin: vec3.clone(ray.getOrigin()), direction: vec3.clone(ray.getDirection()),
+                        energies: ray.getEnergies(), type: 'reflection'
+                    });
+                    this.hits.push(this.createListenerRelativeHit(ray.getOrigin(), ray.getEnergies(), currentTime,
+                                   ray.getPhase(), ray.getFrequency(), 1.0, bounces + 1, 'reflection'));
                     bounces++;
                 } else {
                     ray.deactivate();
                 }
+                if (this.calculateAverageEnergy(ray.getEnergies()) <= this.config.minEnergy) ray.deactivate();
             }
         }
     }
 
     private createListenerRelativeHit(
-        position: vec3,
-        energies: FrequencyBands,
-        time: number,
-        phase: number,
-        frequency: number,
-        dopplerShift: number,
-        bounces: number
+        interactionPointWorld: vec3, energiesAtInteraction: FrequencyBands, timeAtInteraction: number,
+        phaseAtInteraction: number, frequencyAtInteraction: number, dopplerShiftAtInteraction: number,
+        bounces: number, type: 'reflection' | 'diffraction' | 'direct'
     ): RayHit {
-        // Get listener position
         const listenerPos = this.camera.getPosition();
-        
-        // Calculate distance and direction to listener
-        const toListener = vec3.create();
-        vec3.subtract(toListener, listenerPos, position);
-        const distance = vec3.length(toListener);
-        
-        // Calculate time to reach listener
-        const travelTime = distance / this.SPEED_OF_SOUND;
-        const totalTime = time + travelTime;
-        
-        // Apply distance attenuation
-        const attenuatedEnergies = { ...energies };
-        const distanceAttenuation = 1.0 / (distance * distance);
-        
-        // Scale energies by inverse square law
-        Object.keys(attenuatedEnergies).forEach(key => {
-            // Type assertion to assure TypeScript 'key' is a key of FrequencyBands
-            const bandKey = key as keyof FrequencyBands;
-            if (attenuatedEnergies[bandKey] !== undefined) { 
-                 attenuatedEnergies[bandKey] *= distanceAttenuation;
-            }
-        });
-        
-        // Create hit with proper listener-relative parameters
+        const vecToListener = vec3.subtract(vec3.create(), listenerPos, interactionPointWorld);
+        const distanceToListener = vec3.length(vecToListener);
+        const directionFromInteractionToListener = vec3.normalize(vec3.create(), vecToListener);
+        const travelTimeToListener = distanceToListener / this.SPEED_OF_SOUND;
+        const totalTimeAtListener = timeAtInteraction + travelTimeToListener;
+
+        const airAbsRay = new Ray(vec3.create(),vec3.create(), 1.0, frequencyAtInteraction);
+        const airAbs = airAbsRay.calculateAirAbsorption(distanceToListener, this.AIR_TEMPERATURE, 50);
+
+        const energiesAtListener = { ...energiesAtInteraction };
+        const distanceAttenuation = 1.0 / Math.max(0.01, distanceToListener * distanceToListener);
+        for (const key of Object.keys(energiesAtListener) as Array<keyof FrequencyBands>) {
+            energiesAtListener[key] *= distanceAttenuation;
+            energiesAtListener[key] *= (airAbs as any)[`absorption${key.replace('energy', '')}`];
+        }
+        const phaseAtListener = (phaseAtInteraction + (2 * Math.PI * frequencyAtInteraction * travelTimeToListener)) % (2 * Math.PI);
+
         return {
-            position: vec3.clone(position),
-            energies: attenuatedEnergies,
-            time: totalTime,
-            phase: phase,
-            frequency: frequency,
-            dopplerShift: dopplerShift,
-            bounces: bounces,
-            distance: distance,
-            direction: vec3.normalize(vec3.create(), toListener)
+            position: vec3.clone(interactionPointWorld), energies: energiesAtListener, time: totalTimeAtListener,
+            phase: phaseAtListener, frequency: frequencyAtInteraction, dopplerShift: dopplerShiftAtInteraction,
+            bounces: bounces, distance: distanceToListener, direction: directionFromInteractionToListener, type: type
         };
     }
 
@@ -639,72 +473,40 @@ export class RayTracer {
     }
 
     public getRayHits(): RayHit[] {
-        if (!this.hits || !Array.isArray(this.hits)) {
-            console.warn('No valid ray hits available');
-            return [];
-        }
         return this.hits.filter(hit => hit && hit.position && hit.energies);
     }
 
     public render(pass: GPURenderPassEncoder, viewProjection: Float32Array): void {
-        this.rayRenderer.render(
-            pass,
-            viewProjection,
-            this.rayPaths,
-            this.room.config.dimensions
-        );
+        const renderablePaths = this.rayPaths.map(p => ({
+            origin: p.origin, direction: p.direction, energies: p.energies
+        }));
+        this.rayRenderer.render(pass, viewProjection, renderablePaths, this.room.config.dimensions);
     }
 
     public recalculateRays(): void {
-        // Reset the renderer state
         this.rayRenderer.resetRender();
-        // Recalculate ray paths
         this.calculateRayPaths();
     }
 
-    // Method to detect edges from room geometry
     private detectEdges(): void {
+        this.edges = [];
         const { width, height, depth } = this.room.config.dimensions;
-        const halfWidth = width / 2;
-        const halfDepth = depth / 2;
-        
-        // Define room corners
-        const corners = [
-            vec3.fromValues(-halfWidth, 0, -halfDepth),
-            vec3.fromValues(halfWidth, 0, -halfDepth),
-            vec3.fromValues(halfWidth, 0, halfDepth),
-            vec3.fromValues(-halfWidth, 0, halfDepth),
-            vec3.fromValues(-halfWidth, height, -halfDepth),
-            vec3.fromValues(halfWidth, height, -halfDepth),
-            vec3.fromValues(halfWidth, height, halfDepth),
-            vec3.fromValues(-halfWidth, height, halfDepth),
+        const hW = width / 2, hD = depth / 2;
+        const c = [
+            vec3.fromValues(-hW, 0, -hD), vec3.fromValues(hW, 0, -hD), vec3.fromValues(hW, 0, hD), vec3.fromValues(-hW, 0, hD),
+            vec3.fromValues(-hW, height, -hD), vec3.fromValues(hW, height, -hD), vec3.fromValues(hW, height, hD), vec3.fromValues(-hW, height, hD)
         ];
-        
-        // Define edges (12 edges for a rectangular room)
-        // For each edge, store the two adjacent surface indices
-        this.edges = [
-            // Bottom edges
-            { start: corners[0], end: corners[1], adjacentSurfaces: [2, 4] },
-            { start: corners[1], end: corners[2], adjacentSurfaces: [2, 0] },
-            { start: corners[2], end: corners[3], adjacentSurfaces: [2, 5] },
-            { start: corners[3], end: corners[0], adjacentSurfaces: [2, 1] },
-            
-            // Top edges
-            { start: corners[4], end: corners[5], adjacentSurfaces: [3, 4] },
-            { start: corners[5], end: corners[6], adjacentSurfaces: [3, 0] },
-            { start: corners[6], end: corners[7], adjacentSurfaces: [3, 5] },
-            { start: corners[7], end: corners[4], adjacentSurfaces: [3, 1] },
-            
-            // Vertical edges
-            { start: corners[0], end: corners[4], adjacentSurfaces: [1, 4] },
-            { start: corners[1], end: corners[5], adjacentSurfaces: [0, 4] },
-            { start: corners[2], end: corners[6], adjacentSurfaces: [0, 5] },
-            { start: corners[3], end: corners[7], adjacentSurfaces: [1, 5] },
-        ];
-
-        console.log('Edge detection completed:', {
-            numEdges: this.edges.length,
-            roomDimensions: { width, height, depth }
-        });
+        this.edges.push({ start: c[0], end: c[1], adjacentSurfaces: [] } as Edge);
+        this.edges.push({ start: c[1], end: c[2], adjacentSurfaces: [] } as Edge);
+        this.edges.push({ start: c[2], end: c[3], adjacentSurfaces: [] } as Edge);
+        this.edges.push({ start: c[3], end: c[0], adjacentSurfaces: [] } as Edge);
+        this.edges.push({ start: c[4], end: c[5], adjacentSurfaces: [] } as Edge);
+        this.edges.push({ start: c[5], end: c[6], adjacentSurfaces: [] } as Edge);
+        this.edges.push({ start: c[6], end: c[7], adjacentSurfaces: [] } as Edge);
+        this.edges.push({ start: c[7], end: c[4], adjacentSurfaces: [] } as Edge);
+        this.edges.push({ start: c[0], end: c[4], adjacentSurfaces: [] } as Edge);
+        this.edges.push({ start: c[1], end: c[5], adjacentSurfaces: [] } as Edge);
+        this.edges.push({ start: c[2], end: c[6], adjacentSurfaces: [] } as Edge);
+        this.edges.push({ start: c[3], end: c[7], adjacentSurfaces: [] } as Edge);
     }
 }
