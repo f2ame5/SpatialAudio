@@ -117,49 +117,63 @@ export class DiffuseFieldModelModified {
     }
 
     public applyFrequencyFiltering(
-        impulseResponses: Map<string, Float32Array>
-    ): Float32Array {
-        const anyIR = impulseResponses.values().next().value;
-        const totalLength = anyIR ? anyIR.length : 0;
-        if (totalLength === 0) return new Float32Array(0);
+    impulseResponses: Map<string, Float32Array>
+): Float32Array {
+    const anyIR = impulseResponses.values().next().value;
+    const totalLength = anyIR ? anyIR.length : 0;
+    if (totalLength === 0) return new Float32Array(0);
 
-        console.log("[DFM applyFrequencyFiltering] Energies of individual diffuse bands (RMS before gain):");
-        const bandGainsApplied: { [key: string]: number } = {};
+    console.log("[DFM applyFrequencyFiltering] Energies of individual diffuse bands (RMS before gain):");
+    const bandGainsApplied: { [key: string]: number } = {};
 
-        const outputIR = new Float32Array(totalLength);
-        for (const [freq, ir] of impulseResponses.entries()) {
-            let bandGain = 1.0;
-            switch (freq) {
-                case '125': bandGain = 0.5; break;
-                case '250': bandGain = 0.65; break;
-                case '500': bandGain = 0.8; break;
-                case '1000': bandGain = 1.0; break;
-                case '2000': bandGain = 0.95; break;
-                case '4000': bandGain = 0.85; break;
-                case '8000': bandGain = 0.75; break;
-                case '16000': bandGain = 0.65; break;
-            }
-            bandGainsApplied[freq] = bandGain;
-            console.log(`  - Freq: ${freq}Hz, RMS: ${calculateRMS(ir).toExponential(3)}, Applied Gain: ${bandGain.toFixed(2)}`);
-            for (let i = 0; i < Math.min(ir.length, totalLength); i++) {
-                outputIR[i] += ir[i] * bandGain;
-            }
+    const outputIR = new Float32Array(totalLength);
+
+    const smallRoomThreshold = 50; 
+    const isSmallRoom = this.roomVolume < smallRoomThreshold;
+    const verySmallRoomThreshold = 25;
+    const isVerySmallRoom = this.roomVolume < verySmallRoomThreshold;
+
+
+    for (const [freq, ir] of impulseResponses.entries()) {
+        let bandGain = 1.0;
+        switch (freq) {
+            case '125': 
+                bandGain = isVerySmallRoom ? 0.10 : isSmallRoom ? 0.20 : 0.30; 
+                break;
+            case '250': 
+                bandGain = isVerySmallRoom ? 0.20 : isSmallRoom ? 0.35 : 0.45; 
+                break;
+            case '500': 
+                bandGain = isSmallRoom ? 0.65 : 0.70;
+                break;
+            case '1000': 
+                bandGain = 1.0; 
+                break;
+            case '2000': 
+                bandGain = 0.90; 
+                break;
+            case '4000': 
+                bandGain = isSmallRoom ? 0.85 : 0.80; 
+                break;
+            case '8000': 
+                bandGain = isSmallRoom ? 0.75 : 0.70; 
+                break;
+            case '16000': 
+                bandGain = isSmallRoom ? 0.70 : 0.60; 
+                break;
         }
-        console.log("[DFM applyFrequencyFiltering] Applied Band Gains:", bandGainsApplied);
-        const rmsBeforeNorm = calculateRMS(outputIR);
-        console.log(`[DFM applyFrequencyFiltering] Combined monoIR RMS before normalization: ${rmsBeforeNorm.toExponential(3)}`);
-
-        let maxAmp = 0;
-        for (let i = 0; i < outputIR.length; i++) maxAmp = Math.max(maxAmp, Math.abs(outputIR[i]));
-        if (maxAmp > 0) {
-            const scale = 1.0 / maxAmp;
-            for (let i = 0; i < outputIR.length; i++) outputIR[i] *= scale;
-            console.log(`[DFM applyFrequencyFiltering] Combined monoIR normalized. MaxAmp: ${maxAmp.toExponential(3)}, Scale: ${scale.toExponential(3)}`);
+        bandGainsApplied[freq] = bandGain;
+        console.log(`  - Freq: ${freq}Hz, RMS: ${calculateRMS(ir).toExponential(3)}, Applied Gain: ${bandGain.toFixed(2)} (RoomVol: ${this.roomVolume.toFixed(0)}m3)`);
+        for (let i = 0; i < Math.min(ir.length, totalLength); i++) {
+            outputIR[i] += ir[i] * bandGain;
         }
-        const rmsAfterNorm = calculateRMS(outputIR);
-        console.log(`[DFM applyFrequencyFiltering] Combined monoIR RMS after normalization: ${rmsAfterNorm.toExponential(3)}`);
-        return outputIR;
     }
+    console.log("[DFM applyFrequencyFiltering] Applied Band Gains:", bandGainsApplied);
+    const rmsAfterCombining = calculateRMS(outputIR);
+    console.log(`[DFM applyFrequencyFiltering] Combined monoIR RMS (NO DFM internal peak normalization): ${rmsAfterCombining.toExponential(3)}`);
+    
+    return outputIR;
+}
 
     public processLateReverberation(
         lateHits: any[], camera: Camera, roomConfig: any, sampleRate: number
@@ -171,7 +185,6 @@ export class DiffuseFieldModelModified {
         this.meanAbsorption = this.calculateMeanAbsorption(roomConfig.materials);
         console.log(`[DFM processLateReverberation] Updated Room Vol: ${this.roomVolume.toFixed(2)}, Surface Area: ${this.surfaceArea.toFixed(2)}`);
         console.log(`[DFM processLateReverberation] Updated Mean Absorption:`, JSON.parse(JSON.stringify(this.meanAbsorption)));
-
 
         if (!lateHits || lateHits.length === 0) {
             const minLength = Math.ceil(0.2 * sampleRate);
@@ -256,7 +269,7 @@ export class DiffuseFieldModelModified {
 
             tempRT60Log[`${freq}Hz_base`] = rt60.toFixed(2);
 
-            if (parseInt(freq) < 500) rt60 *= 1.05;
+            if (parseInt(freq) < 500) rt60 *= 1.05; 
             else if (parseInt(freq) > 2000) rt60 *= 0.9; 
             
             tempRT60Log[`${freq}Hz_adjusted`] = rt60.toFixed(2);
@@ -268,8 +281,8 @@ export class DiffuseFieldModelModified {
     }
 
     public combineWithEarlyReflections( /* ... */ ): Float32Array {
-        // Method unchanged, not re-listing for brevity
-        const earlyReflections = arguments[0]; // Placeholder for actual args
+        // Method unchanged
+        const earlyReflections = arguments[0]; 
         const diffuseField = arguments[1];
         const crossoverTime = arguments[2];
         const earlyLength = earlyReflections.length;

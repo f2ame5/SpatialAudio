@@ -438,34 +438,38 @@ export class RayTracer {
     }
 
     private createListenerRelativeHit(
-        interactionPointWorld: vec3, energiesAtInteraction: FrequencyBands, timeAtInteraction: number,
-        phaseAtInteraction: number, frequencyAtInteraction: number, dopplerShiftAtInteraction: number,
-        bounces: number, type: 'reflection' | 'diffraction' | 'direct'
-    ): RayHit {
-        const listenerPos = this.camera.getPosition();
-        const vecToListener = vec3.subtract(vec3.create(), listenerPos, interactionPointWorld);
-        const distanceToListener = vec3.length(vecToListener);
-        const directionFromInteractionToListener = vec3.normalize(vec3.create(), vecToListener);
-        const travelTimeToListener = distanceToListener / this.SPEED_OF_SOUND;
-        const totalTimeAtListener = timeAtInteraction + travelTimeToListener;
+    interactionPointWorld: vec3, energiesAtInteraction: FrequencyBands, timeAtInteraction: number,
+    phaseAtInteraction: number, frequencyAtInteraction: number, dopplerShiftAtInteraction: number,
+    bounces: number, type: 'reflection' | 'diffraction' | 'direct'
+): RayHit {
+    const listenerPos = this.camera.getPosition();
+    const vecToListener = vec3.subtract(vec3.create(), listenerPos, interactionPointWorld);
+    const distanceToListener = vec3.length(vecToListener);
+    const directionFromInteractionToListener = vec3.normalize(vec3.create(), vecToListener);
+    const travelTimeToListener = distanceToListener / this.SPEED_OF_SOUND;
+    const totalTimeAtListener = timeAtInteraction + travelTimeToListener;
 
-        const airAbsRay = new Ray(vec3.create(),vec3.create(), 1.0, frequencyAtInteraction);
-        const airAbs = airAbsRay.calculateAirAbsorption(distanceToListener, this.AIR_TEMPERATURE, 50);
+    const airAbsRay = new Ray(vec3.create(),vec3.create(), 1.0, frequencyAtInteraction);
+    const airAbsorptionAmplitudeFactors = airAbsRay.calculateAirAbsorption(distanceToListener, this.AIR_TEMPERATURE, 50);
 
-        const energiesAtListener = { ...energiesAtInteraction };
-        const distanceAttenuation = 1.0 / Math.max(0.01, distanceToListener * distanceToListener);
-        for (const key of Object.keys(energiesAtListener) as Array<keyof FrequencyBands>) {
-            energiesAtListener[key] *= distanceAttenuation;
-            energiesAtListener[key] *= (airAbs as any)[`absorption${key.replace('energy', '')}`];
+    const energiesAtListener = { ...energiesAtInteraction };
+    const distanceAttenuationFactor = 1.0 / Math.max(0.01, distanceToListener * distanceToListener);
+    for (const key of Object.keys(energiesAtListener) as Array<keyof FrequencyBands>) {
+        energiesAtListener[key] *= distanceAttenuationFactor;
+        
+        const bandKeyLookup = `absorption${key.replace('energy', '')}` as keyof typeof airAbsorptionAmplitudeFactors;
+        if (airAbsorptionAmplitudeFactors.hasOwnProperty(bandKeyLookup)) {
+            energiesAtListener[key] *= Math.pow((airAbsorptionAmplitudeFactors as any)[bandKeyLookup], 2);
         }
-        const phaseAtListener = (phaseAtInteraction + (2 * Math.PI * frequencyAtInteraction * travelTimeToListener)) % (2 * Math.PI);
-
-        return {
-            position: vec3.clone(interactionPointWorld), energies: energiesAtListener, time: totalTimeAtListener,
-            phase: phaseAtListener, frequency: frequencyAtInteraction, dopplerShift: dopplerShiftAtInteraction,
-            bounces: bounces, distance: distanceToListener, direction: directionFromInteractionToListener, type: type
-        };
     }
+    const phaseAtListener = (phaseAtInteraction + (2 * Math.PI * frequencyAtInteraction * travelTimeToListener)) % (2 * Math.PI);
+
+    return {
+        position: vec3.clone(interactionPointWorld), energies: energiesAtListener, time: totalTimeAtListener,
+        phase: phaseAtListener, frequency: frequencyAtInteraction, dopplerShift: dopplerShiftAtInteraction,
+        bounces: bounces, distance: distanceToListener, direction: directionFromInteractionToListener, type: type
+    };
+}
 
     private calculateAverageEnergy(energies: FrequencyBands): number {
         const values = Object.values(energies);

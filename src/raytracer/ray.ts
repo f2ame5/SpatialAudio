@@ -92,71 +92,53 @@ export class Ray {
     }
 
     public updateRay(
-        newOrigin: vec3,
-        newDirection: vec3,
-        energyLoss: {
-            absorption125Hz: number,
-            absorption250Hz: number,
-            absorption500Hz: number,
-            absorption1kHz: number,
-            absorption2kHz: number,
-            absorption4kHz: number,
-            absorption8kHz: number,
-            absorption16kHz: number
-        },
-        distance: number,
-        temperature: number = 20,
-        humidity: number = 50
-    ): void {
-        // Debug energy changes
-        const initialEnergy = this.getAverageEnergy();
+    newOrigin: vec3,
+    newDirection: vec3,
+    energyLoss: {
+        absorption125Hz: number,
+        absorption250Hz: number,
+        absorption500Hz: number,
+        absorption1kHz: number,
+        absorption2kHz: number,
+        absorption4kHz: number,
+        absorption8kHz: number,
+        absorption16kHz: number
+    },
+    distance: number,
+    temperature: number = 20,
+    humidity: number = 50
+): void {
+    vec3.copy(this.origin, newOrigin);
+    vec3.normalize(this.direction, newDirection);
 
-       
-        vec3.copy(this.origin, newOrigin);
-        vec3.normalize(this.direction, newDirection);
+    this.energies.energy125Hz *= (1 - energyLoss.absorption125Hz);
+    this.energies.energy250Hz *= (1 - energyLoss.absorption250Hz);
+    this.energies.energy500Hz *= (1 - energyLoss.absorption500Hz);
+    this.energies.energy1kHz *= (1 - energyLoss.absorption1kHz);
+    this.energies.energy2kHz *= (1 - energyLoss.absorption2kHz);
+    this.energies.energy4kHz *= (1 - energyLoss.absorption4kHz);
+    this.energies.energy8kHz *= (1 - energyLoss.absorption8kHz);
+    this.energies.energy16kHz *= (1 - energyLoss.absorption16kHz);
 
-        // Apply frequency-dependent air absorption
-        const airAbsorption = this.calculateAirAbsorption(distance, temperature, humidity);
+    const airAmpFactors = this.calculateAirAbsorption(distance, temperature, humidity);
 
-        // Update energy levels with both material absorption and air absorption
-        // Apply material absorption first (reflection coefficient)
-        this.energies.energy125Hz *= Math.pow(1 - energyLoss.absorption125Hz, 0.5);
-        this.energies.energy250Hz *= Math.pow(1 - energyLoss.absorption250Hz, 0.5);
-        this.energies.energy500Hz *= Math.pow(1 - energyLoss.absorption500Hz, 0.5);
-        this.energies.energy1kHz *= Math.pow(1 - energyLoss.absorption1kHz, 0.5);
-        this.energies.energy2kHz *= Math.pow(1 - energyLoss.absorption2kHz, 0.5);
-        this.energies.energy4kHz *= Math.pow(1 - energyLoss.absorption4kHz, 0.5);
-        this.energies.energy8kHz *= Math.pow(1 - energyLoss.absorption8kHz, 0.5);
-        this.energies.energy16kHz *= Math.pow(1 - energyLoss.absorption16kHz, 0.5);
+    this.energies.energy125Hz *= Math.pow(airAmpFactors.absorption125Hz, 2);
+    this.energies.energy250Hz *= Math.pow(airAmpFactors.absorption250Hz, 2);
+    this.energies.energy500Hz *= Math.pow(airAmpFactors.absorption500Hz, 2);
+    this.energies.energy1kHz *= Math.pow(airAmpFactors.absorption1kHz, 2);
+    this.energies.energy2kHz *= Math.pow(airAmpFactors.absorption2kHz, 2);
+    this.energies.energy4kHz *= Math.pow(airAmpFactors.absorption4kHz, 2);
+    this.energies.energy8kHz *= Math.pow(airAmpFactors.absorption8kHz, 2);
+    this.energies.energy16kHz *= Math.pow(airAmpFactors.absorption16kHz, 2);
 
-        // Then apply air absorption
-        this.energies.energy125Hz *= airAbsorption.absorption125Hz;
-        this.energies.energy250Hz *= airAbsorption.absorption250Hz;
-        this.energies.energy500Hz *= airAbsorption.absorption500Hz;
-        this.energies.energy1kHz *= airAbsorption.absorption1kHz;
-        this.energies.energy2kHz *= airAbsorption.absorption2kHz;
-        this.energies.energy4kHz *= airAbsorption.absorption4kHz;
-        this.energies.energy8kHz *= airAbsorption.absorption8kHz;
-        this.energies.energy16kHz *= airAbsorption.absorption16kHz;
-
-        const finalEnergy = this.getAverageEnergy();
-
-        
-
-        this.pathLength += distance;
-        this.bounces++;
-
-        // Calculate speed of sound (simplified formula)
-        const speedOfSound = 331.3 + 0.6 * temperature;
-
-        // Update time
-        const travelTime = distance / speedOfSound;
-        this.time += travelTime;
-
-        // Update phase (2π * frequency * time)
-        const phaseChange = 2 * Math.PI * this.frequency * travelTime;
-        this.phase = (this.phase + phaseChange) % (2 * Math.PI); // Keep phase between 0 and 2π
-    }
+    this.pathLength += distance;
+    this.bounces++;
+    const speedOfSound = 331.3 + 0.6 * temperature;
+    const travelTime = distance / speedOfSound;
+    this.time += travelTime;
+    const phaseChange = 2 * Math.PI * this.frequency * travelTime;
+    this.phase = (this.phase + phaseChange) % (2 * Math.PI);
+}
 
     private calculateAirAbsorption(distance: number, temperature: number, humidity: number): {
         absorption125Hz: number,
