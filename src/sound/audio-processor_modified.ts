@@ -3,6 +3,7 @@ import { Camera } from '../camera/camera';
 import { Room } from '../room/room';
 import { WaveformRenderer } from '../visualization/waveform-renderer';
 import { RayHit, FrequencyBands } from '../raytracer/raytracer'; // Import FrequencyBands
+import { FeedbackDelayNetwork } from './feedback-delay-network';
 import { DiffuseFieldModelModified } from './diffuse-field-model_modified';
 import { vec3 } from 'gl-matrix';
 
@@ -38,9 +39,11 @@ export class AudioProcessorModified {
     private camera: Camera;
     private diffuseFieldModel: DiffuseFieldModelModified;
     private impulseResponseBuffer: AudioBuffer | null = null;
+    private fdn: FeedbackDelayNetwork;
     private lastImpulseData: Float32Array | null = null;
     private sampleRate: number;
     private lastRayHits: RayHit[] = [];
+    private lastRt60Values: { [freq: string]: number } | null = null;
     private currentSourceNode: AudioBufferSourceNode | null = null;
 
     constructor(audioCtx: AudioContext, room: Room, camera: Camera, sampleRate: number) {
@@ -58,6 +61,7 @@ export class AudioProcessorModified {
              materials: room.config.materials
          };
         this.diffuseFieldModel = new DiffuseFieldModelModified(this.sampleRate, roomConfigForModel);
+        this.fdn = new FeedbackDelayNetwork(this.audioCtx, 16); // Initialize FDN
     }
 
     async processRayHits(
@@ -69,7 +73,7 @@ export class AudioProcessorModified {
             if (!rayHits || !Array.isArray(rayHits) || rayHits.length === 0) {
                 console.warn('[AP processRayHits] No valid ray hits to process'); return;
             }
-            if (!this.diffuseFieldModel) {
+            if (!this.fdn) { // Check FDN instead of diffuseFieldModel for late reverb
                  console.error('[AP processRayHits] Audio components not initialized'); return;
             }
 
@@ -97,49 +101,72 @@ export class AudioProcessorModified {
             throw error;
         }
     }
-    private getAverageRT60(rayHitsForRT60: RayHit[]): number {
-        if (!this.diffuseFieldModel) return 1.0; // Default if DFM not ready
 
-        // Need a roomConfig snapshot for calculateRT60Values
-        // This assumes this.room.config is current.
-        // DFM's calculateRT60Values is private, we'd need to expose it or replicate logic.
-        // For simplicity, let's assume we can get an average RT60.
-        // This part needs proper access to DFM's RT60 calculation or its results.
-        // Let's simulate getting it for now, based on current room config:
-         const roomConfigForRT60 = {
-             dimensions: { 
-                 width: this.room.config.dimensions.width, 
-                 height: this.room.config.dimensions.height, 
-                 depth: this.room.config.dimensions.depth 
-             },
-             materials: this.room.config.materials
-         };
-        // If DiffuseFieldModelModified.calculateRT60Values were public:
-        // const rt60Values = this.diffuseFieldModel.calculateRT60Values(rayHitsForRT60, roomConfigForRT60);
-        // For now, we'll use a placeholder logic if direct access isn't available,
-        // or assume processRayHitsInternal has already triggered this and we can fetch from DFM.
-        // To make this work cleanly, DiffuseFieldModelModified should probably store its last calculated avg RT60.
-        // Or, AudioProcessorModified calls calculateRT60Values and passes results around.
+    // Add these methods to the AudioProcessorModified class
 
-        // Let's assume processRayHitsInternal will calculate and store avgRT60 for playAudioWithIR to use.
-        // This requires adding a property like this.lastAverageRT60 = avgRT60;
-        // For now, as a placeholder if that's not done:
-        const V = this.room.config.dimensions.width * this.room.config.dimensions.height * this.room.config.dimensions.depth;
-        const S = 2 * (
-            this.room.config.dimensions.width * this.room.config.dimensions.height +
-            this.room.config.dimensions.width * this.room.config.dimensions.depth +
-            this.room.config.dimensions.height * this.room.config.dimensions.depth
-        );
-        // Simplified average absorption (e.g., at 1kHz)
-        const avgAbs = (
-            this.room.config.materials.walls.absorption1kHz +
-            this.room.config.materials.ceiling.absorption1kHz +
-            this.room.config.materials.floor.absorption1kHz
-        ) / 3;
-        const effectiveAvgAbs = Math.max(0.01, avgAbs);
-        let estimatedAvgRT60 = (0.161 * V) / (S * effectiveAvgAbs);
-        estimatedAvgRT60 = Math.max(0.1, Math.min(5.0, estimatedAvgRT60)); // Clamp
-        return estimatedAvgRT60;
+    private getMeanAbsorptionForRoom(materials: any): { [freq: string]: number } {
+        const result: { [freq: string]: number } = {
+            '125': 0, '250': 0, '500': 0, '1000': 0,
+            '2000': 0, '4000': 0, '8000': 0, '16000': 0
+        };
+        // let totalSurfaceAreaFactor = 0; // Used to weight material contributions if areas were different
+
+        // Simplified: assumes materials object has 'walls', 'ceiling', 'floor' keys
+        // and each contributes somewhat equally. A more advanced model might take actual surface areas.
+        const surfaceTypes = ['walls', 'ceiling', 'floor'];
+        let surfacesProcessed = 0;
+
+        for (const type of surfaceTypes) {
+            const material = materials[type];
+            if (material) {
+                surfacesProcessed++;
+                result['125'] += (material as any).absorption125Hz || 0.1;
+                result['250'] += (material as any).absorption250Hz || 0.1;
+                result['500'] += (material as any).absorption500Hz || 0.1;
+                result['1000'] += (material as any).absorption1kHz || 0.1;
+                result['2000'] += (material as any).absorption2kHz || 0.1;
+                result['4000'] += (material as any).absorption4kHz || 0.1;
+                result['8000'] += (material as any).absorption8kHz || 0.1;
+                result['16000'] += (material as any).absorption16kHz || 0.1;
+            }
+        }
+
+        if (surfacesProcessed > 0) {
+            for (const freq in result) {
+                result[freq] /= surfacesProcessed;
+            }
+        } else { // Fallback if no materials defined
+            for (const freq in result) result[freq] = 0.2; // Default average absorption
+        }
+        return result;
+    }
+
+    private calculateRt60ValuesForFDN(roomConfig: any): { [freq: string]: number } {
+        const frequencies = ['125', '250', '500', '1000', '2000', '4000', '8000', '16000'];
+        const rt60Values: { [freq: string]: number } = {};
+
+        const meanAbsorption = this.getMeanAbsorptionForRoom(roomConfig.materials);
+
+        const V = Math.max(roomConfig.dimensions.width * roomConfig.dimensions.height * roomConfig.dimensions.depth, 1.0);
+        const S = Math.max(2 * (roomConfig.dimensions.width * roomConfig.dimensions.height +
+                            roomConfig.dimensions.width * roomConfig.dimensions.depth +
+                            roomConfig.dimensions.height * roomConfig.dimensions.depth), 6.0);
+
+        for (const freq of frequencies) {
+            const absorption = meanAbsorption[freq] || 0.2; // Default absorption if not found
+            const effectiveAbsorption = Math.max(absorption, 0.01);
+            let rt60 = 0.161 * V / (S * effectiveAbsorption); // Sabine's formula
+
+            // Empirical adjustments (can be fine-tuned)
+            if (parseInt(freq) < 500) rt60 *= 1.05; // Slightly longer decay for low frequencies
+            else if (parseInt(freq) > 2000) rt60 *= 0.9; // Slightly shorter decay for high frequencies
+            
+            // tempRT60Log[`${freq}Hz_adjusted`] = rt60.toFixed(2);
+            rt60Values[freq] = Math.min(Math.max(rt60, 0.05), 5.0); // Clamp RT60 (e.g., 0.05s to 5s)
+            // tempRT60Log[`${freq}Hz_final`] = rt60Values[freq].toFixed(2);
+        }
+        // console.log("[AP FDN RT60] Calculated RT60s (s):", tempRT60Log);
+        return rt60Values;
     }
 
     private processRayHitsInternal(hits: RayHit[]): [Float32Array, Float32Array] {
@@ -264,34 +291,66 @@ export class AudioProcessorModified {
             }
             const avgRmsEarly = (countNonZeroEarly > 10) ? Math.sqrt((sumSqEarlyL + sumSqEarlyR) / (2 * countNonZeroEarly)) : 1e-6;
 
-
             const lateHits = sortedHits.filter(hit => hit.time >= earlyReflectionCutoffTime);
-            let generatedLateL = new Float32Array(0); // Initialize as empty
-            let generatedLateR = new Float32Array(0);
+            // Late reverberation using FDN
+            // Determine the length of the late reverberation part
+            const lateIrLength = Math.max(1, irLength - crossfadeStartSample);
+            let generatedLateL = new Float32Array(lateIrLength);
+            let generatedLateR = new Float32Array(lateIrLength);
 
-            if (lateHits.length > 0 && this.diffuseFieldModel) {
-                 const roomConfig = {
+            if (lateHits.length > 0 && lateIrLength > 0 && this.fdn) { // Check if FDN is available
+                const roomConfigForRT60 = {
                      dimensions: { width: this.room.config.dimensions.width, height: this.room.config.dimensions.height, depth: this.room.config.dimensions.depth },
                      materials: this.room.config.materials
-                 };
-                 try {
-                    [generatedLateL, generatedLateR] = this.diffuseFieldModel.processLateReverberation(
-                        lateHits, this.camera, roomConfig, this.sampleRate
-                    );
+                };
+                
+                try {
+                    // Calculate RT60 values for the FDN
+                    const rt60Values = this.calculateRt60ValuesForFDN(roomConfigForRT60);
+                    this.lastRt60Values = rt60Values; // Store for dry/wet mix calculation
+                    this.fdn.setRT60(rt60Values);
+                    this.fdn.setDryWetMix(0.0, 1.0); // We want fully wet signal for reverb tail
+
+                    // Create a mono impulse input signal for the FDN
+                    const fdnInputMono = new Float32Array(lateIrLength);
+                    if (fdnInputMono.length > 0) {
+                        fdnInputMono[0] = 0.5; // Impulse, scaled down to avoid overly loud FDN output initially
+                                               // This may need tuning.
+                    }
+
+                    // Process the mono impulse with FDN's stereo processor
+                    // This relies on the FDN's internal structure to create a stereo output
+                    [generatedLateL, generatedLateR] = this.fdn.processStereo(fdnInputMono, fdnInputMono);
+                    
+                    console.log(`[AP processInternal] FDN generated late reverb. Length: ${generatedLateL.length}`);
+
                 } catch (e) {
-                    console.error("Error generating late reverberation:", e);
+                    console.error("Error generating late reverberation with FDN:", e);
+                    // Fallback to empty if FDN fails
+                    generatedLateL = new Float32Array(lateIrLength);
+                    generatedLateR = new Float32Array(lateIrLength);
                 }
+            } else {
+                // Fallback if no late hits, insufficient length, or FDN not present
+                if (lateIrLength > 0) {
+                    generatedLateL = new Float32Array(lateIrLength);
+                    generatedLateR = new Float32Array(lateIrLength);
+                }
+                 console.warn("[AP processInternal] FDN not used for late reverb (no late hits, insufficient length, or FDN missing).");
             }
             
-            const rmsDFM_L = calculateRMS(generatedLateL);
-            const rmsDFM_R = calculateRMS(generatedLateR);
-            const avgRmsDFM = (rmsDFM_L + rmsDFM_R) / 2;
-            if (avgRmsDFM < 1e-9) { // If DFM output is silent, no reverb gain needed
-                 console.warn("[AP processInternal] DFM output is silent or near silent.");
+            const rmsFdnL = calculateRMS(generatedLateL);
+            const rmsFdnR = calculateRMS(generatedLateR);
+            const avgRmsLate = (rmsFdnL + rmsFdnR) / 2;
+            
+            if (avgRmsLate < 1e-9 && generatedLateL.length > 0) {
+                 console.warn("[AP processInternal] FDN output is silent or near silent. Adding a small impulse to prevent zero division.");
+                 generatedLateL[0] = 1e-9; // Add tiny impulse to avoid NaN/Infinity gain
+                 generatedLateR[0] = 1e-9;
             }
 
             const desiredLateToEarlyRMS  = 0.5; 
-            let calculatedLateReverbGain = (avgRmsDFM > 1e-9) ? (desiredLateToEarlyRMS * avgRmsEarly) / avgRmsDFM : 0.0;
+            let calculatedLateReverbGain = (avgRmsLate > 1e-9) ? (desiredLateToEarlyRMS * avgRmsEarly) / avgRmsLate : 0.0;
 
             const currentRoomVolume = this.room.config.dimensions.width * this.room.config.dimensions.height * this.room.config.dimensions.depth;
             const referenceRoomVolumeForScaling = 150; 
@@ -300,9 +359,13 @@ export class AudioProcessorModified {
 
             calculatedLateReverbGain *= roomSizeGainModulator;
             
-            const lateReverbGain = Math.max(0.0, Math.min(5.0, calculatedLateReverbGain)); 
+            // IMPORTANT: FDN output might be louder or softer than DFM.
+            // This gain might need adjustment, or the FDN impulse input (fdnInputMono[0])
+            // needs to be scaled appropriately. Start with a modest gain.
+            const MAX_FDN_GAIN = 2.0; // Cap the gain to prevent excessive loudness
+            const lateReverbGain = Math.max(0.0, Math.min(MAX_FDN_GAIN, calculatedLateReverbGain)); 
             
-            console.log(`[AP processInternal] RMS Early: ${avgRmsEarly.toExponential(3)}, RMS DFM Out: ${avgRmsDFM.toExponential(3)}, TargetRatio: ${desiredLateToEarlyRMS}, RoomMod: ${roomSizeGainModulator.toFixed(3)}, CalcGain: ${calculatedLateReverbGain.toExponential(3)}, Final LateReverbGain: ${lateReverbGain.toExponential(3)}`);
+            console.log(`[AP processInternal] RMS Early: ${avgRmsEarly.toExponential(3)}, RMS FDN Out (pre-gain): ${avgRmsLate.toExponential(3)}, TargetRatio: ${desiredLateToEarlyRMS}, RoomMod: ${roomSizeGainModulator.toFixed(3)}, CalcGain: ${calculatedLateReverbGain.toExponential(3)}, Final LateReverbGain (FDN): ${lateReverbGain.toExponential(3)}`);
 
 
             const crossfadeEndSample = Math.floor((earlyReflectionCutoffTime + 0.04) * this.sampleRate); // 40ms crossfade
@@ -310,20 +373,31 @@ export class AudioProcessorModified {
 
             if (generatedLateL.length > 0 && generatedLateR.length > 0) {
                 for (let i = 0; i < irLength; i++) {
-                    const lateL_contribution = (i < generatedLateL.length) ? generatedLateL[i] * lateReverbGain : 0;
-                    const lateR_contribution = (i < generatedLateR.length) ? generatedLateR[i] * lateReverbGain : 0;
+                    // Note: The original code applies late reverb from index 0 of generatedLateL/R
+                    // This needs to map to the correct position in the main IR (leftIR/rightIR)
+                    const mainIrIndex = i; // Current index in the full IR
+                    const lateIrBufferIndex = mainIrIndex - crossfadeStartSample; // Index for generatedLateL/R
 
-                    if (i < crossfadeStartSample) {
+                    if (mainIrIndex < crossfadeStartSample) {
+                        // Only early reflections
                         continue;
-                    } else if (i >= crossfadeStartSample && i < crossfadeEndSample) {
-                        const fadePos = (i - crossfadeStartSample) / crossfadeDuration;
+                    } else if (mainIrIndex >= crossfadeStartSample && mainIrIndex < crossfadeEndSample) {
+                        // Crossfade region
+                        const fadePos = (mainIrIndex - crossfadeStartSample) / crossfadeDuration;
                         const earlyGainFactor = 0.5 * (1 + Math.cos(fadePos * Math.PI));
                         const diffuseGainFactor = 0.5 * (1 - Math.cos(fadePos * Math.PI));
-                        leftIR[i] = leftIR[i] * earlyGainFactor + lateL_contribution * diffuseGainFactor;
-                        rightIR[i] = rightIR[i] * earlyGainFactor + lateR_contribution * diffuseGainFactor;
+
+                        const currentLateL = (lateIrBufferIndex >= 0 && lateIrBufferIndex < generatedLateL.length) ? generatedLateL[lateIrBufferIndex] * lateReverbGain : 0;
+                        const currentLateR = (lateIrBufferIndex >= 0 && lateIrBufferIndex < generatedLateR.length) ? generatedLateR[lateIrBufferIndex] * lateReverbGain : 0;
+
+                        leftIR[mainIrIndex] = leftIR[mainIrIndex] * earlyGainFactor + currentLateL * diffuseGainFactor;
+                        rightIR[mainIrIndex] = rightIR[mainIrIndex] * earlyGainFactor + currentLateR * diffuseGainFactor;
                     } else {
-                        leftIR[i] = lateL_contribution;
-                        rightIR[i] = lateR_contribution;
+                        // Only late reverberation
+                         const currentLateL = (lateIrBufferIndex >= 0 && lateIrBufferIndex < generatedLateL.length) ? generatedLateL[lateIrBufferIndex] * lateReverbGain : 0;
+                        const currentLateR = (lateIrBufferIndex >= 0 && lateIrBufferIndex < generatedLateR.length) ? generatedLateR[lateIrBufferIndex] * lateReverbGain : 0;
+                        leftIR[mainIrIndex] = currentLateL;
+                        rightIR[mainIrIndex] = currentLateR;
                     }
                 }
             }
@@ -333,6 +407,33 @@ export class AudioProcessorModified {
             console.error('Error in processRayHitsInternal:', error);
             return [new Float32Array(irLength), new Float32Array(irLength)];
         }
+    }
+
+    private getAverageRT60(): number {
+        if (!this.lastRt60Values || Object.keys(this.lastRt60Values).length === 0) {
+            console.warn("[AP getAverageRT60] lastRt60Values not available, using fallback calculation.");
+            const roomDims = this.room.config.dimensions;
+            const V = (roomDims.width || 10) * (roomDims.height || 3) * (roomDims.depth || 10);
+            const S = 2 * (
+                (roomDims.width || 10) * (roomDims.height || 3) +
+                (roomDims.width || 10) * (roomDims.depth || 10) +
+                (roomDims.height || 3) * (roomDims.depth || 10)
+            );
+            if (V <= 0 || S <= 0) return 1.0;
+            const avgAbs = 0.2; // Generic placeholder average absorption
+            let estimatedAvgRT60 = (0.161 * V) / (S * avgAbs);
+            return Math.max(0.1, Math.min(3.0, estimatedAvgRT60)); // Clamp
+        }
+
+        const values = Object.values(this.lastRt60Values).filter(v => typeof v === 'number' && isFinite(v));
+        if (values.length === 0) return 1.0;
+
+        // Prefer average of mid-frequencies for a more representative single RT60 value
+        const midFreqRT60 = (this.lastRt60Values['500'] + this.lastRt60Values['1000'] + this.lastRt60Values['2000']) / 3;
+        if (isFinite(midFreqRT60) && midFreqRT60 > 0.05) return Math.min(3.0, midFreqRT60);
+
+        const sum = values.reduce((acc, val) => acc + val, 0);
+        return Math.min(3.0, Math.max(0.1, sum / values.length));
     }
 
     public async playAudioWithIR(audioBuffer: AudioBuffer): Promise<void> {
@@ -359,7 +460,7 @@ export class AudioProcessorModified {
 
             const dryGainNode = this.audioCtx.createGain();
             
-            const avgRT60 = this.getAverageRT60(this.lastRayHits); 
+            const avgRT60 = this.getAverageRT60(); 
 
             const minRT60 = 0.2; 
             const maxRT60 = 2.5; 

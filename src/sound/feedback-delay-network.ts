@@ -17,7 +17,8 @@ export class FeedbackDelayNetwork {
         this.delays = [];
         this.feedbackMatrix = [];
         this.gains = new Float32Array(numDelays);
-        this.filters = [];
+        this.filterAlphas = new Float32Array(numDelays); 
+        this.filterStates = new Float32Array(numDelays);
         
         const primes = [743, 769, 797, 823, 853, 877, 907, 937, 
                          967, 997, 1021, 1049, 1087, 1117, 1151, 1181];
