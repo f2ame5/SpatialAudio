@@ -140,7 +140,7 @@ export class Ray {
     this.phase = (this.phase + phaseChange) % (2 * Math.PI);
 }
 
-    private calculateAirAbsorption(distance: number, temperature: number, humidity: number): {
+    public calculateAirAbsorption(distance: number, temperature: number, humidity: number): {
         absorption125Hz: number,
         absorption250Hz: number,
         absorption500Hz: number,

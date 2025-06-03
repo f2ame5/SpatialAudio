@@ -62,28 +62,29 @@ export class AudioProcessorModified {
     }
 
     async processRayHits(
-        rayHits: RayHit[],
+        rayHits: [RayHit[], RayHit[]],
     ): Promise<void> {
-        console.log(`[AP processRayHits] Received ${rayHits.length} ray hits.`);
+        console.log(`[AP processRayHits] Received ray hits for left ear: ${rayHits[0].length}, right ear: ${rayHits[1].length}.`);
         try {
-            // ... (validation as before) ...
-            if (!rayHits || !Array.isArray(rayHits) || rayHits.length === 0) {
-                console.warn('[AP processRayHits] No valid ray hits to process'); return;
+            if (!rayHits || !Array.isArray(rayHits) || rayHits.length !== 2 || !Array.isArray(rayHits[0]) || !Array.isArray(rayHits[1])) {
+                console.warn('[AP processRayHits] Invalid ray hits format: expected [leftHits[], rightHits[]]'); return;
             }
+            const [leftEarHits, rightEarHits] = rayHits;
+
             if (!this.diffuseFieldModel) {
                  console.error('[AP processRayHits] Audio components not initialized'); return;
             }
 
-            const validHits = rayHits.filter(hit => hit && hit.position && hit.energies && isFinite(hit.time));
-            if (validHits.length === 0) {
+            // Combine hits for backward compatibility with methods expecting a single list (e.g., getAverageRT60)
+            const combinedHits = [...leftEarHits, ...rightEarHits].filter(hit => hit && hit.position && hit.energies && isFinite(hit.time));
+            if (combinedHits.length === 0) {
                 console.warn('[AP processRayHits] No valid ray hits after filtering');
                 return;
             }
-            this.lastRayHits = validHits;
-            console.log(`[AP processRayHits] Processing ${validHits.length} valid hits.`);
+            this.lastRayHits = combinedHits; // Store combined hits for RT60 calculation
+            console.log(`[AP processRayHits] Processing combined valid hits: ${combinedHits.length}.`);
 
-
-            const [leftIR, rightIR] = this.processRayHitsInternal(validHits);
+            const [leftIR, rightIR] = this.processRayHitsInternal(leftEarHits, rightEarHits);
 
             const stereoData = new Float32Array(leftIR.length * 2);
             for (let i = 0; i < leftIR.length; i++) {
@@ -143,120 +144,52 @@ export class AudioProcessorModified {
         return estimatedAvgRT60;
     }
 
-    private processRayHitsInternal(hits: RayHit[]): [Float32Array, Float32Array] {
+    private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [Float32Array, Float32Array] {
         const irLength = Math.max(Math.ceil(this.sampleRate * 2.5), 1000); // Increased IR length to 2.5s
         const leftIR = new Float32Array(irLength);
         const rightIR = new Float32Array(irLength);
 
         try {
-            const sortedHits = [...hits].sort((a, b) => a.time - b.time);
             const earlyReflectionCutoffTime = 0.08; // 80ms for early part
 
-            const earlyHits = sortedHits.filter(hit => hit.time < earlyReflectionCutoffTime);
-            for (const hit of earlyHits) {
+            // Process left ear hits
+            const sortedLeftHits = [...leftEarHits].sort((a, b) => a.time - b.time);
+            const earlyLeftHits = sortedLeftHits.filter(hit => hit.time < earlyReflectionCutoffTime);
+            for (const hit of earlyLeftHits) {
                 const sampleIndex = Math.floor(hit.time * this.sampleRate);
                 if (sampleIndex < 0 || sampleIndex >= irLength || !isFinite(sampleIndex)) {
-                     continue;
+                    continue;
                 }
-
                 const totalEnergy = Object.values(hit.energies).reduce((sum: number, e) => sum + (typeof e === 'number' ? e : 0), 0);
-                const loudnessScale = 0.05; 
+                const loudnessScale = 0.05;
                 let amplitude = Math.sqrt(Math.max(0, totalEnergy)) * loudnessScale;
                 amplitude = Math.max(0, Math.min(1.0, amplitude));
                 if (!isFinite(amplitude) || amplitude < 1e-6) {
                     continue;
                 }
-                
-                const listenerPos = this.camera.getPosition();
-                const direction = vec3.create();
-                vec3.subtract(direction, hit.position, listenerPos);
-                const distance = vec3.length(direction);
-                vec3.normalize(direction, direction);
+                leftIR[sampleIndex] += amplitude; // Add directly, ITD/ILD handled by ray tracer
+            }
 
-                const listenerRight = this.camera.getRight();
-                const listenerFront = this.camera.getFront();
-                const listenerUp = this.camera.getUp();
-
-                const dotRight = vec3.dot(direction, listenerRight);
-                const dotFront = vec3.dot(direction, listenerFront);
-                const dotUp = vec3.dot(direction, listenerUp);
-
-                const azimuthRad = Math.atan2(dotRight, dotFront);
-                const elevationRad = Math.asin(Math.max(-1, Math.min(1, dotUp)));
-
-               const hrtfGains = this.calculateProceduralHrtfGains(azimuthRad, elevationRad, distance);
-               let leftGain = hrtfGains.left.energy1kHz; // Use 1kHz as a representative for overall gain
-               let rightGain = hrtfGains.right.energy1kHz; // Use 1kHz as a representative for overall gain
-
-               if (!isFinite(leftGain) || !isFinite(rightGain)) {
-                   leftGain = 0; rightGain = 0;
-               }
-
-                let itd_samples = this.calculateITDsamples(azimuthRad, this.sampleRate);
-                if (!isFinite(itd_samples)) {
-                    itd_samples = 0;
+            // Process right ear hits
+            const sortedRightHits = [...rightEarHits].sort((a, b) => a.time - b.time);
+            const earlyRightHits = sortedRightHits.filter(hit => hit.time < earlyReflectionCutoffTime);
+            for (const hit of earlyRightHits) {
+                const sampleIndex = Math.floor(hit.time * this.sampleRate);
+                if (sampleIndex < 0 || sampleIndex >= irLength || !isFinite(sampleIndex)) {
+                    continue;
                 }
-
-                let leftDelaySamples = 0;
-                let rightDelaySamples = 0;
-                if (itd_samples > 0) {
-                    rightDelaySamples = Math.round(itd_samples); 
-                } else if (itd_samples < 0) {
-                    leftDelaySamples = Math.round(-itd_samples); 
+                const totalEnergy = Object.values(hit.energies).reduce((sum: number, e) => sum + (typeof e === 'number' ? e : 0), 0);
+                const loudnessScale = 0.05;
+                let amplitude = Math.sqrt(Math.max(0, totalEnergy)) * loudnessScale;
+                amplitude = Math.max(0, Math.min(1.0, amplitude));
+                if (!isFinite(amplitude) || amplitude < 1e-6) {
+                    continue;
                 }
-                
-                const spreadDurationSamples = Math.floor(this.sampleRate * 0.008); 
-                const decayConstant = spreadDurationSamples > 0 ? spreadDurationSamples / 4 : 1; 
-
-                let sumOfSpreadGains = 0;
-                if (decayConstant > 0 && spreadDurationSamples > 0) {
-                    for (let k_sum = 0; k_sum < spreadDurationSamples; k_sum++) {
-                        sumOfSpreadGains += Math.exp(-k_sum / decayConstant);
-                    }
-                }
-                if (sumOfSpreadGains < 1e-9) { 
-                    sumOfSpreadGains = 1; 
-                }
-
-                const baseLeftIndex = sampleIndex + leftDelaySamples;
-                for (let k = 0; k < spreadDurationSamples; k++) {
-                    const fractionalIndex = baseLeftIndex + k;
-                    const floorIndex = Math.floor(fractionalIndex);
-                    const ceilIndex = Math.ceil(fractionalIndex);
-                    const fraction = fractionalIndex - floorIndex;
-
-                    const spreadGain = decayConstant > 0 ? Math.exp(-k / decayConstant) : 1;
-                    const val = (amplitude * leftGain * spreadGain) / sumOfSpreadGains;
-
-                    if (floorIndex >= 0 && floorIndex < irLength) {
-                        leftIR[floorIndex] += val * (1 - fraction);
-                    }
-                    if (ceilIndex >= 0 && ceilIndex < irLength && fraction > 0 && floorIndex !== ceilIndex) { 
-                        leftIR[ceilIndex] += val * fraction;
-                    }
-                }
-
-                const baseRightIndex = sampleIndex + rightDelaySamples;
-                 for (let k = 0; k < spreadDurationSamples; k++) {
-                    const fractionalIndex = baseRightIndex + k;
-                    const floorIndex = Math.floor(fractionalIndex);
-                    const ceilIndex = Math.ceil(fractionalIndex);
-                    const fraction = fractionalIndex - floorIndex;
-
-                    const spreadGain = decayConstant > 0 ? Math.exp(-k / decayConstant) : 1;
-                    const val = (amplitude * rightGain * spreadGain) / sumOfSpreadGains;
-
-                    if (floorIndex >= 0 && floorIndex < irLength) {
-                        rightIR[floorIndex] += val * (1 - fraction);
-                    }
-                    if (ceilIndex >= 0 && ceilIndex < irLength && fraction > 0 && floorIndex !== ceilIndex) { 
-                        rightIR[ceilIndex] += val * fraction;
-                    }
-                }
+                rightIR[sampleIndex] += amplitude; // Add directly, ITD/ILD handled by ray tracer
             }
 
             const crossfadeStartSample = Math.floor(earlyReflectionCutoffTime * this.sampleRate);
-            
+
             let sumSqEarlyL = 0, sumSqEarlyR = 0;
             let countNonZeroEarly = 0;
             for (let i = 0; i < crossfadeStartSample; i++) {
@@ -268,19 +201,24 @@ export class AudioProcessorModified {
             }
             const avgRmsEarly = (countNonZeroEarly > 10) ? Math.sqrt((sumSqEarlyL + sumSqEarlyR) / (2 * countNonZeroEarly)) : 1e-6;
 
+            const lateLeftHits = sortedLeftHits.filter(hit => hit.time >= earlyReflectionCutoffTime);
+            const lateRightHits = sortedRightHits.filter(hit => hit.time >= earlyReflectionCutoffTime);
 
-            const lateHits = sortedHits.filter(hit => hit.time >= earlyReflectionCutoffTime);
             let generatedLateL = new Float32Array(0); // Initialize as empty
             let generatedLateR = new Float32Array(0);
 
-            if (lateHits.length > 0 && this.diffuseFieldModel) {
+            if ((lateLeftHits.length > 0 || lateRightHits.length > 0) && this.diffuseFieldModel) {
                  const roomConfig = {
                      dimensions: { width: this.room.config.dimensions.width, height: this.room.config.dimensions.height, depth: this.room.config.dimensions.depth },
                      materials: this.room.config.materials
                  };
                  try {
+                    // Pass late hits for both ears to diffuse field model for RT60 calculation
+                    // And pass combined late hits for frequency filtering
+                    const combinedLateHitsForDFM = [...lateLeftHits, ...lateRightHits];
+
                     [generatedLateL, generatedLateR] = this.diffuseFieldModel.processLateReverberation(
-                        lateHits, this.camera, roomConfig, this.sampleRate
+                        combinedLateHitsForDFM, this.camera, roomConfig, this.sampleRate
                     );
                 } catch (e) {
                     console.error("Error generating late reverberation:", e);
@@ -290,26 +228,26 @@ export class AudioProcessorModified {
             const rmsDFM_L = calculateRMS(generatedLateL);
             const rmsDFM_R = calculateRMS(generatedLateR);
             const avgRmsDFM = (rmsDFM_L + rmsDFM_R) / 2;
-            if (avgRmsDFM < 1e-9) { // If DFM output is silent, no reverb gain needed
+            if (avgRmsDFM < 1e-9) {
                  console.warn("[AP processInternal] DFM output is silent or near silent.");
             }
 
-            const desiredLateToEarlyRMS  = 0.5; 
+            const desiredLateToEarlyRMS  = 0.5;
             let calculatedLateReverbGain = (avgRmsDFM > 1e-9) ? (desiredLateToEarlyRMS * avgRmsEarly) / avgRmsDFM : 0.0;
 
             const currentRoomVolume = this.room.config.dimensions.width * this.room.config.dimensions.height * this.room.config.dimensions.depth;
-            const referenceRoomVolumeForScaling = 150; 
+            const referenceRoomVolumeForScaling = 150;
             const volumeScaleFactor = Math.sqrt(currentRoomVolume / referenceRoomVolumeForScaling);
-            const roomSizeGainModulator = Math.min(1.5, Math.max(0.3, volumeScaleFactor)); 
+            const roomSizeGainModulator = Math.min(1.5, Math.max(0.3, volumeScaleFactor));
 
             calculatedLateReverbGain *= roomSizeGainModulator;
             
-            const lateReverbGain = Math.max(0.0, Math.min(5.0, calculatedLateReverbGain)); 
+            const lateReverbGain = Math.max(0.0, Math.min(5.0, calculatedLateReverbGain));
             
             console.log(`[AP processInternal] RMS Early: ${avgRmsEarly.toExponential(3)}, RMS DFM Out: ${avgRmsDFM.toExponential(3)}, TargetRatio: ${desiredLateToEarlyRMS}, RoomMod: ${roomSizeGainModulator.toFixed(3)}, CalcGain: ${calculatedLateReverbGain.toExponential(3)}, Final LateReverbGain: ${lateReverbGain.toExponential(3)}`);
 
 
-            const crossfadeEndSample = Math.floor((earlyReflectionCutoffTime + 0.04) * this.sampleRate); // 40ms crossfade
+            const crossfadeEndSample = Math.floor((earlyReflectionCutoffTime + 0.04) * this.sampleRate);
             const crossfadeDuration = Math.max(1, crossfadeEndSample - crossfadeStartSample);
 
             if (generatedLateL.length > 0 && generatedLateR.length > 0) {
@@ -544,15 +482,6 @@ export class AudioProcessorModified {
     }
 
 
-    private calculateITDsamples(azimuthRad: number, sampleRate: number): number {
-        // Method unchanged
-        const headRadius = 0.0875; 
-        const speedOfSound = 343; 
-        const clampedAzimuth = Math.max(-Math.PI, Math.min(Math.PI, azimuthRad));
-        const maxITDSeconds = 0.00065; 
-        const itdSeconds = maxITDSeconds * Math.sin(clampedAzimuth); 
-        return Math.round(itdSeconds * sampleRate);
-    }
 private calculateProceduralHrtfGains(
     azimuthRad: number,
     elevationRad: number,
