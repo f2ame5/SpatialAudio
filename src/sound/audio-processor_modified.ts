@@ -2,7 +2,8 @@
 import { Camera } from '../camera/camera';
 import { Room } from '../room/room';
 import { WaveformRenderer } from '../visualization/waveform-renderer';
-import { RayHit, FrequencyBands } from '../raytracer/raytracer'; // Import FrequencyBands
+import { RayHit } from '../raytracer/raytracer'; // Import RayHit
+import { FrequencyBands } from '../raytracer/ray'; // Import FrequencyBands
 import { DiffuseFieldModelModified } from './diffuse-field-model_modified';
 import { vec3 } from 'gl-matrix';
 
@@ -160,7 +161,7 @@ export class AudioProcessorModified {
 
                 const totalEnergy = Object.values(hit.energies).reduce((sum: number, e) => sum + (typeof e === 'number' ? e : 0), 0);
                 const loudnessScale = 0.05; 
-                let amplitude = Math.sqrt(Math.max(0, totalEnergy)) * Math.exp(-hit.bounces * 0.2) * loudnessScale;
+                let amplitude = Math.sqrt(Math.max(0, totalEnergy)) * loudnessScale;
                 amplitude = Math.max(0, Math.min(1.0, amplitude));
                 if (!isFinite(amplitude) || amplitude < 1e-6) {
                     continue;
@@ -183,10 +184,13 @@ export class AudioProcessorModified {
                 const azimuthRad = Math.atan2(dotRight, dotFront);
                 const elevationRad = Math.asin(Math.max(-1, Math.min(1, dotUp)));
 
-                let [leftGain, rightGain] = this.calculateBalancedSpatialGains(azimuthRad, elevationRad, distance);
-                if (!isFinite(leftGain) || !isFinite(rightGain)) {
-                    leftGain = 0; rightGain = 0;
-                }
+               const hrtfGains = this.calculateProceduralHrtfGains(azimuthRad, elevationRad, distance);
+               let leftGain = hrtfGains.left.energy1kHz; // Use 1kHz as a representative for overall gain
+               let rightGain = hrtfGains.right.energy1kHz; // Use 1kHz as a representative for overall gain
+
+               if (!isFinite(leftGain) || !isFinite(rightGain)) {
+                   leftGain = 0; rightGain = 0;
+               }
 
                 let itd_samples = this.calculateITDsamples(azimuthRad, this.sampleRate);
                 if (!isFinite(itd_samples)) {
@@ -496,10 +500,8 @@ export class AudioProcessorModified {
         }
     }
 
-    public createConvolvedSource( /* ... */ ): { source: AudioBufferSourceNode, convolver: ConvolverNode, wetGain: GainNode } | null {
+    public createConvolvedSource(audioBuffer: AudioBuffer, impulseResponseBuffer: AudioBuffer): { source: AudioBufferSourceNode, convolver: ConvolverNode, wetGain: GainNode } | null {
         // Method unchanged
-        const audioBufferToConvolve = arguments[0];
-        const impulseResponseBuffer = arguments[1];
         if (this.audioCtx.state === 'suspended') {
              this.audioCtx.resume().catch(err => console.error("Error resuming audio context:", err));
         }
@@ -508,7 +510,7 @@ export class AudioProcessorModified {
             convolver.normalize = false;
             convolver.buffer = impulseResponseBuffer;
             const source = this.audioCtx.createBufferSource();
-            source.buffer = audioBufferToConvolve;
+            source.buffer = audioBuffer;
             const wetGain = this.audioCtx.createGain();
             wetGain.gain.value = 1.0; 
             source.connect(convolver);
@@ -532,58 +534,6 @@ export class AudioProcessorModified {
         }
     }
 
-    public async playAudioWithIR(audioBuffer: AudioBuffer): Promise<void> {
-    this.stopAllSounds();
-    if (!this.impulseResponseBuffer) {
-        console.warn('No impulse response buffer available for playback. Playing dry signal only.');
-        const drySource = this.audioCtx.createBufferSource();
-        drySource.buffer = audioBuffer;
-        drySource.connect(this.audioCtx.destination);
-        drySource.start(0);
-        this.currentSourceNode = drySource;
-        drySource.onended = () => {
-            if (this.currentSourceNode === drySource) this.currentSourceNode = null;
-            try { drySource.disconnect(); } catch (e) {}
-        };
-        return;
-    }
-
-    try {
-        const nodes = this.createConvolvedSource(audioBuffer, this.impulseResponseBuffer);
-        if (!nodes) return;
-
-        const { source, convolver, wetGain } = nodes;
-
-        const dryGainNode = this.audioCtx.createGain();
-        dryGainNode.gain.value = 0.3; // 30% dry
-
-        wetGain.gain.value = 0.7; // 70% wet
-
-        source.connect(dryGainNode);
-        dryGainNode.connect(this.audioCtx.destination);
-        
-        wetGain.connect(this.audioCtx.destination);
-
-
-        this.currentSourceNode = source;
-        source.onended = () => {
-            if (this.currentSourceNode === source) this.currentSourceNode = null;
-            try { 
-                wetGain.disconnect(); 
-                convolver.disconnect(); 
-                source.disconnect(convolver); // Source was connected to convolver
-                dryGainNode.disconnect();
-                source.disconnect(dryGainNode); // Source was also connected to dryGainNode
-            } catch (e) {
-                console.warn("Error during node cleanup onended:", e);
-            }
-        };
-        source.start(0);
-    } catch (error) {
-        console.error('Error playing audio with IR:', error);
-        this.currentSourceNode = null;
-    }
-}
 
     public stopAllSounds(): void {
         // Method unchanged
@@ -593,34 +543,6 @@ export class AudioProcessorModified {
         }
     }
 
-    private calculateBalancedSpatialGains(
-        azimuthRad: number, elevationRad: number, distance: number
-    ): [number, number] {
-        // Method unchanged
-        const pi = Math.PI;
-        const piOver2 = pi / 2;
-        const clampedAzimuth = Math.max(-pi, Math.min(pi, azimuthRad));
-        const sinAz = Math.sin(clampedAzimuth);
-
-        const baseGain = 0.707; 
-        let leftGain = baseGain * (1 - sinAz * 0.8); 
-        let rightGain = baseGain * (1 + sinAz * 0.8);
-
-        const elevationFactor = 1.0 - Math.abs(elevationRad) / piOver2 * 0.3;
-        leftGain *= elevationFactor;
-        rightGain *= elevationFactor;
-
-        const distanceAtten = 1.0 / Math.max(1, distance);
-        leftGain *= distanceAtten;
-        rightGain *= distanceAtten;
-
-        if (Math.abs(clampedAzimuth) > piOver2) {
-            const backFactor = 0.8;
-            leftGain *= backFactor;
-            rightGain *= backFactor;
-        }
-        return [Math.max(0, Math.min(1.5, leftGain)), Math.max(0, Math.min(1.5, rightGain))];
-    }
 
     private calculateITDsamples(azimuthRad: number, sampleRate: number): number {
         // Method unchanged
@@ -631,4 +553,60 @@ export class AudioProcessorModified {
         const itdSeconds = maxITDSeconds * Math.sin(clampedAzimuth); 
         return Math.round(itdSeconds * sampleRate);
     }
+private calculateProceduralHrtfGains(
+    azimuthRad: number,
+    elevationRad: number,
+    distance: number
+): { left: FrequencyBands, right: FrequencyBands } {
+    const headRadius = 0.0875; // meters
+    const speedOfSound = 343; // m/s
+    
+    // Initial gains (base level for each frequency)
+    const baseGains: FrequencyBands = {
+        energy125Hz: 1.0, energy250Hz: 1.0, energy500Hz: 1.0, energy1kHz: 1.0,
+        energy2kHz: 1.0, energy4kHz: 1.0, energy8kHz: 1.0, energy16kHz: 1.0
+    };
+    
+    let leftGains = { ...baseGains };
+    let rightGains = { ...baseGains };
+
+    const frequencies = [125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+    const energyKeys = Object.keys(baseGains) as Array<keyof typeof baseGains>;
+
+    // Model Head Shadow (Interaural Level Difference - ILD)
+    // This effect is more pronounced for higher frequencies
+    const pathDifference = headRadius * (Math.abs(azimuthRad) + Math.sin(Math.abs(azimuthRad)));
+    
+    for (let i = 0; i < frequencies.length; i++) {
+        const freq = frequencies[i];
+        const key = energyKeys[i];
+        const wavelength = speedOfSound / freq;
+        
+        // Attenuation is stronger when the wavelength is smaller than the path difference
+        const shadowEffect = 1.0 - 0.7 * Math.min(1.0, Math.max(0, pathDifference / wavelength));
+        
+        if (azimuthRad > 0) { // Sound is from the right
+            leftGains[key] *= shadowEffect;
+        } else { // Sound is from the left
+            rightGains[key] *= shadowEffect;
+        }
+    }
+    
+    // Model simple pinna effect for elevation (adds a bit of color)
+    // This creates a subtle notch/peak based on elevation
+    const elevationFactor = 1.0 - Math.abs(elevationRad) / (Math.PI / 2) * 0.2;
+    for (const key of energyKeys) {
+        leftGains[key] *= elevationFactor;
+        rightGains[key] *= elevationFactor;
+    }
+    
+    // Apply general distance attenuation
+    const distanceAtten = 1.0 / Math.max(1, distance);
+    for (const key of energyKeys) {
+        leftGains[key] *= distanceAtten;
+        rightGains[key] *= distanceAtten;
+    }
+
+    return { left: leftGains, right: rightGains };
+}
 }

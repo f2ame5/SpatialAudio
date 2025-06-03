@@ -117,60 +117,55 @@ export class DiffuseFieldModelModified {
     }
 
     public applyFrequencyFiltering(
-    impulseResponses: Map<string, Float32Array>
+    impulseResponses: Map<string, Float32Array>,
+    lateHits: any[] // Pass in the late hits from the simulation
 ): Float32Array {
     const anyIR = impulseResponses.values().next().value;
     const totalLength = anyIR ? anyIR.length : 0;
     if (totalLength === 0) return new Float32Array(0);
 
-    console.log("[DFM applyFrequencyFiltering] Energies of individual diffuse bands (RMS before gain):");
-    const bandGainsApplied: { [key: string]: number } = {};
+    const bandGains: { [key: string]: number } = {};
+    const totalEnergyPerBand: { [key: string]: number } = {
+        '125': 0, '250': 0, '500': 0, '1000': 0,
+        '2000': 0, '4000': 0, '8000': 0, '16000': 0
+    };
+    const frequencies = Object.keys(totalEnergyPerBand);
 
-    const outputIR = new Float32Array(totalLength);
-
-    const smallRoomThreshold = 50; 
-    const isSmallRoom = this.roomVolume < smallRoomThreshold;
-    const verySmallRoomThreshold = 25;
-    const isVerySmallRoom = this.roomVolume < verySmallRoomThreshold;
-
-
-    for (const [freq, ir] of impulseResponses.entries()) {
-        let bandGain = 1.0;
-        switch (freq) {
-            case '125': 
-                bandGain = isVerySmallRoom ? 0.10 : isSmallRoom ? 0.20 : 0.30; 
-                break;
-            case '250': 
-                bandGain = isVerySmallRoom ? 0.20 : isSmallRoom ? 0.35 : 0.45; 
-                break;
-            case '500': 
-                bandGain = isSmallRoom ? 0.65 : 0.70;
-                break;
-            case '1000': 
-                bandGain = 1.0; 
-                break;
-            case '2000': 
-                bandGain = 0.90; 
-                break;
-            case '4000': 
-                bandGain = isSmallRoom ? 0.85 : 0.80; 
-                break;
-            case '8000': 
-                bandGain = isSmallRoom ? 0.75 : 0.70; 
-                break;
-            case '16000': 
-                bandGain = isSmallRoom ? 0.70 : 0.60; 
-                break;
-        }
-        bandGainsApplied[freq] = bandGain;
-        console.log(`  - Freq: ${freq}Hz, RMS: ${calculateRMS(ir).toExponential(3)}, Applied Gain: ${bandGain.toFixed(2)} (RoomVol: ${this.roomVolume.toFixed(0)}m3)`);
-        for (let i = 0; i < Math.min(ir.length, totalLength); i++) {
-            outputIR[i] += ir[i] * bandGain;
+    // 1. Calculate the total energy for each frequency band from the late hits
+    for (const hit of lateHits) {
+        if (hit.energies) {
+            totalEnergyPerBand['125'] += hit.energies.energy125Hz || 0;
+            totalEnergyPerBand['250'] += hit.energies.energy250Hz || 0;
+            totalEnergyPerBand['500'] += hit.energies.energy500Hz || 0;
+            totalEnergyPerBand['1000'] += hit.energies.energy1kHz || 0;
+            totalEnergyPerBand['2000'] += hit.energies.energy2kHz || 0;
+            totalEnergyPerBand['4000'] += hit.energies.energy4kHz || 0;
+            totalEnergyPerBand['8000'] += hit.energies.energy8kHz || 0;
+            totalEnergyPerBand['16000'] += hit.energies.energy16kHz || 0;
         }
     }
-    console.log("[DFM applyFrequencyFiltering] Applied Band Gains:", bandGainsApplied);
-    const rmsAfterCombining = calculateRMS(outputIR);
-    console.log(`[DFM applyFrequencyFiltering] Combined monoIR RMS (NO DFM internal peak normalization): ${rmsAfterCombining.toExponential(3)}`);
+
+    // 2. Normalize the energies to get the final band gains
+    const maxEnergy = Math.max(...Object.values(totalEnergyPerBand));
+    if (maxEnergy > 0) {
+        for (const freq of frequencies) {
+            bandGains[freq] = totalEnergyPerBand[freq] / maxEnergy;
+        }
+    } else {
+        // Fallback if there's no energy
+        for (const freq of frequencies) { bandGains[freq] = 1.0; }
+    }
+    
+    console.log("[DFM applyFrequencyFiltering] Data-driven Band Gains:", bandGains);
+
+    // 3. Combine the diffuse responses using the new data-driven gains
+    const outputIR = new Float32Array(totalLength);
+    for (const [freq, ir] of impulseResponses.entries()) {
+        const gain = bandGains[freq] || 0;
+        for (let i = 0; i < Math.min(ir.length, totalLength); i++) {
+            outputIR[i] += ir[i] * gain;
+        }
+    }
     
     return outputIR;
 }
@@ -200,7 +195,7 @@ export class DiffuseFieldModelModified {
         console.log(`[DFM processLateReverberation] Max RT60: ${maxRT60.toFixed(2)}s, Reverb Gen Duration: ${reverbGenerationDuration.toFixed(2)}s`);
 
         const diffuseResponses = this.generateDiffuseField(reverbGenerationDuration, rt60Values);
-        const monoIR = this.applyFrequencyFiltering(diffuseResponses);
+        const monoIR = this.applyFrequencyFiltering(diffuseResponses, lateHits);
 
         if (!monoIR || monoIR.length === 0) {
             const minLength = Math.ceil(0.2 * sampleRate);
@@ -256,27 +251,65 @@ export class DiffuseFieldModelModified {
     private calculateRT60Values(lateHits: any[], roomConfig: any): { [freq: string]: number } {
         const frequencies = ['125', '250', '500', '1000', '2000', '4000', '8000', '16000'];
         const rt60Values: { [freq: string]: number } = {};
-        
-        console.log(`[DFM calculateRT60Values] Using V=${this.roomVolume.toFixed(2)}, S=${this.surfaceArea.toFixed(2)}`);
-        const tempRT60Log: any = {};
+
+        // Find the latest time among all hits to determine the analysis duration
+        const maxTime = lateHits.reduce((max, hit) => Math.max(max, hit.time), 0);
+        const numBins = 50; // Use 50 time bins for the energy decay analysis
+        const binDuration = maxTime / numBins;
 
         for (const freq of frequencies) {
-            const absorption = this.meanAbsorption[freq] || 0.1;
-            const effectiveAbsorption = Math.max(absorption, 0.01);
-            const V = Math.max(this.roomVolume, 1.0);
-            const S = Math.max(this.surfaceArea, 6.0);
-            let rt60 = 0.161 * V / (S * effectiveAbsorption);
+            const energyKey = `energy${freq}Hz`;
+            const energyBins = new Array(numBins).fill(0);
+            const timeBins = new Array(numBins).fill(0).map((_, i) => (i + 0.5) * binDuration);
 
-            tempRT60Log[`${freq}Hz_base`] = rt60.toFixed(2);
+            // 1. Create a time-energy histogram for the current frequency band
+            for (const hit of lateHits) {
+                const binIndex = Math.floor(hit.time / binDuration);
+                if (binIndex < numBins && hit.energies[energyKey]) {
+                    energyBins[binIndex] += hit.energies[energyKey];
+                }
+            }
 
-            if (parseInt(freq) < 500) rt60 *= 1.05; 
-            else if (parseInt(freq) > 2000) rt60 *= 0.9; 
+            // 2. Convert energy to decibels and find valid points for linear regression
+            const dbPoints: { time: number, db: number }[] = [];
+            let maxDb = -Infinity;
+            for (let i = 0; i < numBins; i++) {
+                if (energyBins[i] > 0) {
+                    const db = 10 * Math.log10(energyBins[i]);
+                    dbPoints.push({ time: timeBins[i], db });
+                    if (db > maxDb) maxDb = db;
+                }
+            }
             
-            tempRT60Log[`${freq}Hz_adjusted`] = rt60.toFixed(2);
-            rt60Values[freq] = Math.min(Math.max(rt60, 0.05), 3.5); 
-            tempRT60Log[`${freq}Hz_final`] = rt60Values[freq].toFixed(2);
+            // Only use points from the peak down to a certain threshold for a stable fit
+            const validPoints = dbPoints.filter(p => p.db > maxDb - 40 && p.db < maxDb - 5);
+            if (validPoints.length < 5) {
+                // Fallback to a default if not enough data
+                rt60Values[freq] = 1.0;
+                continue;
+            }
+
+            // 3. Perform linear regression (y = mx + c, where y is dB and x is time)
+            let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+            for (const p of validPoints) {
+                sumX += p.time;
+                sumY += p.db;
+                sumXY += p.time * p.db;
+                sumX2 += p.time * p.time;
+            }
+            const n = validPoints.length;
+            const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX); // slope is dB/second
+
+            // 4. Calculate RT60 from the slope
+            if (slope < -0.1) { // Ensure decay is actually happening
+                const rt60 = -60 / slope;
+                rt60Values[freq] = Math.min(Math.max(rt60, 0.1), 3.5); // Clamp to a reasonable range
+            } else {
+                rt60Values[freq] = 1.0; // Fallback
+            }
         }
-        console.log("[DFM calculateRT60Values] Calculated RT60s (s):", tempRT60Log);
+        
+        console.log("[DFM calculateRT60Values] Calculated RT60s from simulation:", rt60Values);
         return rt60Values;
     }
 
