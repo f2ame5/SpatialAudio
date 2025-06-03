@@ -146,25 +146,39 @@ export class DiffuseFieldModelModified {
     }
 
     // 2. Normalize the energies to get the final band gains
-    const maxEnergy = Math.max(...Object.values(totalEnergyPerBand));
+    const maxEnergy = Math.max(...Object.values(totalEnergyPerBand).filter(e => e > 0)); // Ensure maxEnergy is positive
     if (maxEnergy > 0) {
         for (const freq of frequencies) {
-            bandGains[freq] = totalEnergyPerBand[freq] / maxEnergy;
+            bandGains[freq] = (totalEnergyPerBand[freq] || 0) / maxEnergy;
         }
     } else {
-        // Fallback if there's no energy
-        for (const freq of frequencies) { bandGains[freq] = 1.0; }
+        for (const freq of frequencies) { bandGains[freq] = 0.0; } // Or 1.0 if you prefer a flat response for silent late hits
     }
     
     console.log("[DFM applyFrequencyFiltering] Data-driven Band Gains:", bandGains);
 
-    // 3. Combine the diffuse responses using the new data-driven gains
     const outputIR = new Float32Array(totalLength);
     for (const [freq, ir] of impulseResponses.entries()) {
         const gain = bandGains[freq] || 0;
-        for (let i = 0; i < Math.min(ir.length, totalLength); i++) {
-            outputIR[i] += ir[i] * gain;
+        if (gain > 0) { // Only process if there's gain to apply
+            for (let i = 0; i < Math.min(ir.length, totalLength); i++) {
+                outputIR[i] += ir[i] * gain;
+            }
         }
+    }
+
+    // **NEW: Add peak normalization for the combined outputIR**
+    let peakValue = 0;
+    for (let i = 0; i < outputIR.length; i++) {
+        peakValue = Math.max(peakValue, Math.abs(outputIR[i]));
+    }
+
+    if (peakValue > 0) {
+        const normalizationFactor = 0.9 / peakValue; // Normalize to a peak of 0.9 to leave some headroom
+        for (let i = 0; i < outputIR.length; i++) {
+            outputIR[i] *= normalizationFactor;
+        }
+        console.log(`[DFM applyFrequencyFiltering] Output IR normalized. Peak was ${peakValue.toExponential(3)}, Factor: ${normalizationFactor.toExponential(3)}`);
     }
     
     return outputIR;
