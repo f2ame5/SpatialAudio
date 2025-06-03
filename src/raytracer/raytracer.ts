@@ -507,22 +507,64 @@ export class RayTracer {
                     });
 
                     const D_orig = ray.getDirection();
-                    const reflectedDir = vec3.create();
-
-                    const dot_v_n = vec3.dot(D_orig, closestPlane.normal);
-                    const term2_scalar_mult_n = vec3.create();
-                    vec3.scale(term2_scalar_mult_n, closestPlane.normal, 2 * dot_v_n);
-                    vec3.subtract(reflectedDir, D_orig, term2_scalar_mult_n);
-                    vec3.normalize(reflectedDir, reflectedDir);
+                    const normal = closestPlane.normal;
                     
-                    const offsetOrigin = vec3.scaleAndAdd(vec3.create(), reflectedHitPoint, reflectedDir, 0.0001);
-                    ray.updateRay(offsetOrigin, reflectedDir, closestPlane.material, reflectionDistanceTraveled, this.AIR_TEMPERATURE, 50);
+                    // Calculate the specular reflection direction (mirror-like)
+                    const specularDir = vec3.create();
+                    const dot_v_n = vec3.dot(D_orig, normal);
+                    vec3.scaleAndAdd(specularDir, D_orig, normal, -2 * dot_v_n);
+                    vec3.normalize(specularDir, specularDir);
+
+                    // Calculate a random diffuse direction in a hemisphere around the normal
+                    // For simplicity, a random vector within a hemisphere defined by normal
+                    const randomDir = vec3.fromValues(Math.random() * 2 - 1, Math.random() * 2 - 1, Math.random() * 2 - 1);
+                    if (vec3.dot(randomDir, normal) < 0) vec3.negate(randomDir, randomDir); // Ensure in hemisphere
+                    vec3.normalize(randomDir, randomDir);
+
+                    // For the ray's NEW direction, you can use an average scattering value
+                    const avgScattering = (closestPlane.material.scattering1kHz + closestPlane.material.scattering4kHz) / 2.0;
+                    const newDirection = vec3.create();
+                    vec3.lerp(newDirection, specularDir, randomDir, avgScattering); // Mix based on avg scattering
+                    vec3.normalize(newDirection, newDirection);
+
+                    // But for the ENERGY of each band, you must consider its own scattering
+                    let energies = ray.getEnergies();
+                    let newEnergies: FrequencyBands = { ...energies }; // Copy current energies
+
+                    const frequencies = ['125', '250', '500', '1000', '2000', '4000', '8000', '16000'];
+                    const energyKeys = Object.keys(newEnergies) as Array<keyof FrequencyBands>;
+
+                    for (const key of energyKeys) {
+                        const bandFreq = parseInt(key.replace('energy', '').replace('Hz', '').replace('kHz', '000'));
+                        const absorptionKey = `absorption${bandFreq > 1000 ? (bandFreq / 1000) + 'kHz' : bandFreq + 'Hz'}` as keyof typeof closestPlane.material;
+                        const scatteringKey = `scattering${bandFreq > 1000 ? (bandFreq / 1000) + 'kHz' : bandFreq + 'Hz'}` as keyof typeof closestPlane.material;
+
+                        const absorption = (closestPlane.material as any)[absorptionKey] || 0;
+                        const scattering = (closestPlane.material as any)[scatteringKey] || 0;
+                        
+                        let energyAfterAbsorption = energies[key] * (1.0 - absorption);
+                        
+                        // A simple model: more scattering slightly reduces the focused energy
+                        // And apply scattering as a reduction in specular component
+                        
+                        if (Math.random() < scattering) { // Probabilistically scatter
+                            // This ray becomes diffuse. Apply energy decrease due to scattering.
+                            energyAfterAbsorption *= (1.0 - scattering * 0.5); // Example penalty
+                            newEnergies[key] = energyAfterAbsorption;
+                        } else {
+                            // This ray is specular. No additional penalty for scattering.
+                            newEnergies[key] = energyAfterAbsorption;
+                        }
+                    }
+
+                    const offsetOrigin = vec3.scaleAndAdd(vec3.create(), reflectedHitPoint, newDirection, 0.0001);
+                    ray.updateRay(offsetOrigin, newDirection, closestPlane.material, reflectionDistanceTraveled, this.AIR_TEMPERATURE, 50);
+                    ray.setEnergies(newEnergies); // Update energies after scattering
 
                     this.rayPaths.push({
                         origin: vec3.clone(ray.getOrigin()), direction: vec3.clone(ray.getDirection()),
                         energies: ray.getEnergies(), type: 'reflection'
                     });
-                    // No direct hit pushed to left/right ear hits because it's a reflection, not an absorption
                     bounces++;
                 } else {
                     ray.deactivate(); // No event hit, deactivate ray
