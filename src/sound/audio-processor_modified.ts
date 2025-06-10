@@ -166,7 +166,7 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         // --- NEW BINAURAL SIMULATION FOR EARLY REFLECTIONS ---
         for (const hit of uniqueHits) {
             // Get the direction from the point of reflection to the listener's head
-            const toHeadDir = vec3.subtract(vec3.create(), headPos, hit.position);
+            const toHeadDir = vec3.subtract(vec3.create(), hit.position, headPos);
             vec3.normalize(toHeadDir, toHeadDir);
 
             // --- 1. Calculate Inter-aural Level Difference (ILD) ---
