@@ -167,7 +167,7 @@ public applyFrequencyFiltering(
         }
     }
     
-    // **REMOVED**: The incorrect peak normalization block was here.
+
     return outputIR;
 }
 

@@ -245,34 +245,34 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
             } catch (e) { console.error("Error generating late reverberation:", e); }
         }
         
-        const avgRmsDFM = (calculateRMS(generatedLateL) + calculateRMS(generatedLateR)) / 2;
-        const desiredLateToEarlyRMS = 0.4; 
-        let lateReverbGain = (avgRmsDFM > 1e-9) ? (desiredLateToEarlyRMS * avgRmsEarly) / avgRmsDFM : 0.0;
-        lateReverbGain = Math.max(0.0, Math.min(5.0, lateReverbGain));
+        // const avgRmsDFM = (calculateRMS(generatedLateL) + calculateRMS(generatedLateR)) / 2;
+        // const desiredLateToEarlyRMS = 0.4; 
+        // let lateReverbGain = (avgRmsDFM > 1e-9) ? (desiredLateToEarlyRMS * avgRmsEarly) / avgRmsDFM : 0.0;
+        // lateReverbGain = Math.max(0.0, Math.min(5.0, lateReverbGain));
 
-        if (generatedLateL.length > 0 && generatedLateR.length > 0) {
-            const crossfadeEndSample = Math.floor((earlyReflectionCutoffTime + 0.04) * this.sampleRate);
-            const crossfadeDuration = Math.max(1, crossfadeEndSample - crossfadeStartSample);
+        // if (generatedLateL.length > 0 && generatedLateR.length > 0) {
+        //     const crossfadeEndSample = Math.floor((earlyReflectionCutoffTime + 0.04) * this.sampleRate);
+        //     const crossfadeDuration = Math.max(1, crossfadeEndSample - crossfadeStartSample);
 
-            for (let i = crossfadeStartSample; i < irLength; i++) {
-                const lateReverbIndex = i - crossfadeStartSample;
-                if (lateReverbIndex >= generatedLateL.length) break;
+        //     for (let i = crossfadeStartSample; i < irLength; i++) {
+        //         const lateReverbIndex = i - crossfadeStartSample;
+        //         if (lateReverbIndex >= generatedLateL.length) break;
 
-                const lateL_contribution = generatedLateL[lateReverbIndex] * lateReverbGain;
-                const lateR_contribution = generatedLateR[lateReverbIndex] * lateReverbGain;
+        //         const lateL_contribution = generatedLateL[lateReverbIndex] * lateReverbGain;
+        //         const lateR_contribution = generatedLateR[lateReverbIndex] * lateReverbGain;
 
-                if (i < crossfadeEndSample) {
-                    const fadePos = (i - crossfadeStartSample) / crossfadeDuration;
-                    const earlyGainFactor = 0.5 * (1 + Math.cos(fadePos * Math.PI));
-                    const diffuseGainFactor = 0.5 * (1 - Math.cos(fadePos * Math.PI));
-                    leftIR[i] = leftIR[i] * earlyGainFactor + lateL_contribution * diffuseGainFactor;
-                    rightIR[i] = rightIR[i] * earlyGainFactor + lateR_contribution * diffuseGainFactor;
-                } else {
-                    leftIR[i] = lateL_contribution;
-                    rightIR[i] = lateR_contribution;
-                }
-            }
-        }
+        //         if (i < crossfadeEndSample) {
+        //             const fadePos = (i - crossfadeStartSample) / crossfadeDuration;
+        //             const earlyGainFactor = 0.5 * (1 + Math.cos(fadePos * Math.PI));
+        //             const diffuseGainFactor = 0.5 * (1 - Math.cos(fadePos * Math.PI));
+        //             leftIR[i] = leftIR[i] * earlyGainFactor + lateL_contribution * diffuseGainFactor;
+        //             rightIR[i] = rightIR[i] * earlyGainFactor + lateR_contribution * diffuseGainFactor;
+        //         } else {
+        //             leftIR[i] = lateL_contribution;
+        //             rightIR[i] = lateR_contribution;
+        //         }
+        //     }
+        // }
         
         this.sanitizeIRBuffers(leftIR, rightIR);
         return [leftIR, rightIR];
