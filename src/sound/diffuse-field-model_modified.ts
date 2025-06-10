@@ -116,7 +116,7 @@ export class DiffuseFieldModelModified {
         }
     }
 
-    public applyFrequencyFiltering(
+public applyFrequencyFiltering(
     impulseResponses: Map<string, Float32Array>,
     lateHits: any[] // Pass in the late hits from the simulation
 ): Float32Array {
@@ -125,7 +125,7 @@ export class DiffuseFieldModelModified {
     if (totalLength === 0) return new Float32Array(0);
 
     const bandGains: { [key: string]: number } = {};
-    const totalEnergyPerBand: { [key: string]: number } = {
+    const totalEnergyPerBand: { [key:string]: number } = {
         '125': 0, '250': 0, '500': 0, '1000': 0,
         '2000': 0, '4000': 0, '8000': 0, '16000': 0
     };
@@ -166,21 +166,8 @@ export class DiffuseFieldModelModified {
             }
         }
     }
-
-    // **NEW: Add peak normalization for the combined outputIR**
-    let peakValue = 0;
-    for (let i = 0; i < outputIR.length; i++) {
-        peakValue = Math.max(peakValue, Math.abs(outputIR[i]));
-    }
-
-    if (peakValue > 0) {
-        const normalizationFactor = 0.9 / peakValue; // Normalize to a peak of 0.9 to leave some headroom
-        for (let i = 0; i < outputIR.length; i++) {
-            outputIR[i] *= normalizationFactor;
-        }
-        console.log(`[DFM applyFrequencyFiltering] Output IR normalized. Peak was ${peakValue.toExponential(3)}, Factor: ${normalizationFactor.toExponential(3)}`);
-    }
     
+    // **REMOVED**: The incorrect peak normalization block was here.
     return outputIR;
 }
 

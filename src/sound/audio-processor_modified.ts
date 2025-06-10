@@ -144,138 +144,143 @@ export class AudioProcessorModified {
         return estimatedAvgRT60;
     }
 
-    private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [Float32Array, Float32Array] {
-        const irLength = Math.max(Math.ceil(this.sampleRate * 2.5), 1000); // Increased IR length to 2.5s
-        const leftIR = new Float32Array(irLength);
-        const rightIR = new Float32Array(irLength);
+private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [Float32Array, Float32Array] {
+    const irLength = Math.max(Math.ceil(this.sampleRate * 2.5), 1000);
+    const leftIR = new Float32Array(irLength);
+    const rightIR = new Float32Array(irLength);
 
-        try {
-            const earlyReflectionCutoffTime = 0.08; // 80ms for early part
+    try {
+        const earlyReflectionCutoffTime = 0.08; // 80ms for early part
+        const SPEED_OF_SOUND = 343.0; // m/s
+        
+        // Combine all early hits. We will calculate the path to each ear from the reflection point.
+        const allEarlyHits = [...leftEarHits, ...rightEarHits].filter(hit => hit.time < earlyReflectionCutoffTime);
+        const uniqueHits = Array.from(new Map(allEarlyHits.map(hit => [hit.time.toString() + hit.position.toString(), hit])).values());
 
-            // Process left ear hits
-            const sortedLeftHits = [...leftEarHits].sort((a, b) => a.time - b.time);
-            const earlyLeftHits = sortedLeftHits.filter(hit => hit.time < earlyReflectionCutoffTime);
-            for (const hit of earlyLeftHits) {
-                const sampleIndex = Math.floor(hit.time * this.sampleRate);
-                if (sampleIndex < 0 || sampleIndex >= irLength || !isFinite(sampleIndex)) {
-                    continue;
-                }
-                const totalEnergy = Object.values(hit.energies).reduce((sum: number, e) => sum + (typeof e === 'number' ? e : 0), 0);
-                const loudnessScale = 0.05;
-                let amplitude = Math.sqrt(Math.max(0, totalEnergy)) * loudnessScale;
-                amplitude = Math.max(0, Math.min(1.0, amplitude));
-                if (!isFinite(amplitude) || amplitude < 1e-6) {
-                    continue;
-                }
-                leftIR[sampleIndex] += amplitude; // Add directly, ITD/ILD handled by ray tracer
-            }
+        // Get listener's head position and orientation
+        const headPos = this.camera.getPosition();
+        const headRight = this.camera.getRight();
+        const headFront = this.camera.getFront();
+        const headRadius = 0.0875; // Approx. radius of the head in meters
 
-            // Process right ear hits
-            const sortedRightHits = [...rightEarHits].sort((a, b) => a.time - b.time);
-            const earlyRightHits = sortedRightHits.filter(hit => hit.time < earlyReflectionCutoffTime);
-            for (const hit of earlyRightHits) {
-                const sampleIndex = Math.floor(hit.time * this.sampleRate);
-                if (sampleIndex < 0 || sampleIndex >= irLength || !isFinite(sampleIndex)) {
-                    continue;
-                }
-                const totalEnergy = Object.values(hit.energies).reduce((sum: number, e) => sum + (typeof e === 'number' ? e : 0), 0);
-                const loudnessScale = 0.05;
-                let amplitude = Math.sqrt(Math.max(0, totalEnergy)) * loudnessScale;
-                amplitude = Math.max(0, Math.min(1.0, amplitude));
-                if (!isFinite(amplitude) || amplitude < 1e-6) {
-                    continue;
-                }
-                rightIR[sampleIndex] += amplitude; // Add directly, ITD/ILD handled by ray tracer
-            }
+        // --- NEW BINAURAL SIMULATION FOR EARLY REFLECTIONS ---
+        for (const hit of uniqueHits) {
+            // Get the direction from the point of reflection to the listener's head
+            const toHeadDir = vec3.subtract(vec3.create(), headPos, hit.position);
+            vec3.normalize(toHeadDir, toHeadDir);
 
-            const crossfadeStartSample = Math.floor(earlyReflectionCutoffTime * this.sampleRate);
-
-            let sumSqEarlyL = 0, sumSqEarlyR = 0;
-            let countNonZeroEarly = 0;
-            for (let i = 0; i < crossfadeStartSample; i++) {
-                sumSqEarlyL += leftIR[i] * leftIR[i];
-                sumSqEarlyR += rightIR[i] * rightIR[i];
-                if (Math.abs(leftIR[i]) > 1e-9 || Math.abs(rightIR[i]) > 1e-9) {
-                    countNonZeroEarly++;
-                }
-            }
-            const avgRmsEarly = (countNonZeroEarly > 10) ? Math.sqrt((sumSqEarlyL + sumSqEarlyR) / (2 * countNonZeroEarly)) : 1e-6;
-
-            const lateLeftHits = sortedLeftHits.filter(hit => hit.time >= earlyReflectionCutoffTime);
-            const lateRightHits = sortedRightHits.filter(hit => hit.time >= earlyReflectionCutoffTime);
-
-            let generatedLateL = new Float32Array(0); // Initialize as empty
-            let generatedLateR = new Float32Array(0);
-
-            if ((lateLeftHits.length > 0 || lateRightHits.length > 0) && this.diffuseFieldModel) {
-                 const roomConfig = {
-                     dimensions: { width: this.room.config.dimensions.width, height: this.room.config.dimensions.height, depth: this.room.config.dimensions.depth },
-                     materials: this.room.config.materials
-                 };
-                 try {
-                    // Pass late hits for both ears to diffuse field model for RT60 calculation
-                    // And pass combined late hits for frequency filtering
-                    const combinedLateHitsForDFM = [...lateLeftHits, ...lateRightHits];
-
-                    [generatedLateL, generatedLateR] = this.diffuseFieldModel.processLateReverberation(
-                        combinedLateHitsForDFM, this.camera, roomConfig, this.sampleRate
-                    );
-                } catch (e) {
-                    console.error("Error generating late reverberation:", e);
-                }
-            }
+            // --- 1. Calculate Inter-aural Level Difference (ILD) ---
+            // This simulates the head shadow. We calculate how much the sound is facing the right ear.
+            const lateralness = vec3.dot(toHeadDir, headRight); // Value from -1 (left) to 1 (right)
             
-            const rmsDFM_L = calculateRMS(generatedLateL);
-            const rmsDFM_R = calculateRMS(generatedLateR);
-            const avgRmsDFM = (rmsDFM_L + rmsDFM_R) / 2;
-            if (avgRmsDFM < 1e-9) {
-                 console.warn("[AP processInternal] DFM output is silent or near silent.");
+            // A simple formula for gain. If sound is from the right (lateralness=1), right ear gets full volume, left ear is quieter.
+            // We use a cosine curve for a smooth transition.
+            const rightGain = Math.pow(0.5 * (1 + lateralness), 2);
+            const leftGain = Math.pow(0.5 * (1 - lateralness), 2);
+
+            // --- 2. Calculate Inter-aural Time Difference (ITD) ---
+            // We get the positions of the ears from the ray tracer's last calculation.
+            // NOTE: This assumes `this.lastRayHits` is populated before this function runs.
+            const earLeftPos = vec3.scaleAndAdd(vec3.create(), headPos, headRight, -headRadius);
+            const earRightPos = vec3.scaleAndAdd(vec3.create(), headPos, headRight, headRadius);
+
+            // Calculate the final leg of the journey from the wall to each ear
+            const distToLeftEar = vec3.distance(hit.position, earLeftPos);
+            const distToRightEar = vec3.distance(hit.position, earRightPos);
+            
+            const timeToLeftEar = hit.time + (distToLeftEar / SPEED_OF_SOUND);
+            const timeToRightEar = hit.time + (distToRightEar / SPEED_OF_SOUND);
+
+            const leftSampleIndex = Math.floor(timeToLeftEar * this.sampleRate);
+            const rightSampleIndex = Math.floor(timeToRightEar * this.sampleRate);
+
+            // --- 3. Apply to the Impulse Response ---
+            // Calculate the amplitude of this reflection
+            const totalEnergy = Object.values(hit.energies).reduce((sum: number, e) => sum + (typeof e === 'number' ? e : 0), 0);
+            const amplitude = Math.sqrt(Math.max(0, totalEnergy));
+
+            if (isFinite(amplitude) && amplitude > 1e-6) {
+                // Write the reflection to the left ear's IR at its specific arrival time
+                if (leftSampleIndex >= 0 && leftSampleIndex < irLength) {
+                    leftIR[leftSampleIndex] += amplitude * leftGain;
+                }
+                // Write the reflection to the right ear's IR at its specific arrival time
+                if (rightSampleIndex >= 0 && rightSampleIndex < irLength) {
+                    rightIR[rightSampleIndex] += amplitude * rightGain;
+                }
             }
+        }
 
-            const desiredLateToEarlyRMS  = 0.5;
-            let calculatedLateReverbGain = (avgRmsDFM > 1e-9) ? (desiredLateToEarlyRMS * avgRmsEarly) / avgRmsDFM : 0.0;
+        // --- LATE REVERBERATION (Unchanged from our previous fix) ---
+        const crossfadeStartSample = Math.floor(earlyReflectionCutoffTime * this.sampleRate);
 
-            const currentRoomVolume = this.room.config.dimensions.width * this.room.config.dimensions.height * this.room.config.dimensions.depth;
-            const referenceRoomVolumeForScaling = 150;
-            const volumeScaleFactor = Math.sqrt(currentRoomVolume / referenceRoomVolumeForScaling);
-            const roomSizeGainModulator = Math.min(1.5, Math.max(0.3, volumeScaleFactor));
+        let sumSqEarlyL = 0, sumSqEarlyR = 0;
+        let countNonZeroEarly = 0;
+        for (let i = 0; i < crossfadeStartSample; i++) {
+            sumSqEarlyL += leftIR[i] * leftIR[i];
+            sumSqEarlyR += rightIR[i] * rightIR[i];
+            if (Math.abs(leftIR[i]) > 1e-9 || Math.abs(rightIR[i]) > 1e-9) {
+                countNonZeroEarly++;
+            }
+        }
+        const avgRmsEarly = (countNonZeroEarly > 10) ? Math.sqrt((sumSqEarlyL + sumSqEarlyR) / (2 * countNonZeroEarly)) : 1e-6;
 
-            calculatedLateReverbGain *= roomSizeGainModulator;
-            
-            const lateReverbGain = Math.max(0.0, Math.min(5.0, calculatedLateReverbGain));
-            
-            console.log(`[AP processInternal] RMS Early: ${avgRmsEarly.toExponential(3)}, RMS DFM Out: ${avgRmsDFM.toExponential(3)}, TargetRatio: ${desiredLateToEarlyRMS}, RoomMod: ${roomSizeGainModulator.toFixed(3)}, CalcGain: ${calculatedLateReverbGain.toExponential(3)}, Final LateReverbGain: ${lateReverbGain.toExponential(3)}`);
+        const lateHits = [...leftEarHits, ...rightEarHits].filter(hit => hit.time >= earlyReflectionCutoffTime);
 
+        let generatedLateL = new Float32Array(0), generatedLateR = new Float32Array(0);
 
+        if (lateHits.length > 0 && this.diffuseFieldModel) {
+            const roomConfig = {
+                dimensions: { width: this.room.config.dimensions.width, height: this.room.config.dimensions.height, depth: this.room.config.dimensions.depth },
+                materials: this.room.config.materials
+            };
+            try {
+                const [rawGeneratedLateL, rawGeneratedLateR] = this.diffuseFieldModel.processLateReverberation(
+                    lateHits, this.camera, roomConfig, this.sampleRate
+                );
+                generatedLateL = new Float32Array(rawGeneratedLateL.length);
+                generatedLateL.set(rawGeneratedLateL);
+                generatedLateR = new Float32Array(rawGeneratedLateR.length);
+                generatedLateR.set(rawGeneratedLateR);
+            } catch (e) { console.error("Error generating late reverberation:", e); }
+        }
+        
+        const avgRmsDFM = (calculateRMS(generatedLateL) + calculateRMS(generatedLateR)) / 2;
+        const desiredLateToEarlyRMS = 0.4; 
+        let lateReverbGain = (avgRmsDFM > 1e-9) ? (desiredLateToEarlyRMS * avgRmsEarly) / avgRmsDFM : 0.0;
+        lateReverbGain = Math.max(0.0, Math.min(5.0, lateReverbGain));
+
+        if (generatedLateL.length > 0 && generatedLateR.length > 0) {
             const crossfadeEndSample = Math.floor((earlyReflectionCutoffTime + 0.04) * this.sampleRate);
             const crossfadeDuration = Math.max(1, crossfadeEndSample - crossfadeStartSample);
 
-            if (generatedLateL.length > 0 && generatedLateR.length > 0) {
-                for (let i = 0; i < irLength; i++) {
-                    const lateL_contribution = (i < generatedLateL.length) ? generatedLateL[i] * lateReverbGain : 0;
-                    const lateR_contribution = (i < generatedLateR.length) ? generatedLateR[i] * lateReverbGain : 0;
+            for (let i = crossfadeStartSample; i < irLength; i++) {
+                const lateReverbIndex = i - crossfadeStartSample;
+                if (lateReverbIndex >= generatedLateL.length) break;
 
-                    if (i < crossfadeStartSample) {
-                        continue;
-                    } else if (i >= crossfadeStartSample && i < crossfadeEndSample) {
-                        const fadePos = (i - crossfadeStartSample) / crossfadeDuration;
-                        const earlyGainFactor = 0.5 * (1 + Math.cos(fadePos * Math.PI));
-                        const diffuseGainFactor = 0.5 * (1 - Math.cos(fadePos * Math.PI));
-                        leftIR[i] = leftIR[i] * earlyGainFactor + lateL_contribution * diffuseGainFactor;
-                        rightIR[i] = rightIR[i] * earlyGainFactor + lateR_contribution * diffuseGainFactor;
-                    } else {
-                        leftIR[i] = lateL_contribution;
-                        rightIR[i] = lateR_contribution;
-                    }
+                const lateL_contribution = generatedLateL[lateReverbIndex] * lateReverbGain;
+                const lateR_contribution = generatedLateR[lateReverbIndex] * lateReverbGain;
+
+                if (i < crossfadeEndSample) {
+                    const fadePos = (i - crossfadeStartSample) / crossfadeDuration;
+                    const earlyGainFactor = 0.5 * (1 + Math.cos(fadePos * Math.PI));
+                    const diffuseGainFactor = 0.5 * (1 - Math.cos(fadePos * Math.PI));
+                    leftIR[i] = leftIR[i] * earlyGainFactor + lateL_contribution * diffuseGainFactor;
+                    rightIR[i] = rightIR[i] * earlyGainFactor + lateR_contribution * diffuseGainFactor;
+                } else {
+                    leftIR[i] = lateL_contribution;
+                    rightIR[i] = lateR_contribution;
                 }
             }
-            this.sanitizeIRBuffers(leftIR, rightIR);
-            return [leftIR, rightIR];
-        } catch (error) {
-            console.error('Error in processRayHitsInternal:', error);
-            return [new Float32Array(irLength), new Float32Array(irLength)];
         }
+        
+        this.sanitizeIRBuffers(leftIR, rightIR);
+        return [leftIR, rightIR];
+    } catch (error) {
+        console.error('Error in processRayHitsInternal:', error);
+        return [new Float32Array(irLength), new Float32Array(irLength)];
     }
+}
 
     public async playAudioWithIR(audioBuffer: AudioBuffer): Promise<void> {
         this.stopAllSounds();
@@ -410,8 +415,11 @@ export class AudioProcessorModified {
 
             if (this.audioCtx.state === 'suspended') await this.audioCtx.resume();
             this.impulseResponseBuffer = this.audioCtx.createBuffer(2, leftIR.length, this.audioCtx.sampleRate);
-            this.impulseResponseBuffer.copyToChannel(leftIR, 0);
-            this.impulseResponseBuffer.copyToChannel(rightIR, 1);
+            // Ensure the buffers are standard ArrayBuffer-backed Float32Arrays for copyToChannel
+            const channelLeftIR = new Float32Array(leftIR);
+            const channelRightIR = new Float32Array(rightIR);
+            this.impulseResponseBuffer.copyToChannel(channelLeftIR, 0);
+            this.impulseResponseBuffer.copyToChannel(channelRightIR, 1);
             console.log(`[AP setupIR] Impulse response buffer created/updated, length: ${(leftIR.length / this.sampleRate).toFixed(2)}s`);
         } catch (error) {
             // ... (error handling as before) ...
@@ -482,60 +490,55 @@ export class AudioProcessorModified {
     }
 
 
-private calculateProceduralHrtfGains(
-    azimuthRad: number,
-    elevationRad: number,
-    distance: number
-): { left: FrequencyBands, right: FrequencyBands } {
-    const headRadius = 0.0875; // meters
-    const speedOfSound = 343; // m/s
-    
-    // Initial gains (base level for each frequency)
-    const baseGains: FrequencyBands = {
-        energy125Hz: 1.0, energy250Hz: 1.0, energy500Hz: 1.0, energy1kHz: 1.0,
-        energy2kHz: 1.0, energy4kHz: 1.0, energy8kHz: 1.0, energy16kHz: 1.0
-    };
-    
-    let leftGains = { ...baseGains };
-    let rightGains = { ...baseGains };
-
-    const frequencies = [125, 250, 500, 1000, 2000, 4000, 8000, 16000];
-    const energyKeys = Object.keys(baseGains) as Array<keyof typeof baseGains>;
-
-    // Model Head Shadow (Interaural Level Difference - ILD)
-    // This effect is more pronounced for higher frequencies
-    const pathDifference = headRadius * (Math.abs(azimuthRad) + Math.sin(Math.abs(azimuthRad)));
-    
-    for (let i = 0; i < frequencies.length; i++) {
-        const freq = frequencies[i];
-        const key = energyKeys[i];
-        const wavelength = speedOfSound / freq;
+    private calculateProceduralHrtfGains(
+        azimuthRad: number,
+        elevationRad: number,
+        distance: number
+    ): { left: FrequencyBands, right: FrequencyBands } {
+        const headRadius = 0.0875; // meters
+        const speedOfSound = 343; // m/s
         
-        // Attenuation is stronger when the wavelength is smaller than the path difference
-        const shadowEffect = 1.0 - 0.7 * Math.min(1.0, Math.max(0, pathDifference / wavelength));
+        // Initial gains (base level for each frequency)
+        const baseGains: FrequencyBands = {
+            energy125Hz: 1.0, energy250Hz: 1.0, energy500Hz: 1.0, energy1kHz: 1.0,
+            energy2kHz: 1.0, energy4kHz: 1.0, energy8kHz: 1.0, energy16kHz: 1.0
+        };
         
+        let leftGains = { ...baseGains };
+        let rightGains = { ...baseGains };
+
+        // Apply ITD and ILD based on azimuth and distance
+        // Simplified ITD: time difference between ears
+        const ITD = (headRadius * (azimuthRad + Math.sin(azimuthRad))) / speedOfSound;
+        
+        // Apply ILD: Inter-aural Level Difference, frequency-dependent
+        // High frequencies are more attenuated by the head shadow
+        const K_ILD = 0.5; // ILD factor
         if (azimuthRad > 0) { // Sound is from the right
-            leftGains[key] *= shadowEffect;
-        } else { // Sound is from the left
-            rightGains[key] *= shadowEffect;
+            leftGains.energy4kHz *= (1 - K_ILD * Math.abs(Math.sin(azimuthRad)));
+            leftGains.energy8kHz *= (1 - 2 * K_ILD * Math.abs(Math.sin(azimuthRad)));
+            leftGains.energy16kHz *= (1 - 3 * K_ILD * Math.abs(Math.sin(azimuthRad)));
+        } else if (azimuthRad < 0) { // Sound is from the left
+            rightGains.energy4kHz *= (1 - K_ILD * Math.abs(Math.sin(azimuthRad)));
+            rightGains.energy8kHz *= (1 - 2 * K_ILD * Math.abs(Math.sin(azimuthRad)));
+            rightGains.energy16kHz *= (1 - 3 * K_ILD * Math.abs(Math.sin(azimuthRad)));
         }
-    }
-    
-    // Model simple pinna effect for elevation (adds a bit of color)
-    // This creates a subtle notch/peak based on elevation
-    const elevationFactor = 1.0 - Math.abs(elevationRad) / (Math.PI / 2) * 0.2;
-    for (const key of energyKeys) {
-        leftGains[key] *= elevationFactor;
-        rightGains[key] *= elevationFactor;
-    }
-    
-    // Apply general distance attenuation
-    const distanceAtten = 1.0 / Math.max(1, distance);
-    for (const key of energyKeys) {
-        leftGains[key] *= distanceAtten;
-        rightGains[key] *= distanceAtten;
-    }
 
-    return { left: leftGains, right: rightGains };
-}
+        // Apply spectral coloration based on elevation
+        // Simplified: higher elevation might introduce some comb filtering or spectral notches
+        const elevationFactor = 1.0 - Math.abs(elevationRad) / (Math.PI / 2) * 0.2; // Max 20% reduction at 90 deg elevation
+        for (const freq in leftGains) {
+            (leftGains as any)[freq] *= elevationFactor;
+            (rightGains as any)[freq] *= elevationFactor;
+        }
+
+        // Apply distance attenuation (already handled by raytracer energy, but can add a small modulation)
+        const distanceAtten = 1.0 / Math.max(1, distance);
+        for (const freq in leftGains) {
+            (leftGains as any)[freq] *= distanceAtten;
+            (rightGains as any)[freq] *= distanceAtten;
+        }
+
+        return { left: leftGains, right: rightGains };
+    }
 }
