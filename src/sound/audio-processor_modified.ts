@@ -200,13 +200,26 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
             const amplitude = Math.sqrt(Math.max(0, totalEnergy));
 
             if (isFinite(amplitude) && amplitude > 1e-6) {
-                // Write the reflection to the left ear's IR at its specific arrival time
-                if (leftSampleIndex >= 0 && leftSampleIndex < irLength) {
-                    leftIR[leftSampleIndex] += amplitude * leftGain;
+                // Temporal spreading to make reflections less "spiky"
+                const spreadSamples = 40; // Spread over ~1ms
+                const spreadDecay = 20;   // How quickly the spread impulse decays
+
+                // Spread left ear impulse
+                for (let j = 0; j < spreadSamples; j++) {
+                    const idx = leftSampleIndex + j;
+                    if (idx >= 0 && idx < irLength) {
+                        const spreadEnvelope = Math.exp(-j / spreadDecay);
+                        leftIR[idx] += amplitude * leftGain * spreadEnvelope;
+                    }
                 }
-                // Write the reflection to the right ear's IR at its specific arrival time
-                if (rightSampleIndex >= 0 && rightSampleIndex < irLength) {
-                    rightIR[rightSampleIndex] += amplitude * rightGain;
+
+                // Spread right ear impulse
+                for (let j = 0; j < spreadSamples; j++) {
+                    const idx = rightSampleIndex + j;
+                    if (idx >= 0 && idx < irLength) {
+                        const spreadEnvelope = Math.exp(-j / spreadDecay);
+                        rightIR[idx] += amplitude * rightGain * spreadEnvelope;
+                    }
                 }
             }
         }
