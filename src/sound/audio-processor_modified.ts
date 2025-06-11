@@ -144,6 +144,8 @@ export class AudioProcessorModified {
         return estimatedAvgRT60;
     }
 
+// src/sound/audio-processor_modified.ts
+
 private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [Float32Array, Float32Array] {
     const irLength = Math.max(Math.ceil(this.sampleRate * 2.5), 1000);
     const leftIR = new Float32Array(irLength);
@@ -153,38 +155,26 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         const earlyReflectionCutoffTime = 0.08; // 80ms for early part
         const SPEED_OF_SOUND = 343.0; // m/s
         
-        // Combine all early hits. We will calculate the path to each ear from the reflection point.
         const allEarlyHits = [...leftEarHits, ...rightEarHits].filter(hit => hit.time < earlyReflectionCutoffTime);
         const uniqueHits = Array.from(new Map(allEarlyHits.map(hit => [hit.time.toString() + hit.position.toString(), hit])).values());
 
-        // Get listener's head position and orientation
         const headPos = this.camera.getPosition();
         const headRight = this.camera.getRight();
         const headFront = this.camera.getFront();
         const headRadius = 0.0875; // Approx. radius of the head in meters
 
-        // --- NEW BINAURAL SIMULATION FOR EARLY REFLECTIONS ---
         for (const hit of uniqueHits) {
-            // Get the direction from the point of reflection to the listener's head
             const toHeadDir = vec3.subtract(vec3.create(), hit.position, headPos);
             vec3.normalize(toHeadDir, toHeadDir);
 
-            // --- 1. Calculate Inter-aural Level Difference (ILD) ---
-            // This simulates the head shadow. We calculate how much the sound is facing the right ear.
-            const lateralness = vec3.dot(toHeadDir, headRight); // Value from -1 (left) to 1 (right)
+            const lateralness = vec3.dot(toHeadDir, headRight);
             
-            // A simple formula for gain. If sound is from the right (lateralness=1), right ear gets full volume, left ear is quieter.
-            // We use a cosine curve for a smooth transition.
             const rightGain = Math.pow(0.5 * (1 + lateralness), 2);
             const leftGain = Math.pow(0.5 * (1 - lateralness), 2);
 
-            // --- 2. Calculate Inter-aural Time Difference (ITD) ---
-            // We get the positions of the ears from the ray tracer's last calculation.
-            // NOTE: This assumes `this.lastRayHits` is populated before this function runs.
             const earLeftPos = vec3.scaleAndAdd(vec3.create(), headPos, headRight, -headRadius);
             const earRightPos = vec3.scaleAndAdd(vec3.create(), headPos, headRight, headRadius);
 
-            // Calculate the final leg of the journey from the wall to each ear
             const distToLeftEar = vec3.distance(hit.position, earLeftPos);
             const distToRightEar = vec3.distance(hit.position, earRightPos);
             
@@ -194,17 +184,13 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
             const leftSampleIndex = Math.floor(timeToLeftEar * this.sampleRate);
             const rightSampleIndex = Math.floor(timeToRightEar * this.sampleRate);
 
-            // --- 3. Apply to the Impulse Response ---
-            // Calculate the amplitude of this reflection
             const totalEnergy = Object.values(hit.energies).reduce((sum: number, e) => sum + (typeof e === 'number' ? e : 0), 0);
             const amplitude = Math.sqrt(Math.max(0, totalEnergy));
 
             if (isFinite(amplitude) && amplitude > 1e-6) {
-                // Temporal spreading to make reflections less "spiky"
-                const spreadSamples = 40; // Spread over ~1ms
-                const spreadDecay = 20;   // How quickly the spread impulse decays
+                const spreadSamples = 40;
+                const spreadDecay = 20;
 
-                // Spread left ear impulse
                 for (let j = 0; j < spreadSamples; j++) {
                     const idx = leftSampleIndex + j;
                     if (idx >= 0 && idx < irLength) {
@@ -213,7 +199,6 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
                     }
                 }
 
-                // Spread right ear impulse
                 for (let j = 0; j < spreadSamples; j++) {
                     const idx = rightSampleIndex + j;
                     if (idx >= 0 && idx < irLength) {
@@ -224,7 +209,8 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
             }
         }
 
-        // --- LATE REVERBERATION (Unchanged from our previous fix) ---
+        /*
+        // --- LATE REVERBERATION (COMMENTED OUT AS REQUESTED) ---
         const crossfadeStartSample = Math.floor(earlyReflectionCutoffTime * this.sampleRate);
 
         let sumSqEarlyL = 0, sumSqEarlyR = 0;
@@ -258,34 +244,35 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
             } catch (e) { console.error("Error generating late reverberation:", e); }
         }
         
-        // const avgRmsDFM = (calculateRMS(generatedLateL) + calculateRMS(generatedLateR)) / 2;
-        // const desiredLateToEarlyRMS = 0.4; 
-        // let lateReverbGain = (avgRmsDFM > 1e-9) ? (desiredLateToEarlyRMS * avgRmsEarly) / avgRmsDFM : 0.0;
-        // lateReverbGain = Math.max(0.0, Math.min(5.0, lateReverbGain));
+        const avgRmsDFM = (calculateRMS(generatedLateL) + calculateRMS(generatedLateR)) / 2;
+        const desiredLateToEarlyRMS = 0.4;
+        let lateReverbGain = (avgRmsDFM > 1e-9) ? (desiredLateToEarlyRMS * avgRmsEarly) / avgRmsDFM : 0.0;
+        lateReverbGain = Math.max(0.0, Math.min(5.0, lateReverbGain));
 
-        // if (generatedLateL.length > 0 && generatedLateR.length > 0) {
-        //     const crossfadeEndSample = Math.floor((earlyReflectionCutoffTime + 0.04) * this.sampleRate);
-        //     const crossfadeDuration = Math.max(1, crossfadeEndSample - crossfadeStartSample);
+        if (generatedLateL.length > 0 && generatedLateR.length > 0) {
+            const crossfadeEndSample = Math.floor((earlyReflectionCutoffTime + 0.04) * this.sampleRate);
+            const crossfadeDuration = Math.max(1, crossfadeEndSample - crossfadeStartSample);
 
-        //     for (let i = crossfadeStartSample; i < irLength; i++) {
-        //         const lateReverbIndex = i - crossfadeStartSample;
-        //         if (lateReverbIndex >= generatedLateL.length) break;
+            for (let i = crossfadeStartSample; i < irLength; i++) {
+                const lateReverbIndex = i - crossfadeStartSample;
+                if (lateReverbIndex >= generatedLateL.length) break;
 
-        //         const lateL_contribution = generatedLateL[lateReverbIndex] * lateReverbGain;
-        //         const lateR_contribution = generatedLateR[lateReverbIndex] * lateReverbGain;
+                const lateL_contribution = generatedLateL[lateReverbIndex] * lateReverbGain;
+                const lateR_contribution = generatedLateR[lateReverbIndex] * lateReverbGain;
 
-        //         if (i < crossfadeEndSample) {
-        //             const fadePos = (i - crossfadeStartSample) / crossfadeDuration;
-        //             const earlyGainFactor = 0.5 * (1 + Math.cos(fadePos * Math.PI));
-        //             const diffuseGainFactor = 0.5 * (1 - Math.cos(fadePos * Math.PI));
-        //             leftIR[i] = leftIR[i] * earlyGainFactor + lateL_contribution * diffuseGainFactor;
-        //             rightIR[i] = rightIR[i] * earlyGainFactor + lateR_contribution * diffuseGainFactor;
-        //         } else {
-        //             leftIR[i] = lateL_contribution;
-        //             rightIR[i] = lateR_contribution;
-        //         }
-        //     }
-        // }
+                if (i < crossfadeEndSample) {
+                    const fadePos = (i - crossfadeStartSample) / crossfadeDuration;
+                    const earlyGainFactor = 0.5 * (1 + Math.cos(fadePos * Math.PI));
+                    const diffuseGainFactor = 0.5 * (1 - Math.cos(fadePos * Math.PI));
+                    leftIR[i] = leftIR[i] * earlyGainFactor + lateL_contribution * diffuseGainFactor;
+                    rightIR[i] = rightIR[i] * earlyGainFactor + lateR_contribution * diffuseGainFactor;
+                } else {
+                    leftIR[i] = lateL_contribution;
+                    rightIR[i] = lateR_contribution;
+                }
+            }
+        }
+        */
         
         this.sanitizeIRBuffers(leftIR, rightIR);
         return [leftIR, rightIR];
@@ -317,29 +304,12 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
 
             const { source, convolver, wetGain } = nodes;
 
-            const dryGainNode = this.audioCtx.createGain();
+            // The impulse response now contains the direct sound, so we play it at full volume (1.0).
+            // All dry/wet mixing logic is removed as it's no longer needed.
+            console.log(`[AP playAudioWithIR] Playing fully convolved signal (IR includes direct sound).`);
+            wetGain.gain.setValueAtTime(1.0, this.audioCtx.currentTime);
             
-            const avgRT60 = this.getAverageRT60(this.lastRayHits); 
-
-            const minRT60 = 0.2; 
-            const maxRT60 = 2.5; 
-            const normalizedRT60 = (avgRT60 - minRT60) / (maxRT60 - minRT60);
-            const clampedNormalizedRT60 = Math.max(0.0, Math.min(1.0, normalizedRT60));
-
-            let wetLevel = 0.4 + 0.5 * clampedNormalizedRT60; 
-            let dryLevel = 1.0 - wetLevel;
-
-            dryLevel = Math.max(0.1, Math.min(0.9, dryLevel)); 
-            wetLevel = 1.0 - dryLevel;
-            
-            console.log(`[AP playAudioWithIR] AvgRT60: ${avgRT60.toFixed(2)}s, ClampedNormRT60: ${clampedNormalizedRT60.toFixed(2)}, Dry: ${dryLevel.toFixed(2)}, Wet: ${wetLevel.toFixed(2)}`);
-
-            dryGainNode.gain.setValueAtTime(dryLevel, this.audioCtx.currentTime);
-            wetGain.gain.setValueAtTime(wetLevel, this.audioCtx.currentTime);
-
-            source.connect(dryGainNode);
-            dryGainNode.connect(this.audioCtx.destination);
-            
+            // The only connection to the output is now the convolved signal path.
             wetGain.connect(this.audioCtx.destination);
 
 
@@ -347,11 +317,10 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
             source.onended = () => {
                 if (this.currentSourceNode === source) this.currentSourceNode = null;
                 try { 
+                    // Clean up all nodes.
                     wetGain.disconnect(); 
                     convolver.disconnect(); 
-                    source.disconnect(convolver); 
-                    dryGainNode.disconnect();
-                    source.disconnect(dryGainNode); 
+                    source.disconnect(convolver);
                 } catch (e) {
                     console.warn("Error during node cleanup onended:", e);
                 }
