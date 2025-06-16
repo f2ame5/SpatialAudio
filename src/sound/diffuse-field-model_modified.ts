@@ -341,11 +341,21 @@ export class DiffuseFieldModelModified {
     const allPassD_R = Math.max(1, Math.floor(this.sampleRate * 0.0005));
     let allPassX_R: number[] = new Array(allPassD_R + 1).fill(0);
     let allPassY_R: number[] = new Array(allPassD_R + 1).fill(0);
+    // Additional all-pass filters for frequency-dependent decorrelation in higher frequencies
+    const allPassG_L_High = 0.4;
+    const allPassD_L_High = Math.max(1, Math.floor(this.sampleRate * 0.0002));
+    let allPassX_L_High: number[] = new Array(allPassD_L_High + 1).fill(0);
+    let allPassY_L_High: number[] = new Array(allPassD_L_High + 1).fill(0);
+    const allPassG_R_High = 0.35;
+    const allPassD_R_High = Math.max(1, Math.floor(this.sampleRate * 0.0004));
+    let allPassX_R_High: number[] = new Array(allPassD_R_High + 1).fill(0);
+    let allPassY_R_High: number[] = new Array(allPassD_R_High + 1).fill(0);
 
     for (let i = 0; i < monoIR.length; i++) {
       const currentSample = monoIR[i];
       const filteredSampleL = alpha * currentSample + (1 - alpha) * prevL;
       prevL = filteredSampleL;
+      // First all-pass filter for left channel
       for (let k = allPassD_L; k > 0; k--) {
         allPassX_L[k] = allPassX_L[k - 1];
         allPassY_L[k] = allPassY_L[k - 1];
@@ -358,11 +368,25 @@ export class DiffuseFieldModelModified {
         x_n_minus_D_L -
         allPassG_L * y_n_minus_D_L;
       allPassY_L[0] = allPassOutputL;
-      leftIR[i] = allPassOutputL;
+      // Second all-pass filter for left channel (high frequency decorrelation)
+      for (let k = allPassD_L_High; k > 0; k--) {
+        allPassX_L_High[k] = allPassX_L_High[k - 1];
+        allPassY_L_High[k] = allPassY_L_High[k - 1];
+      }
+      allPassX_L_High[0] = allPassOutputL;
+      const x_n_minus_D_L_High = allPassX_L_High[allPassD_L_High];
+      const y_n_minus_D_L_High = allPassY_L_High[allPassD_L_High];
+      const allPassOutputL_High =
+        allPassG_L_High * allPassOutputL +
+        x_n_minus_D_L_High -
+        allPassG_L_High * y_n_minus_D_L_High;
+      allPassY_L_High[0] = allPassOutputL_High;
+      leftIR[i] = allPassOutputL_High;
 
       const delayedSample = currentSample;
       const filteredDelayedSample = alpha * delayedSample + (1 - alpha) * prevR;
       prevR = filteredDelayedSample;
+      // First all-pass filter for right channel
       for (let k = allPassD_R; k > 0; k--) {
         allPassX_R[k] = allPassX_R[k - 1];
         allPassY_R[k] = allPassY_R[k - 1];
@@ -375,7 +399,20 @@ export class DiffuseFieldModelModified {
         x_n_minus_D_R -
         allPassG_R * y_n_minus_D_R;
       allPassY_R[0] = allPassOutputR;
-      rightIR[i] = allPassOutputR;
+      // Second all-pass filter for right channel (high frequency decorrelation)
+      for (let k = allPassD_R_High; k > 0; k--) {
+        allPassX_R_High[k] = allPassX_R_High[k - 1];
+        allPassY_R_High[k] = allPassY_R_High[k - 1];
+      }
+      allPassX_R_High[0] = allPassOutputR;
+      const x_n_minus_D_R_High = allPassX_R_High[allPassD_R_High];
+      const y_n_minus_D_R_High = allPassY_R_High[allPassD_R_High];
+      const allPassOutputR_High =
+        allPassG_R_High * allPassOutputR +
+        x_n_minus_D_R_High -
+        allPassG_R_High * y_n_minus_D_R_High;
+      allPassY_R_High[0] = allPassOutputR_High;
+      rightIR[i] = allPassOutputR_High;
     }
     console.log(
       `[DFM processLateReverberation] Final stereo late IR generated. Left RMS: ${calculateRMS(
@@ -432,9 +469,9 @@ export class DiffuseFieldModelModified {
         }
       }
 
-      // Only use points from the peak down to a certain threshold for a stable fit
+      // Only use points from the peak down to a certain threshold, focusing on the middle decay for a stable fit
       const validPoints = dbPoints.filter(
-        (p) => p.db > maxDb - 40 && p.db < maxDb - 5
+        (p) => p.db > maxDb - 40 && p.db < maxDb - 10
       );
       if (validPoints.length < 5) {
         // Fallback to a default if not enough data
@@ -442,24 +479,38 @@ export class DiffuseFieldModelModified {
         continue;
       }
 
-      // 3. Perform linear regression (y = mx + c, where y is dB and x is time)
+      // 3. Perform weighted linear regression (y = mx + c, where y is dB and x is time)
+      // Weight points in the middle of the decay curve more heavily to avoid outliers
       let sumX = 0,
         sumY = 0,
         sumXY = 0,
-        sumX2 = 0;
+        sumX2 = 0,
+        sumWeights = 0;
       for (const p of validPoints) {
-        sumX += p.time;
-        sumY += p.db;
-        sumXY += p.time * p.db;
-        sumX2 += p.time * p.time;
+        // Gaussian-like weighting: higher weight for points around -20dB to -30dB from peak
+        const weight = Math.exp(-Math.pow(p.db - (maxDb - 25), 2) / (2 * 100));
+        sumX += p.time * weight;
+        sumY += p.db * weight;
+        sumXY += p.time * p.db * weight;
+        sumX2 += p.time * p.time * weight;
+        sumWeights += weight;
       }
-      const n = validPoints.length;
-      const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX); // slope is dB/second
+      const slope = (sumWeights * sumXY - sumX * sumY) / (sumWeights * sumX2 - sumX * sumX); // slope is dB/second
 
-      // 4. Calculate RT60 from the slope
+      // 4. Calculate RT60 from the slope and cross-validate with Sabine formula
+      let rt60 = 1.0;
       if (slope < -0.1) {
         // Ensure decay is actually happening
-        const rt60 = -60 / slope;
+        rt60 = -60 / slope;
+        // Cross-validate with Sabine formula estimate for physical plausibility
+        const V = this.roomVolume;
+        const S = this.surfaceArea;
+        const absorptionKey = freq === "1000" ? "absorption1kHz" : `absorption${freq}Hz`;
+        const avgAbsorption = this.meanAbsorption[freq] || 0.1;
+        const sabineRT60 = (0.161 * V) / (S * Math.max(0.01, avgAbsorption));
+        // Use a weighted average to balance simulation with theoretical estimate
+        const simulationWeight = 0.7;
+        rt60 = simulationWeight * rt60 + (1 - simulationWeight) * sabineRT60;
         rt60Values[freq] = Math.min(Math.max(rt60, 0.1), 3.5); // Clamp to a reasonable range
       } else {
         rt60Values[freq] = 1.0; // Fallback

@@ -209,8 +209,7 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
             }
         }
 
-        /*
-        // --- LATE REVERBERATION (COMMENTED OUT AS REQUESTED) ---
+        // --- LATE REVERBERATION (RE-ENABLED FOR ENHANCED REALISM) ---
         const crossfadeStartSample = Math.floor(earlyReflectionCutoffTime * this.sampleRate);
 
         let sumSqEarlyL = 0, sumSqEarlyR = 0;
@@ -245,7 +244,7 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         }
         
         const avgRmsDFM = (calculateRMS(generatedLateL) + calculateRMS(generatedLateR)) / 2;
-        const desiredLateToEarlyRMS = 0.4;
+        const desiredLateToEarlyRMS = 0.005; // Further reduced from 0.2 to 0.005 based on user feedback for much lower reverb loudness
         let lateReverbGain = (avgRmsDFM > 1e-9) ? (desiredLateToEarlyRMS * avgRmsEarly) / avgRmsDFM : 0.0;
         lateReverbGain = Math.max(0.0, Math.min(5.0, lateReverbGain));
 
@@ -272,7 +271,6 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
                 }
             }
         }
-        */
         
         this.sanitizeIRBuffers(leftIR, rightIR);
         return [leftIR, rightIR];
@@ -350,7 +348,7 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         }
         console.log(`[AP sanitizeIRBuffers] Max value before normalization: ${maxValue.toExponential(3)}`);
         
-        const targetPeak = 0.85; 
+        const targetPeak = 0.9; // Adjusted from 0.85 to 0.9 for slightly higher dynamic range
         if (maxValue > targetPeak) { 
             const gainFactor = (maxValue > 0) ? targetPeak / maxValue : 1.0;
             if (gainFactor < 1.0) { 
