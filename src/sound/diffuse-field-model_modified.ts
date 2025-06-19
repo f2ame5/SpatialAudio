@@ -252,7 +252,24 @@ export class DiffuseFieldModelModified {
       }
     }
 
-    return outputIR;
+    // --- Add a smoothing filter ---
+    const smoothedIR = new Float32Array(outputIR.length);
+    const alpha = 0.6; // Smoothing factor, adjustable (0.0 to 1.0)
+    let lastSample = 0;
+    for (let i = 0; i < outputIR.length; i++) {
+        smoothedIR[i] = alpha * outputIR[i] + (1 - alpha) * lastSample;
+        lastSample = smoothedIR[i];
+    }
+    
+    // Normalize the final smoothed IR
+    const maxAmp = Math.max(...Array.from(smoothedIR).map(Math.abs));
+    if (maxAmp > 0) {
+        for (let i = 0; i < smoothedIR.length; i++) {
+            smoothedIR[i] /= maxAmp;
+        }
+    }
+
+    return smoothedIR;
   }
 
   public processLateReverberation(

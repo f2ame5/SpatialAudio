@@ -149,13 +149,7 @@ export class Main {
       this.sphere,
       this.room,
       this.camera,
-      {
-        numRays: 5000,
-        maxBounces: 50,
-        minEnergy: 0.05,
-        enableDiffraction: true,
-        diffractionAttenuationFactor: 0.5,
-      }
+     
     );
     this.audioProcessor = new AudioProcessorModified(
       this.audioCtx,

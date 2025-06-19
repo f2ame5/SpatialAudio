@@ -4,7 +4,7 @@ import { Room } from '../room/room';
 import { WaveformRenderer } from '../visualization/waveform-renderer';
 import { RayHit } from '../raytracer/raytracer'; // Import RayHit
 import { FrequencyBands } from '../raytracer/ray'; // Import FrequencyBands
-import { DiffuseFieldModelModified } from './diffuse-field-model_modified';
+import { FeedbackDelayNetwork } from './feedback-delay-network';
 import { vec3 } from 'gl-matrix';
 
 // Helper to calculate RMS of a Float32Array
@@ -37,7 +37,6 @@ export class AudioProcessorModified {
     private audioCtx: AudioContext;
     private room: Room;
     private camera: Camera;
-    private diffuseFieldModel: DiffuseFieldModelModified;
     private impulseResponseBuffer: AudioBuffer | null = null;
     private lastImpulseData: Float32Array | null = null;
     private sampleRate: number;
@@ -50,15 +49,6 @@ export class AudioProcessorModified {
         this.camera = camera;
         this.sampleRate = sampleRate;
 
-        const roomConfigForModel = {
-             dimensions: {
-                 width: room.config.dimensions.width || 10,
-                 height: room.config.dimensions.height || 3,
-                 depth: room.config.dimensions.depth || 10
-             },
-             materials: room.config.materials
-         };
-        this.diffuseFieldModel = new DiffuseFieldModelModified(this.sampleRate, roomConfigForModel);
     }
 
     async processRayHits(
@@ -71,9 +61,7 @@ export class AudioProcessorModified {
             }
             const [leftEarHits, rightEarHits] = rayHits;
 
-            if (!this.diffuseFieldModel) {
-                 console.error('[AP processRayHits] Audio components not initialized'); return;
-            }
+            // Note: diffuseFieldModel is no longer used, replaced by FeedbackDelayNetwork in playAudioWithIR
 
             // Combine hits for backward compatibility with methods expecting a single list (e.g., getAverageRT60)
             const combinedHits = [...leftEarHits, ...rightEarHits].filter(hit => hit && hit.position && hit.energies && isFinite(hit.time));
@@ -100,32 +88,7 @@ export class AudioProcessorModified {
         }
     }
     private getAverageRT60(rayHitsForRT60: RayHit[]): number {
-        if (!this.diffuseFieldModel) return 1.0; // Default if DFM not ready
-
-        // Need a roomConfig snapshot for calculateRT60Values
-        // This assumes this.room.config is current.
-        // DFM's calculateRT60Values is private, we'd need to expose it or replicate logic.
-        // For simplicity, let's assume we can get an average RT60.
-        // This part needs proper access to DFM's RT60 calculation or its results.
-        // Let's simulate getting it for now, based on current room config:
-         const roomConfigForRT60 = {
-             dimensions: { 
-                 width: this.room.config.dimensions.width, 
-                 height: this.room.config.dimensions.height, 
-                 depth: this.room.config.dimensions.depth 
-             },
-             materials: this.room.config.materials
-         };
-        // If DiffuseFieldModelModified.calculateRT60Values were public:
-        // const rt60Values = this.diffuseFieldModel.calculateRT60Values(rayHitsForRT60, roomConfigForRT60);
-        // For now, we'll use a placeholder logic if direct access isn't available,
-        // or assume processRayHitsInternal has already triggered this and we can fetch from DFM.
-        // To make this work cleanly, DiffuseFieldModelModified should probably store its last calculated avg RT60.
-        // Or, AudioProcessorModified calls calculateRT60Values and passes results around.
-
-        // Let's assume processRayHitsInternal will calculate and store avgRT60 for playAudioWithIR to use.
-        // This requires adding a property like this.lastAverageRT60 = avgRT60;
-        // For now, as a placeholder if that's not done:
+        // Calculate an estimated RT60 based on room properties
         const V = this.room.config.dimensions.width * this.room.config.dimensions.height * this.room.config.dimensions.depth;
         const S = 2 * (
             this.room.config.dimensions.width * this.room.config.dimensions.height +
@@ -209,68 +172,7 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
             }
         }
 
-        // --- LATE REVERBERATION (RE-ENABLED FOR ENHANCED REALISM) ---
-        const crossfadeStartSample = Math.floor(earlyReflectionCutoffTime * this.sampleRate);
-
-        let sumSqEarlyL = 0, sumSqEarlyR = 0;
-        let countNonZeroEarly = 0;
-        for (let i = 0; i < crossfadeStartSample; i++) {
-            sumSqEarlyL += leftIR[i] * leftIR[i];
-            sumSqEarlyR += rightIR[i] * rightIR[i];
-            if (Math.abs(leftIR[i]) > 1e-9 || Math.abs(rightIR[i]) > 1e-9) {
-                countNonZeroEarly++;
-            }
-        }
-        const avgRmsEarly = (countNonZeroEarly > 10) ? Math.sqrt((sumSqEarlyL + sumSqEarlyR) / (2 * countNonZeroEarly)) : 1e-6;
-
-        const lateHits = [...leftEarHits, ...rightEarHits].filter(hit => hit.time >= earlyReflectionCutoffTime);
-
-        let generatedLateL = new Float32Array(0), generatedLateR = new Float32Array(0);
-
-        if (lateHits.length > 0 && this.diffuseFieldModel) {
-            const roomConfig = {
-                dimensions: { width: this.room.config.dimensions.width, height: this.room.config.dimensions.height, depth: this.room.config.dimensions.depth },
-                materials: this.room.config.materials
-            };
-            try {
-                const [rawGeneratedLateL, rawGeneratedLateR] = this.diffuseFieldModel.processLateReverberation(
-                    lateHits, this.camera, roomConfig, this.sampleRate
-                );
-                generatedLateL = new Float32Array(rawGeneratedLateL.length);
-                generatedLateL.set(rawGeneratedLateL);
-                generatedLateR = new Float32Array(rawGeneratedLateR.length);
-                generatedLateR.set(rawGeneratedLateR);
-            } catch (e) { console.error("Error generating late reverberation:", e); }
-        }
-        
-        const avgRmsDFM = (calculateRMS(generatedLateL) + calculateRMS(generatedLateR)) / 2;
-        const desiredLateToEarlyRMS = 0.005; // Further reduced from 0.2 to 0.005 based on user feedback for much lower reverb loudness
-        let lateReverbGain = (avgRmsDFM > 1e-9) ? (desiredLateToEarlyRMS * avgRmsEarly) / avgRmsDFM : 0.0;
-        lateReverbGain = Math.max(0.0, Math.min(5.0, lateReverbGain));
-
-        if (generatedLateL.length > 0 && generatedLateR.length > 0) {
-            const crossfadeEndSample = Math.floor((earlyReflectionCutoffTime + 0.04) * this.sampleRate);
-            const crossfadeDuration = Math.max(1, crossfadeEndSample - crossfadeStartSample);
-
-            for (let i = crossfadeStartSample; i < irLength; i++) {
-                const lateReverbIndex = i - crossfadeStartSample;
-                if (lateReverbIndex >= generatedLateL.length) break;
-
-                const lateL_contribution = generatedLateL[lateReverbIndex] * lateReverbGain;
-                const lateR_contribution = generatedLateR[lateReverbIndex] * lateReverbGain;
-
-                if (i < crossfadeEndSample) {
-                    const fadePos = (i - crossfadeStartSample) / crossfadeDuration;
-                    const earlyGainFactor = 0.5 * (1 + Math.cos(fadePos * Math.PI));
-                    const diffuseGainFactor = 0.5 * (1 - Math.cos(fadePos * Math.PI));
-                    leftIR[i] = leftIR[i] * earlyGainFactor + lateL_contribution * diffuseGainFactor;
-                    rightIR[i] = rightIR[i] * earlyGainFactor + lateR_contribution * diffuseGainFactor;
-                } else {
-                    leftIR[i] = lateL_contribution;
-                    rightIR[i] = lateR_contribution;
-                }
-            }
-        }
+        // Late reverberation is now handled by FeedbackDelayNetwork in playAudioWithIR, not in the impulse response
         
         this.sanitizeIRBuffers(leftIR, rightIR);
         return [leftIR, rightIR];
@@ -282,52 +184,54 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
 
     public async playAudioWithIR(audioBuffer: AudioBuffer): Promise<void> {
         this.stopAllSounds();
+
         if (!this.impulseResponseBuffer) {
-            console.warn('No impulse response buffer available for playback. Playing dry signal only.');
-            const drySource = this.audioCtx.createBufferSource();
-            drySource.buffer = audioBuffer;
-            drySource.connect(this.audioCtx.destination);
-            drySource.start(0);
-            this.currentSourceNode = drySource;
-            drySource.onended = () => {
-                if (this.currentSourceNode === drySource) this.currentSourceNode = null;
-                try { drySource.disconnect(); } catch (e) {}
-            };
+            console.warn('No impulse response buffer for early reflections.');
             return;
         }
 
-        try {
-            const nodes = this.createConvolvedSource(audioBuffer, this.impulseResponseBuffer);
-            if (!nodes) return;
+        // --- 1. Create Nodes ---
+        const source = this.audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
 
-            const { source, convolver, wetGain } = nodes;
+        // Early reflections part
+        const earlyReflections = this.audioCtx.createConvolver();
+        earlyReflections.normalize = false;
+        earlyReflections.buffer = this.impulseResponseBuffer;
 
-            // The impulse response now contains the direct sound, so we play it at full volume (1.0).
-            // All dry/wet mixing logic is removed as it's no longer needed.
-            console.log(`[AP playAudioWithIR] Playing fully convolved signal (IR includes direct sound).`);
-            wetGain.gain.setValueAtTime(1.0, this.audioCtx.currentTime);
-            
-            // The only connection to the output is now the convolved signal path.
-            wetGain.connect(this.audioCtx.destination);
+        // Late reverb part (using the new FDN)
+        const fdn = new FeedbackDelayNetwork(this.audioCtx);
+        const rt60 = this.getAverageRT60(this.lastRayHits); // Assumes you have a method for this
+        fdn.setRT60({ '1000': rt60, '8000': rt60 * 0.6 });
+        fdn.setMix(1.0); // Use FDN as a fully wet effect
 
+        const masterOutput = this.audioCtx.createGain();
+        masterOutput.connect(this.audioCtx.destination);
+        
+        // --- 2. Connect the Audio Graph ---
+        
+        // DRY PATH: For comparison, you might want a dry signal path
+        // const dryGain = this.audioCtx.createGain();
+        // dryGain.gain.value = 0.5;
+        // source.connect(dryGain);
+        // dryGain.connect(masterOutput);
 
-            this.currentSourceNode = source;
-            source.onended = () => {
-                if (this.currentSourceNode === source) this.currentSourceNode = null;
-                try { 
-                    // Clean up all nodes.
-                    wetGain.disconnect(); 
-                    convolver.disconnect(); 
-                    source.disconnect(convolver);
-                } catch (e) {
-                    console.warn("Error during node cleanup onended:", e);
-                }
-            };
-            source.start(0);
-        } catch (error) {
-            console.error('Error playing audio with IR:', error);
-            this.currentSourceNode = null;
-        }
+        // WET PATH
+        const wetGain = this.audioCtx.createGain();
+        wetGain.gain.value = 0.8; // Adjust overall reverb level
+
+        // Route audio through early reflections AND the FDN in parallel
+        source.connect(earlyReflections);
+        source.connect(fdn.input); // Send audio to the FDN
+
+        earlyReflections.connect(wetGain);
+        fdn.connect(wetGain); // Connect FDN output
+        
+        wetGain.connect(masterOutput);
+
+        // --- 3. Play ---
+        source.start(0);
+        this.currentSourceNode = source;
     }
 
     private sanitizeIRBuffers(leftIR: Float32Array, rightIR: Float32Array): void {
