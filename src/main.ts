@@ -300,11 +300,22 @@ export class Main {
 
     // Add ray tracing controls
     const rayTracingFolder = this.gui.addFolder("Ray Tracing");
+    
+    // Get the initial config from the ray tracer to populate the UI
+    const rayTracerConfig = (this.rayTracer as any).getConfig(); // Use as any to bypass private access if needed
+
+    rayTracingFolder.add(rayTracerConfig, 'numRays', 1000, 50000, 100).name('Number of Rays');
+    rayTracingFolder.add(rayTracerConfig, 'maxBounces', 5, 200, 1).name('Max Bounces');
+    rayTracingFolder.add(rayTracerConfig, 'minEnergy', 0.001, 0.1, 0.001).name('Min Energy').listen();
+
     const rayTracingControls = {
       calculateIR: async () => {
+        // Before calculating, update the ray tracer with the values from the UI
+        (this.rayTracer as any).setConfig(rayTracerConfig);
         await this.calculateIR();
       },
     };
+
     rayTracingFolder
       .add(rayTracingControls, "calculateIR")
       .name("Calculate IR");
