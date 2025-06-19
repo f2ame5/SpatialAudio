@@ -48,6 +48,7 @@ export class AudioProcessorModified {
         this.room = room;
         this.camera = camera;
         this.sampleRate = sampleRate;
+        console.log(`[AP CONSTRUCTOR] AudioProcessorModified initialized with sample rate: ${sampleRate}`);
 
     }
 
@@ -67,6 +68,9 @@ export class AudioProcessorModified {
             const combinedHits = [...leftEarHits, ...rightEarHits].filter(hit => hit && hit.position && hit.energies && isFinite(hit.time));
             if (combinedHits.length === 0) {
                 console.warn('[AP processRayHits] No valid ray hits after filtering');
+                // Create a fallback silent IR buffer so audio can still play
+                const fallbackIR = new Float32Array(Math.ceil(this.sampleRate * 0.1));
+                await this.setupImpulseResponseBuffer(fallbackIR, fallbackIR);
                 return;
             }
             this.lastRayHits = combinedHits; // Store combined hits for RT60 calculation
@@ -88,7 +92,8 @@ export class AudioProcessorModified {
         }
     }
     private getAverageRT60(rayHitsForRT60: RayHit[]): number {
-        // Calculate an estimated RT60 based on room properties
+        console.log('[AP getAverageRT60] Calculating average RT60...');
+        // Calculate an estimated RT60 based on room properties using Sabine's formula
         const V = this.room.config.dimensions.width * this.room.config.dimensions.height * this.room.config.dimensions.depth;
         const S = 2 * (
             this.room.config.dimensions.width * this.room.config.dimensions.height +
@@ -103,23 +108,27 @@ export class AudioProcessorModified {
         ) / 3;
         const effectiveAvgAbs = Math.max(0.01, avgAbs);
         let estimatedAvgRT60 = (0.161 * V) / (S * effectiveAvgAbs);
-        estimatedAvgRT60 = Math.max(0.1, Math.min(5.0, estimatedAvgRT60)); // Clamp
+        estimatedAvgRT60 = Math.max(0.1, Math.min(5.0, estimatedAvgRT60)); // Clamp to a reasonable range
+        console.log(`[AP getAverageRT60] Estimated RT60 from room properties: ${estimatedAvgRT60.toFixed(3)}s`);
         return estimatedAvgRT60;
     }
 
 // src/sound/audio-processor_modified.ts
 
 private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [Float32Array, Float32Array] {
-    const irLength = Math.max(Math.ceil(this.sampleRate * 2.5), 1000);
+    const irLength = Math.max(Math.ceil(this.sampleRate * 2.5), 1000); // 2.5 seconds IR length
     const leftIR = new Float32Array(irLength);
     const rightIR = new Float32Array(irLength);
+    console.log(`[AP processRayHitsInternal] Creating IR buffers of length ${irLength}`);
 
     try {
         const earlyReflectionCutoffTime = 0.08; // 80ms for early part
         const SPEED_OF_SOUND = 343.0; // m/s
         
+        // Combine, filter, and create a unique set of early hits
         const allEarlyHits = [...leftEarHits, ...rightEarHits].filter(hit => hit.time < earlyReflectionCutoffTime);
         const uniqueHits = Array.from(new Map(allEarlyHits.map(hit => [hit.time.toString() + hit.position.toString(), hit])).values());
+        console.log(`[AP processRayHitsInternal] Processing ${uniqueHits.length} unique early reflection hits.`);
 
         const headPos = this.camera.getPosition();
         const headRight = this.camera.getRight();
@@ -130,11 +139,13 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
             const toHeadDir = vec3.subtract(vec3.create(), hit.position, headPos);
             vec3.normalize(toHeadDir, toHeadDir);
 
+            // Simple lateral gain based on dot product with 'right' vector
             const lateralness = vec3.dot(toHeadDir, headRight);
             
             const rightGain = Math.pow(0.5 * (1 + lateralness), 2);
             const leftGain = Math.pow(0.5 * (1 - lateralness), 2);
 
+            // Calculate arrival time at each ear considering head geometry
             const earLeftPos = vec3.scaleAndAdd(vec3.create(), headPos, headRight, -headRadius);
             const earRightPos = vec3.scaleAndAdd(vec3.create(), headPos, headRight, headRadius);
 
@@ -151,8 +162,9 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
             const amplitude = Math.sqrt(Math.max(0, totalEnergy));
 
             if (isFinite(amplitude) && amplitude > 1e-6) {
-                const spreadSamples = 40;
-                const spreadDecay = 20;
+                // Apply temporal spreading for a more natural, less 'clicky' impulse
+                const spreadSamples = 40; // Spread over 40 samples
+                const spreadDecay = 20;   // Decay factor for the spread
 
                 for (let j = 0; j < spreadSamples; j++) {
                     const idx = leftSampleIndex + j;
@@ -173,6 +185,7 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         }
 
         // Late reverberation is now handled by FeedbackDelayNetwork in playAudioWithIR, not in the impulse response
+        console.log('[AP processRayHitsInternal] Finished processing early reflections. Late reverb handled by FDN.');
         
         this.sanitizeIRBuffers(leftIR, rightIR);
         return [leftIR, rightIR];
@@ -184,11 +197,18 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
 
     public async playAudioWithIR(audioBuffer: AudioBuffer): Promise<void> {
         this.stopAllSounds();
+        console.log('[AP playAudioWithIR] Attempting to play audio with IR.');
 
         if (!this.impulseResponseBuffer) {
-            console.warn('No impulse response buffer for early reflections.');
+            console.warn('No impulse response buffer for early reflections. Playing dry audio instead.');
+             const source = this.audioCtx.createBufferSource();
+             source.buffer = audioBuffer;
+             source.connect(this.audioCtx.destination);
+             source.start(0);
+             this.currentSourceNode = source;
             return;
         }
+        console.log('[AP playAudioWithIR] Impulse response buffer is available.');
 
         // --- 1. Create Nodes ---
         const source = this.audioCtx.createBufferSource();
@@ -200,9 +220,10 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         earlyReflections.buffer = this.impulseResponseBuffer;
 
         // Late reverb part (using the new FDN)
-        const fdn = new FeedbackDelayNetwork(this.audioCtx);
-        const rt60 = this.getAverageRT60(this.lastRayHits); // Assumes you have a method for this
-        fdn.setRT60({ '1000': rt60, '8000': rt60 * 0.6 });
+        const fdn = new FeedbackDelayNetwork(this.audioCtx, 16); // Using 16 delay lines for a denser reverb
+        const rt60 = this.getAverageRT60(this.lastRayHits); 
+        console.log(`[AP playAudioWithIR] Setting FDN RT60 to: ${rt60.toFixed(3)}s`);
+        fdn.setRT60({ '1000': rt60, '8000': rt60 * 0.6 }); // Set mid and high frequency decay
         fdn.setMix(1.0); // Use FDN as a fully wet effect
 
         const masterOutput = this.audioCtx.createGain();
@@ -210,12 +231,6 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         
         // --- 2. Connect the Audio Graph ---
         
-        // DRY PATH: For comparison, you might want a dry signal path
-        // const dryGain = this.audioCtx.createGain();
-        // dryGain.gain.value = 0.5;
-        // source.connect(dryGain);
-        // dryGain.connect(masterOutput);
-
         // WET PATH
         const wetGain = this.audioCtx.createGain();
         wetGain.gain.value = 0.8; // Adjust overall reverb level
@@ -228,10 +243,12 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         fdn.connect(wetGain); // Connect FDN output
         
         wetGain.connect(masterOutput);
+        console.log('[AP playAudioWithIR] Audio graph connected for early reflections and FDN late reverb.');
 
         // --- 3. Play ---
         source.start(0);
         this.currentSourceNode = source;
+        console.log('[AP playAudioWithIR] Audio playback started.');
     }
 
     private sanitizeIRBuffers(leftIR: Float32Array, rightIR: Float32Array): void {
@@ -264,9 +281,11 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
             }
         }
 
+        // Ensure first sample is zero to prevent clicks
         if (leftIR.length > 0) leftIR[0] = 0;
         if (rightIR.length > 0) rightIR[0] = 0;
 
+        // Apply a short fade-in and fade-out to prevent clicks
         const fadeSamples = Math.min(Math.floor(this.sampleRate * 0.005), 50);
         if (fadeSamples > 0 && leftIR.length > fadeSamples * 2) {
             for (let i = 0; i < fadeSamples; i++) {
@@ -283,7 +302,7 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
 
      private async setupImpulseResponseBuffer(leftIR: Float32Array, rightIR: Float32Array): Promise<void> {
         try {
-            // ... (validation and setup as before) ...
+            console.log('[AP setupIR] Setting up impulse response buffer...');
             if (!leftIR || !rightIR || leftIR.length === 0 || rightIR.length === 0) {
                 this.impulseResponseBuffer = null; console.warn("[AP setupIR] IR buffers empty/null."); return;
             }
@@ -306,7 +325,6 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
             this.impulseResponseBuffer.copyToChannel(channelRightIR, 1);
             console.log(`[AP setupIR] Impulse response buffer created/updated, length: ${(leftIR.length / this.sampleRate).toFixed(2)}s`);
         } catch (error) {
-            // ... (error handling as before) ...
             console.error('[AP setupIR] Error setting up impulse response buffer:', error);
             this.impulseResponseBuffer = null;
             try { 
@@ -324,6 +342,7 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
 
     public async visualizeImpulseResponse(renderer: WaveformRenderer): Promise<void> {
         if (this.lastImpulseData) {
+            console.log('[AP visualize] Visualizing impulse response.');
             await renderer.drawWaveformWithFFT(this.lastImpulseData);
         } else {
             console.warn('[AP visualize] No impulse data available to visualize.');
@@ -366,7 +385,7 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
 
 
     public stopAllSounds(): void {
-        // Method unchanged
+        console.log('[AP stopAllSounds] Stopping all current audio sources.');
         if (this.currentSourceNode) {
             try { this.currentSourceNode.stop(); } catch (error) {} 
             this.currentSourceNode = null; 

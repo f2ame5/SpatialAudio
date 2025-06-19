@@ -5,7 +5,7 @@ import { vec3 } from "gl-matrix";
 import * as dat from "dat.gui";
 import { Sphere } from "./objects/sphere";
 import { SphereRenderer } from "./objects/sphere-renderer";
-import { RayTracer } from "./raytracer/raytracer";
+import { RayTracer, RayTracerConfig } from "./raytracer/raytracer"; // Import RayTracerConfig
 import { AudioProcessorModified } from "./sound/audio-processor_modified"; // Use modified version
 import { WaveformRenderer } from "./visualization/waveform-renderer";
 
@@ -143,13 +143,19 @@ export class Main {
     // Initialize sphere renderer
     this.sphereRenderer = new SphereRenderer(device);
 
-    // Initialize ray tracer
+    // Initialize ray tracer with a more robust configuration
     this.rayTracer = new RayTracer(
       device,
       this.sphere,
       this.room,
       this.camera,
-     
+      {
+        numRays: 10000, // Increased from 1000
+        maxBounces: 100,  // Increased from 50
+        minEnergy: 0.001, // Decreased from 0.05
+        enableDiffraction: true,
+        diffractionAttenuationFactor: 0.5
+      }
     );
     this.audioProcessor = new AudioProcessorModified(
       this.audioCtx,

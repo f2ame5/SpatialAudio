@@ -21,6 +21,7 @@ export class FeedbackDelayNetwork {
     constructor(audioCtx: AudioContext, channels: number = 8) {
         this.audioCtx = audioCtx;
         this.numChannels = channels;
+        console.log(`[FDN CONSTRUCTOR] Creating FDN with ${channels} channels.`);
 
         // --- Core Nodes ---
         this._input = this.audioCtx.createGain();
@@ -35,6 +36,8 @@ export class FeedbackDelayNetwork {
         // --- Create Delay Lines and Feedback Loop ---
         const maxDelayTime = 1.0; // Max delay of 1 second
         const delayTimes = this.generateDelayTimes(this.numChannels);
+        console.log('[FDN CONSTRUCTOR] Generated Delay Times (s):', delayTimes);
+
 
         for (let i = 0; i < this.numChannels; i++) {
             // 1. Delay Line
@@ -66,6 +69,8 @@ export class FeedbackDelayNetwork {
         // --- Feedback Loop with Mixing Matrix ---
         // A Hadamard matrix is great for mixing signals efficiently and without coloration.
         const hadamardMatrix = this.createHadamardMatrix(this.numChannels);
+        console.log('[FDN CONSTRUCTOR] Created Hadamard Matrix:', hadamardMatrix);
+
 
         // The output of the merged feedback is split and sent back to the delays
         this.merger.connect(this.splitter);
@@ -118,6 +123,7 @@ export class FeedbackDelayNetwork {
      */
     public setMix(wetLevel: number): void {
         const clampedWet = Math.max(0, Math.min(1, wetLevel));
+        console.log(`[FDN setMix] Setting wet level to: ${clampedWet}`);
         this.wetGain.gain.setValueAtTime(clampedWet, this.audioCtx.currentTime);
         this.dryGain.gain.setValueAtTime(1 - clampedWet, this.audioCtx.currentTime);
     }
@@ -127,6 +133,7 @@ export class FeedbackDelayNetwork {
      * @param rt60Values - An object with frequencies as keys and decay times in seconds as values.
      */
     public setRT60(rt60Values: { [frequency: string]: number }): void {
+        console.log('[FDN setRT60] Received RT60 values:', rt60Values);
         const rt60_1k = rt60Values['1000'] || 1.5;
         const rt60_high = rt60Values['8000'] || rt60_1k * 0.7;
 
@@ -146,6 +153,7 @@ export class FeedbackDelayNetwork {
             const cutoff = 20000 * Math.pow(highFreqRatio, 2); // Exponential scaling
             this.filters[i].frequency.value = Math.max(400, Math.min(20000, cutoff));
         }
+        console.log(`[FDN setRT60] Configured feedback gains and filter cutoffs based on RT60_1k=${rt60_1k} and RT60_high=${rt60_high}.`);
     }
 
     // --- Private Helper Methods ---
@@ -162,7 +170,12 @@ export class FeedbackDelayNetwork {
     
     private createHadamardMatrix(size: number): number[][] {
         if (size === 1) return [[1]];
-        if (size % 2 !== 0) throw new Error("Matrix size must be a power of 2.");
+        if (size % 2 !== 0) {
+            console.error("Matrix size must be a power of 2 for Hadamard. Using fallback.");
+            // Fallback to a simple mixing matrix if not a power of 2
+            const fallbackMatrix = Array.from({ length: size }, () => Array(size).fill(1/Math.sqrt(size)));
+            return fallbackMatrix;
+        }
 
         const half = this.createHadamardMatrix(size / 2);
         const halfSize = half.length;
