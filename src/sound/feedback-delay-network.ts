@@ -139,13 +139,17 @@ export class FeedbackDelayNetwork {
 
         for (let i = 0; i < this.numChannels; i++) {
             const delayTime = this.delayNodes[i].delayTime.value;
+            let feedbackGain = 0;
             
             // Set feedback gain based on mid-frequency decay
             if (rt60_1k > delayTime) {
-                this.feedbackGains[i].gain.value = Math.pow(10, (-3 * delayTime) / rt60_1k);
-            } else {
-                this.feedbackGains[i].gain.value = 0;
+                feedbackGain = Math.pow(10, (-3 * delayTime) / rt60_1k);
             }
+
+            // --- MODIFICATION START ---
+            // Add a safety clamp to prevent instability from gains >= 1.0
+            this.feedbackGains[i].gain.value = Math.min(feedbackGain, 0.999);
+            // --- MODIFICATION END ---
 
             // Set filter frequency for high-frequency damping
             // A higher ratio of high-freq RT60 means less damping (higher cutoff)
@@ -153,7 +157,7 @@ export class FeedbackDelayNetwork {
             const cutoff = 20000 * Math.pow(highFreqRatio, 2); // Exponential scaling
             this.filters[i].frequency.value = Math.max(400, Math.min(20000, cutoff));
         }
-        console.log(`[FDN setRT60] Configured feedback gains and filter cutoffs based on RT60_1k=${rt60_1k} and RT60_high=${rt60_high}.`);
+        console.log(`[FDN setRT60] Configured feedback gains and filter cutoffs based on RT60_1k=${rt60_1k}. Max gain clamped to 0.999.`);
     }
 
     // --- Private Helper Methods ---
