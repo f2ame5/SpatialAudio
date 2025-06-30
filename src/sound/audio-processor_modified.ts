@@ -33,6 +33,8 @@ function calculateRMS(arr: Float32Array, countNonZeroThreshold: number = 10): nu
     return Math.sqrt(sumSq / count);
 }
 
+import { SpatialAudioProcessor } from './spatial-audio-processor';
+
 export class AudioProcessorModified {
     private audioCtx: AudioContext;
     private room: Room;
@@ -42,8 +44,10 @@ export class AudioProcessorModified {
     private sampleRate: number;
     private lastRayHits: RayHit[] = [];
     private currentSourceNode: AudioBufferSourceNode | null = null;
+    private spatialProcessor: SpatialAudioProcessor;
 
     constructor(audioCtx: AudioContext, room: Room, camera: Camera, sampleRate: number) {
+        this.spatialProcessor = new SpatialAudioProcessor(sampleRate);
         this.audioCtx = audioCtx;
         this.room = room;
         this.camera = camera;
@@ -113,6 +117,24 @@ export class AudioProcessorModified {
         return estimatedAvgRT60;
     }
 
+    private applyHighPassFilter(buffer: Float32Array, cutoffHz: number): void {
+        const dt = 1.0 / this.sampleRate;
+        const rc = 1.0 / (2.0 * Math.PI * cutoffHz);
+        const alpha = rc / (rc + dt);
+
+        let y_prev = 0;
+        let x_prev = 0;
+
+        for (let i = 0; i < buffer.length; i++) {
+            const x_curr = buffer[i];
+            // The classic RC high-pass filter formula
+            const y_curr = alpha * (y_prev + x_curr - x_prev);
+            buffer[i] = y_curr;
+            x_prev = x_curr;
+            y_prev = y_curr;
+        }
+    }
+
 // src/sound/audio-processor_modified.ts
 
 private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [Float32Array, Float32Array] {
@@ -129,6 +151,24 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         const allEarlyHits = [...leftEarHits, ...rightEarHits].filter(hit => hit.time < earlyReflectionCutoffTime);
         const uniqueHits = Array.from(new Map(allEarlyHits.map(hit => [hit.time.toString() + hit.position.toString(), hit])).values());
         console.log(`[AP processRayHitsInternal] Processing ${uniqueHits.length} unique early reflection hits.`);
+
+        // Log average energy across frequency bands
+        const avgEnergies: { [key: string]: number } = {};
+        if (uniqueHits.length > 0) {
+            const energyKeys = Object.keys(uniqueHits[0].energies);
+            for (const key of energyKeys) {
+                avgEnergies[key] = 0;
+            }
+            for (const hit of uniqueHits) {
+                for (const key of energyKeys) {
+                    avgEnergies[key] += hit.energies[key as keyof typeof hit.energies] as number;
+                }
+            }
+            for (const key of energyKeys) {
+                avgEnergies[key] /= uniqueHits.length;
+            }
+            console.log(`[AudioProcessorModified] Average Ray Hit Energy:`, avgEnergies);
+        }
 
         const headPos = this.camera.getPosition();
         const headRight = this.camera.getRight();
@@ -155,30 +195,59 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
             const timeToLeftEar = hit.time + (distToLeftEar / SPEED_OF_SOUND);
             const timeToRightEar = hit.time + (distToRightEar / SPEED_OF_SOUND);
 
-            const leftSampleIndex = Math.floor(timeToLeftEar * this.sampleRate);
-            const rightSampleIndex = Math.floor(timeToRightEar * this.sampleRate);
+            let leftSampleIndex = Math.floor(timeToLeftEar * this.sampleRate);
+            let rightSampleIndex = Math.floor(timeToRightEar * this.sampleRate);
+
+            // For direct hits, ensure they start at sample 0
+            if (hit.type === 'direct') {
+                leftSampleIndex = 0;
+                rightSampleIndex = 0;
+            }
+
+            // For direct hits, ensure they start at sample 0
+            if (hit.type === 'direct') {
+                leftSampleIndex = 0;
+                rightSampleIndex = 0;
+            }
 
             const totalEnergy = Object.values(hit.energies).reduce((sum: number, e) => sum + (typeof e === 'number' ? e : 0), 0);
-            const amplitude = Math.sqrt(Math.max(0, totalEnergy));
+            let amplitude = Math.sqrt(Math.max(0, totalEnergy));
+
+            // Apply a more controlled distance attenuation to prevent clipping and provide smoother rolloff
+            const distance = hit.distance;
+            const rolloffFactor = 0.8; // Adjust this to control how quickly sound decays
+            const distanceAttenuation = 1.0 / (1.0 + distance * rolloffFactor);
+            
+            // Apply a master gain to prevent overall clipping before normalization
+            const masterGain = 0.7;
+
+            amplitude *= distanceAttenuation * masterGain;
+
+            // Get HRTF filters for this hit's direction
+            const [leftHRTF, rightHRTF] = this.spatialProcessor.calculateImprovedHRTF(
+                hit.position,
+                this.camera.getPosition(),
+                this.camera.getFront(),
+                this.camera.getRight(),
+                this.camera.getUp()
+            );
 
             if (isFinite(amplitude) && amplitude > 1e-6) {
                 // Apply temporal spreading for a more natural, less 'clicky' impulse
                 const spreadSamples = 40; // Spread over 40 samples
                 const spreadDecay = 20;   // Decay factor for the spread
 
-                for (let j = 0; j < spreadSamples; j++) {
-                    const idx = leftSampleIndex + j;
-                    if (idx >= 0 && idx < irLength) {
-                        const spreadEnvelope = Math.exp(-j / spreadDecay);
-                        leftIR[idx] += amplitude * leftGain * spreadEnvelope;
+                for (let j = 0; j < leftHRTF.length; j++) {
+                    const irIdx = leftSampleIndex + j;
+                    if (irIdx >= 0 && irIdx < irLength) {
+                        leftIR[irIdx] += amplitude * leftHRTF[j];
                     }
                 }
 
-                for (let j = 0; j < spreadSamples; j++) {
-                    const idx = rightSampleIndex + j;
-                    if (idx >= 0 && idx < irLength) {
-                        const spreadEnvelope = Math.exp(-j / spreadDecay);
-                        rightIR[idx] += amplitude * rightGain * spreadEnvelope;
+                for (let j = 0; j < rightHRTF.length; j++) {
+                    const irIdx = rightSampleIndex + j;
+                    if (irIdx >= 0 && irIdx < irLength) {
+                        rightIR[irIdx] += amplitude * rightHRTF[j];
                     }
                 }
             }
@@ -187,6 +256,10 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         // Late reverberation is now handled by FeedbackDelayNetwork in playAudioWithIR, not in the impulse response
         console.log('[AP processRayHitsInternal] Finished processing early reflections. Late reverb handled by FDN.');
         
+        // Apply a high-pass filter to remove low-end boominess from early reflections
+        this.applyHighPassFilter(leftIR, 120); // Cutoff at 120Hz
+        this.applyHighPassFilter(rightIR, 120);
+
         this.sanitizeIRBuffers(leftIR, rightIR);
         return [leftIR, rightIR];
     } catch (error) {
@@ -223,6 +296,7 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         const fdn = new FeedbackDelayNetwork(this.audioCtx, 16); // Using 16 delay lines for a denser reverb
         const rt60 = this.getAverageRT60(this.lastRayHits); 
         console.log(`[AP playAudioWithIR] Setting FDN RT60 to: ${rt60.toFixed(3)}s`);
+        console.log(`[AudioProcessorModified] FDN Filter Cutoff: High-frequency RT60 ratio controlled`);
         fdn.setRT60({ '1000': rt60, '8000': rt60 * 0.6 }); // Set mid and high frequency decay
         fdn.setMix(1.0); // Use FDN as a fully wet effect
 
@@ -230,20 +304,19 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         masterOutput.connect(this.audioCtx.destination);
         
         // --- 2. Connect the Audio Graph ---
-        
-        // WET PATH
-        const wetGain = this.audioCtx.createGain();
-        wetGain.gain.value = 0.8; // Adjust overall reverb level
 
-        // Route audio through early reflections AND the FDN in parallel
+        // Path 1: Early Reflections (includes direct sound)
         source.connect(earlyReflections);
-        source.connect(fdn.input); // Send audio to the FDN
+        earlyReflections.connect(masterOutput);
 
-        earlyReflections.connect(wetGain);
-        fdn.connect(wetGain); // Connect FDN output
-        
-        wetGain.connect(masterOutput);
-        console.log('[AP playAudioWithIR] Audio graph connected for early reflections and FDN late reverb.');
+        // Path 2: Late Reverberation (with pre-delay)
+        const preDelay = this.audioCtx.createDelay();
+        preDelay.delayTime.value = 0.08; // 80ms pre-delay, matching early reflection cutoff
+
+        source.connect(preDelay);
+        preDelay.connect(fdn.input);
+        fdn.connect(masterOutput);
+        console.log('[AP playAudioWithIR] Audio graph connected with pre-delay for late reverb.');
 
         // --- 3. Play ---
         source.start(0);
@@ -267,9 +340,10 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         for (let i = 0; i < leftIR.length; i++) {
             maxValue = Math.max(maxValue, Math.abs(leftIR[i]), Math.abs(rightIR[i]));
         }
+        console.log(`[AudioProcessorModified] Pre-normalization: Max IR value = ${maxValue.toFixed(4)}`);
         console.log(`[AP sanitizeIRBuffers] Max value before normalization: ${maxValue.toExponential(3)}`);
         
-        const targetPeak = 0.9; // Adjusted from 0.85 to 0.9 for slightly higher dynamic range
+        const targetPeak = 0.8; // Adjusted from 0.9 to 0.8 for more headroom
         if (maxValue > targetPeak) { 
             const gainFactor = (maxValue > 0) ? targetPeak / maxValue : 1.0;
             if (gainFactor < 1.0) { 
@@ -282,8 +356,8 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         }
 
         // Ensure first sample is zero to prevent clicks
-        if (leftIR.length > 0) leftIR[0] = 0;
-        if (rightIR.length > 0) rightIR[0] = 0;
+        // if (leftIR.length > 0) leftIR[0] = 0;
+        // if (rightIR.length > 0) rightIR[0] = 0;
 
         // Apply a short fade-in and fade-out to prevent clicks
         const fadeSamples = Math.min(Math.floor(this.sampleRate * 0.005), 50);

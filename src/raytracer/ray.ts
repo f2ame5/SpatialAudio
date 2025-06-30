@@ -120,16 +120,16 @@ export class Ray {
     this.energies.energy8kHz *= (1 - energyLoss.absorption8kHz);
     this.energies.energy16kHz *= (1 - energyLoss.absorption16kHz);
 
-    const airAmpFactors = this.calculateAirAbsorption(distance, temperature, humidity);
+    const airAmpFactors = this.calculateAirAbsorption(distance);
 
-    this.energies.energy125Hz *= Math.pow(airAmpFactors.absorption125Hz, 2);
-    this.energies.energy250Hz *= Math.pow(airAmpFactors.absorption250Hz, 2);
-    this.energies.energy500Hz *= Math.pow(airAmpFactors.absorption500Hz, 2);
-    this.energies.energy1kHz *= Math.pow(airAmpFactors.absorption1kHz, 2);
-    this.energies.energy2kHz *= Math.pow(airAmpFactors.absorption2kHz, 2);
-    this.energies.energy4kHz *= Math.pow(airAmpFactors.absorption4kHz, 2);
-    this.energies.energy8kHz *= Math.pow(airAmpFactors.absorption8kHz, 2);
-    this.energies.energy16kHz *= Math.pow(airAmpFactors.absorption16kHz, 2);
+    this.energies.energy125Hz *= airAmpFactors.absorption125Hz;
+    this.energies.energy250Hz *= airAmpFactors.absorption250Hz;
+    this.energies.energy500Hz *= airAmpFactors.absorption500Hz;
+    this.energies.energy1kHz *= airAmpFactors.absorption1kHz;
+    this.energies.energy2kHz *= airAmpFactors.absorption2kHz;
+    this.energies.energy4kHz *= airAmpFactors.absorption4kHz;
+    this.energies.energy8kHz *= airAmpFactors.absorption8kHz;
+    this.energies.energy16kHz *= airAmpFactors.absorption16kHz;
 
     this.pathLength += distance;
     this.bounces++;
@@ -140,7 +140,7 @@ export class Ray {
     this.phase = (this.phase + phaseChange) % (2 * Math.PI);
 }
 
-    public calculateAirAbsorption(distance: number, temperature: number, humidity: number): {
+    public calculateAirAbsorption(distance: number): {
         absorption125Hz: number,
         absorption250Hz: number,
         absorption500Hz: number,
@@ -150,31 +150,18 @@ export class Ray {
         absorption8kHz: number,
         absorption16kHz: number
     } {
-        // ISO 9613-1 standard air absorption calculation
-        const T = temperature + 273.15;
-        const T0 = 293.15;
-        const T01 = T / T0;
-        const hr = humidity * Math.pow(T01, -4.17);
-
-        // Calculate absorption for each frequency band
-        const calculateBandAbsorption = (freq: number): number => {
-            const fr = freq * T01;
-            const alpha = 1.84e-11 * (1 / T01) * Math.sqrt(T01) +
-                Math.pow(fr, 2.5) * (0.10680 * Math.exp(-3352 / T) * 1 / (fr + 3352 / T)) +
-                Math.pow(fr, 2.5) * (0.01278 * Math.exp(-2239.1 / T) * 1 / (fr + 2239.1 / T));
-
-            return Math.exp(-alpha * distance);
-        };
+        // Simplified exponential decay model for air absorption
+        const m = (freq: number) => 0.00005 * Math.pow(freq / 1000, 1.5);
 
         return {
-            absorption125Hz: calculateBandAbsorption(125),
-            absorption250Hz: calculateBandAbsorption(250),
-            absorption500Hz: calculateBandAbsorption(500),
-            absorption1kHz: calculateBandAbsorption(1000),
-            absorption2kHz: calculateBandAbsorption(2000),
-            absorption4kHz: calculateBandAbsorption(4000),
-            absorption8kHz: calculateBandAbsorption(8000),
-            absorption16kHz: calculateBandAbsorption(16000)
+            absorption125Hz: Math.exp(-m(125) * distance),
+            absorption250Hz: Math.exp(-m(250) * distance),
+            absorption500Hz: Math.exp(-m(500) * distance),
+            absorption1kHz: Math.exp(-m(1000) * distance),
+            absorption2kHz: Math.exp(-m(2000) * distance),
+            absorption4kHz: Math.exp(-m(4000) * distance),
+            absorption8kHz: Math.exp(-m(8000) * distance),
+            absorption16kHz: Math.exp(-m(16000) * distance)
         };
     }
 

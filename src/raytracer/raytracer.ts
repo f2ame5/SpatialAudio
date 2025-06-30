@@ -156,9 +156,18 @@ export class RayTracer {
         const listenerPos = this.camera.getPosition();
         const sourcePos = this.soundSource.getPosition();
 
-        // Direct path calculation (important for initial sound)
-        if (!this.checkForObstruction(sourcePos, listenerPos, this.getReflectionPlanes())) {
-            const directDist = vec3.distance(sourcePos, listenerPos);
+        // Direct path calculation
+        this.addDirectPath(sourcePos, this.earLeftPos, this.leftEarHits);
+        this.addDirectPath(sourcePos, this.earRightPos, this.rightEarHits);
+
+        this.generateRays();
+        await this.calculateLateReflections();
+    }
+
+    private addDirectPath(sourcePos: vec3, earPos: vec3, hits: RayHit[]): void {
+        const reflectionPlanes = this.getReflectionPlanes();
+        if (!this.checkForObstruction(sourcePos, earPos, reflectionPlanes)) {
+            const directDist = vec3.distance(sourcePos, earPos);
             const directTimeToListener = directDist / this.SPEED_OF_SOUND;
             const directEnergies: FrequencyBands = {
                 energy125Hz: 1.0, energy250Hz: 1.0, energy500Hz: 1.0, energy1kHz: 1.0,
@@ -169,19 +178,12 @@ export class RayTracer {
                 (directEnergies as any)[key] *= directAttenuation;
             }
 
-            this.leftEarHits.push(this.createListenerRelativeHit(
+            hits.push(this.createListenerRelativeHit(
                 sourcePos, directEnergies, 0,
-                0, 1000, 1.0, 0, 'direct', this.earLeftPos
+                0, 1000, 1.0, 0, 'direct', earPos
             ));
-
-            this.rightEarHits.push(this.createListenerRelativeHit(
-                sourcePos, directEnergies, 0,
-                0, 1000, 1.0, 0, 'direct', this.earRightPos
-            ));
+            console.log(`[RayTracer] Direct Path Hit added: Time=${0}, Energies=${JSON.stringify(directEnergies)}, EarPos=${earPos}`);
         }
-
-        this.generateRays();
-        await this.calculateLateReflections();
     }
 
     private getReflectionPlanes(): any[] {
@@ -296,16 +298,13 @@ export class RayTracer {
         const totalTimeAtListener = timeAtInteraction + travelTimeToListener;
 
         const airAbsRay = new Ray(vec3.create(), vec3.create(), 1.0, frequencyAtInteraction);
-        const airAbsorptionAmplitudeFactors = airAbsRay.calculateAirAbsorption(distanceToListener, this.AIR_TEMPERATURE, 50);
+        const airAbsorptionAmplitudeFactors = airAbsRay.calculateAirAbsorption(distanceToListener);
 
-        // Apply general distance attenuation (moved here to apply before head shadow)
-        const distanceAttenuationFactor = 1.0 / Math.max(0.01, distanceToListener * distanceToListener);
+        // Apply air absorption
         for (const key of Object.keys(energiesAtListener) as Array<keyof FrequencyBands>) {
-            energiesAtListener[key] *= distanceAttenuationFactor;
-            
             const bandKeyLookup = `absorption${key.replace('energy', '')}` as keyof typeof airAbsorptionAmplitudeFactors;
             if (airAbsorptionAmplitudeFactors.hasOwnProperty(bandKeyLookup)) {
-                energiesAtListener[key] *= Math.pow((airAbsorptionAmplitudeFactors as any)[bandKeyLookup], 2);
+                energiesAtListener[key] *= (airAbsorptionAmplitudeFactors as any)[bandKeyLookup];
             }
         }
 
@@ -339,7 +338,7 @@ export class RayTracer {
         const phaseAtListener = (phaseAtInteraction + (2 * Math.PI * frequencyAtInteraction * travelTimeToListener)) % (2 * Math.PI);
 
         return {
-            position: vec3.clone(interactionPointWorld), energies: energiesAtListener, time: totalTimeAtListener,
+            position: vec3.clone(interactionPointWorld), energies: energiesAtListener, time: (type === 'direct' ? 0 : totalTimeAtListener),
             phase: phaseAtListener, frequency: frequencyAtInteraction, dopplerShift: dopplerShiftAtInteraction,
             bounces: bounces, distance: distanceToListener, direction: directionFromInteractionToListener, type: type
         };

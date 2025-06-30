@@ -37,29 +37,77 @@ export class SpatialAudioProcessor {
     }
     
     private generateHRTFFilters(azimuth: number, elevation: number): [Float32Array, Float32Array] {
-        const filterLength = 128;
-        const leftFilter = new Float32Array(filterLength);
-        const rightFilter = new Float32Array(filterLength);
+        const filterLength = 512; // Increased filter length for better resolution
+        const leftFilter = new Float32Array(filterLength).fill(0);
+        const rightFilter = new Float32Array(filterLength).fill(0);
         
         // Convert angles to radians
         const azimuthRad = azimuth * Math.PI / 180;
         const elevationRad = elevation * Math.PI / 180;
         
-        // Generate HRTF filter coefficients
-        for (let i = 0; i < filterLength; i++) {
-            const t = i / filterLength;
-            
-            // Basic head shadow and pinna effects
-            const headShadow = Math.exp(-t * 8) * (1 - Math.abs(azimuthRad) / Math.PI);
-            const pinnaEffect = Math.exp(-t * 4) * (1 - Math.abs(elevationRad) / (Math.PI/2));
-            
-            // Left ear response
-            const leftPhase = -azimuthRad + Math.PI/4;
-            leftFilter[i] = headShadow * pinnaEffect * Math.cos(2 * Math.PI * t + leftPhase);
-            
-            // Right ear response
-            const rightPhase = azimuthRad + Math.PI/4;
-            rightFilter[i] = headShadow * pinnaEffect * Math.cos(2 * Math.PI * t + rightPhase);
+        const SPEED_OF_SOUND = 343.0; // m/s
+        const HEAD_RADIUS = 0.0875; // Approx. radius of the head in meters
+
+        // 1. Interaural Time Difference (ITD)
+        // More accurate ITD based on KEMAR dummy head measurements (simplified)
+        const itd = (HEAD_RADIUS / SPEED_OF_SOUND) * (azimuthRad + 0.5 * Math.sin(2 * azimuthRad));
+        const leftDelaySamples = -itd * this.sampleRate; 
+        const rightDelaySamples = itd * this.sampleRate; 
+
+        // 2. Interaural Level Difference (ILD) and Pinna Effects
+        const applySpatialFilter = (filter: Float32Array, delaySamples: number, isLeftEar: boolean) => {
+            const impulsePos = Math.round(delaySamples); // Position of the main impulse
+
+            // Apply a windowed impulse for smoother response
+            const windowSize = 50; // samples
+            for (let i = 0; i < windowSize; i++) {
+                const idx = impulsePos + i - Math.floor(windowSize / 2);
+                if (idx >= 0 && idx < filterLength) {
+                    const windowVal = 0.5 * (1 - Math.cos(2 * Math.PI * i / (windowSize - 1))); // Hanning window
+                    filter[idx] += windowVal; // Base impulse
+                }
+            }
+
+            // Apply ILD and Pinna effects by shaping the impulse
+            for (let i = 0; i < filterLength; i++) {
+                const time = i / this.sampleRate;
+                let gain = 1.0;
+
+                // Head shadow (ILD): more attenuation for higher frequencies on the far ear
+                const shadowFactor = Math.abs(azimuthRad) / Math.PI; // 0 at front/back, 1 at sides
+                const highFreqAttenuation = 1.0 - 0.8 * shadowFactor; // Increased attenuation
+                const lowFreqAttenuation = 1.0 - 0.3 * shadowFactor; // Increased attenuation
+
+                // Simple frequency-dependent shaping (simulating a low-pass for far ear)
+                if ((isLeftEar && azimuthRad > 0) || (!isLeftEar && azimuthRad < 0)) { // Far ear
+                    gain *= (i < filterLength / 8) ? lowFreqAttenuation : highFreqAttenuation; // Apply more to high freq part of impulse
+                }
+
+                // Pinna effects (simplified: subtle high-frequency boost/cut based on elevation)
+                const elevationEffect = Math.sin(elevationRad); // -1 to 1
+                if (elevationEffect > 0) { // Sound from above
+                    gain *= (1.0 + 0.15 * elevationEffect); // Increased boost
+                } else { // Sound from below
+                    gain *= (1.0 + 0.08 * elevationEffect); // Increased cut
+                }
+
+                filter[i] *= gain;
+            }
+        };
+
+        applySpatialFilter(leftFilter, leftDelaySamples, true);
+        applySpatialFilter(rightFilter, rightDelaySamples, false);
+
+        // Normalize filters to prevent clipping
+        const maxLeft = Math.max(...Array.from(leftFilter).map(Math.abs));
+        const maxRight = Math.max(...Array.from(rightFilter).map(Math.abs));
+        const overallMax = Math.max(maxLeft, maxRight);
+
+        if (overallMax > 0) {
+            for (let i = 0; i < filterLength; i++) {
+                leftFilter[i] /= overallMax;
+                rightFilter[i] /= overallMax;
+            }
         }
         
         return [leftFilter, rightFilter];
@@ -71,11 +119,10 @@ export class SpatialAudioProcessor {
         listenerFront: vec3,
         listenerRight: vec3,
         listenerUp: vec3
-    ): [number, number] {
+    ): [Float32Array, Float32Array] {
         // Calculate direction vector from listener to source
         const direction = vec3.create();
         vec3.subtract(direction, sourcePos, listenerPos);
-        const distance = vec3.length(direction);
         vec3.normalize(direction, direction);
         
         // Calculate azimuth (horizontal angle)
@@ -87,34 +134,11 @@ export class SpatialAudioProcessor {
         const dotUp = vec3.dot(direction, listenerUp);
         const elevation = Math.asin(Math.max(-1, Math.min(1, dotUp)));
         
-        // Base gains using spherical head model
-        let leftGain = 0.5, rightGain = 0.5;
-        
-        if (azimuth < 0) { // Source is to the left
-            leftGain = 0.9 - 0.4 * azimuth/Math.PI;
-            rightGain = 0.4 + 0.5 * (1 + azimuth/Math.PI);
-        } else { // Source is to the right
-            leftGain = 0.4 + 0.5 * (1 - azimuth/Math.PI);
-            rightGain = 0.9 + 0.4 * azimuth/Math.PI;
-        }
-        
-        // Apply elevation effects
-        const elevationFactor = 1.0 - Math.abs(elevation) / (Math.PI/2) * 0.3;
-        leftGain *= elevationFactor;
-        rightGain *= elevationFactor;
-        
-        // Apply distance attenuation
-        const distanceAtten = 1.0 / Math.max(1, distance);
-        leftGain *= distanceAtten;
-        rightGain *= distanceAtten;
-        
-        // Apply front-back disambiguation
-        if (Math.abs(azimuth) > Math.PI/2) {
-            const backFactor = 0.8;
-            leftGain *= backFactor;
-            rightGain *= backFactor;
-        }
-        
-        return [leftGain, rightGain];
+        // Convert radians to degrees for generateHRTFFilters
+        const azimuthDeg = azimuth * 180 / Math.PI;
+        const elevationDeg = elevation * 180 / Math.PI;
+
+        // Generate HRTF filters for this specific direction
+        return this.generateHRTFFilters(azimuthDeg, elevationDeg);
     }
 }

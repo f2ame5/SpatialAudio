@@ -36,9 +36,9 @@ export interface WallMaterial {
 // Add standard material presets with more detailed frequency response
 export const MATERIAL_PRESETS = {
     CONCRETE: {
-        absorption125Hz: 0.01,
-        absorption250Hz: 0.02,
-        absorption500Hz: 0.02,
+        absorption125Hz: 0.10,
+        absorption250Hz: 0.08,
+        absorption500Hz: 0.06,
         absorption1kHz: 0.03,
         absorption2kHz: 0.03,
         absorption4kHz: 0.04,
