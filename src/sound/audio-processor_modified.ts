@@ -176,14 +176,9 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         const headRadius = 0.0875; // Approx. radius of the head in meters
 
         for (const hit of uniqueHits) {
+            if (hit.type === 'direct') continue;
             const toHeadDir = vec3.subtract(vec3.create(), hit.position, headPos);
             vec3.normalize(toHeadDir, toHeadDir);
-
-            // Simple lateral gain based on dot product with 'right' vector
-            const lateralness = vec3.dot(toHeadDir, headRight);
-            
-            const rightGain = Math.pow(0.5 * (1 + lateralness), 2);
-            const leftGain = Math.pow(0.5 * (1 - lateralness), 2);
 
             // Calculate arrival time at each ear considering head geometry
             const earLeftPos = vec3.scaleAndAdd(vec3.create(), headPos, headRight, -headRadius);
@@ -198,30 +193,14 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
             let leftSampleIndex = Math.floor(timeToLeftEar * this.sampleRate);
             let rightSampleIndex = Math.floor(timeToRightEar * this.sampleRate);
 
-            // For direct hits, ensure they start at sample 0
-            if (hit.type === 'direct') {
-                leftSampleIndex = 0;
-                rightSampleIndex = 0;
-            }
-
-            // For direct hits, ensure they start at sample 0
-            if (hit.type === 'direct') {
-                leftSampleIndex = 0;
-                rightSampleIndex = 0;
-            }
-
             const totalEnergy = Object.values(hit.energies).reduce((sum: number, e) => sum + (typeof e === 'number' ? e : 0), 0);
             let amplitude = Math.sqrt(Math.max(0, totalEnergy));
 
             // Apply a more controlled distance attenuation to prevent clipping and provide smoother rolloff
             const distance = hit.distance;
-            const rolloffFactor = 0.8; // Adjust this to control how quickly sound decays
-            const distanceAttenuation = 1.0 / (1.0 + distance * rolloffFactor);
-            
-            // Apply a master gain to prevent overall clipping before normalization
-            const masterGain = 0.7;
+            const distanceAttenuation = 1.0 / Math.max(1.0, distance);
 
-            amplitude *= distanceAttenuation * masterGain;
+            amplitude *= distanceAttenuation;
 
             // Get HRTF filters for this hit's direction
             const [leftHRTF, rightHRTF] = this.spatialProcessor.calculateImprovedHRTF(
@@ -343,7 +322,7 @@ private processRayHitsInternal(leftEarHits: RayHit[], rightEarHits: RayHit[]): [
         console.log(`[AudioProcessorModified] Pre-normalization: Max IR value = ${maxValue.toFixed(4)}`);
         console.log(`[AP sanitizeIRBuffers] Max value before normalization: ${maxValue.toExponential(3)}`);
         
-        const targetPeak = 0.8; // Adjusted from 0.9 to 0.8 for more headroom
+        const targetPeak = 0.5; // Adjusted from 0.8 to 0.5 for more headroom
         if (maxValue > targetPeak) { 
             const gainFactor = (maxValue > 0) ? targetPeak / maxValue : 1.0;
             if (gainFactor < 1.0) { 

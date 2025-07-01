@@ -75,8 +75,8 @@ export class SpatialAudioProcessor {
 
                 // Head shadow (ILD): more attenuation for higher frequencies on the far ear
                 const shadowFactor = Math.abs(azimuthRad) / Math.PI; // 0 at front/back, 1 at sides
-                const highFreqAttenuation = 1.0 - 0.8 * shadowFactor; // Increased attenuation
-                const lowFreqAttenuation = 1.0 - 0.3 * shadowFactor; // Increased attenuation
+                const highFreqAttenuation = 1.0 - 0.4 * shadowFactor; // Reduced attenuation
+                const lowFreqAttenuation = 1.0 - 0.15 * shadowFactor; // Reduced attenuation
 
                 // Simple frequency-dependent shaping (simulating a low-pass for far ear)
                 if ((isLeftEar && azimuthRad > 0) || (!isLeftEar && azimuthRad < 0)) { // Far ear
@@ -123,6 +123,7 @@ export class SpatialAudioProcessor {
         // Calculate direction vector from listener to source
         const direction = vec3.create();
         vec3.subtract(direction, sourcePos, listenerPos);
+        const distance = vec3.length(direction);
         vec3.normalize(direction, direction);
         
         // Calculate azimuth (horizontal angle)
@@ -139,6 +140,15 @@ export class SpatialAudioProcessor {
         const elevationDeg = elevation * 180 / Math.PI;
 
         // Generate HRTF filters for this specific direction
-        return this.generateHRTFFilters(azimuthDeg, elevationDeg);
+        const [leftFilter, rightFilter] = this.generateHRTFFilters(azimuthDeg, elevationDeg);
+
+        // Apply distance attenuation
+        const attenuation = 1.0 / Math.max(1.0, distance);
+        for (let i = 0; i < leftFilter.length; i++) {
+            leftFilter[i] *= attenuation;
+            rightFilter[i] *= attenuation;
+        }
+
+        return [leftFilter, rightFilter];
     }
 }
