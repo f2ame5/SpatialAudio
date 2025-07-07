@@ -6,9 +6,9 @@ interface RoomConfig {
         depth: number;
     };
     materials: {
-        walls: { absorption: number };
-        ceiling: { absorption: number };
-        floor: { absorption: number };
+        walls: { color: number[] };
+        ceiling: { color: number[] };
+        floor: { color: number[] };
     };
 }
 
@@ -19,9 +19,9 @@ interface RoomDimensions {
 }
 
 interface RoomMaterials {
-    walls: { absorption: number };
-    ceiling: { absorption: number };
-    floor: { absorption: number };
+    walls: { color: number[] };
+    ceiling: { color: number[] };
+    floor: { color: number[] };
 }
 
 export enum Surface {

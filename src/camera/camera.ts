@@ -84,6 +84,11 @@ export class Camera {
         return vec3.clone(this.front);
     }
 
+    public getForward(): vec3 {
+        // Alias for getFront for consistency with spatial audio naming
+        return this.getFront();
+    }
+
     public getUp(): vec3 {
         return vec3.clone(this.up);
     }

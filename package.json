@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "devDependencies": {
+    "@types/webaudioapi": "^0.0.27",
     "typescript": "~5.7.2",
     "vite": "^6.1.0"
   },

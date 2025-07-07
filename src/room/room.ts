@@ -199,6 +199,11 @@ export class Room {
         return 50; // Default humidity percentage
     }
 
+    public getDimensions(): [number, number, number] {
+        const { width, height, depth } = this.config.dimensions;
+        return [width, height, depth];
+    }
+
     public getClosestValidPosition(position: [number, number, number]): [number, number, number] {
         const { width, height, depth } = this.config.dimensions;
         const halfWidth = width / 2;
