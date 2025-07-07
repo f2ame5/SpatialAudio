@@ -1,217 +1,146 @@
 /**
- * Acoustic Materials - Material properties for spatial audio
+ * Acoustic Materials Database
+ * Frequency-dependent absorption and scattering coefficients for common building materials
  */
 
-import { FREQUENCY_BANDS } from './audio-utils';
-
-/**
- * Acoustic material properties interface
- */
 export interface AcousticMaterial {
     id: string;
     name: string;
-    category: MaterialCategory;
-    
-    // Frequency-dependent absorption coefficients (0-1)
-    // One value per frequency band (125Hz, 250Hz, 500Hz, 1kHz, 2kHz, 4kHz, 8kHz, 16kHz)
-    absorption: number[];
-    
-    // Frequency-dependent scattering coefficients (0-1)
-    scattering: number[];
-    
-    // Material impedance (kg/m²s)
-    impedance: number;
-    
-    // Surface roughness (0-1, affects scattering behavior)
-    roughness: number;
-    
-    // Transmission loss (dB) - for materials that allow sound transmission
-    transmissionLoss?: number;
-    
-    // Visual properties for UI
-    color?: string;
-    texture?: string;
+    description: string;
+    absorption: number[]; // 8 frequency bands: 125, 250, 500, 1k, 2k, 4k, 8k, 16k Hz
+    scattering: number[]; // 8 frequency bands: 125, 250, 500, 1k, 2k, 4k, 8k, 16k Hz
+    impedance: number;    // Acoustic impedance (Pa·s/m)
+    roughness: number;    // Surface roughness factor (0-1)
+    density: number;      // Material density (kg/m³)
 }
 
 /**
- * Material categories for organization
+ * Acoustic materials database
  */
-export enum MaterialCategory {
-    HARD_SURFACES = 'hard_surfaces',
-    SOFT_SURFACES = 'soft_surfaces',
-    WOOD = 'wood',
-    FABRIC = 'fabric',
-    ACOUSTIC_TREATMENT = 'acoustic_treatment',
-    GLASS = 'glass',
-    METAL = 'metal',
-    SPECIAL = 'special'
-}
-
-/**
- * Predefined acoustic materials database
- * Absorption and scattering coefficients based on research data
- */
-export const ACOUSTIC_MATERIALS: Record<string, AcousticMaterial> = {
-    // Hard surfaces
-    concrete: {
+export const ACOUSTIC_MATERIALS: { [key: string]: AcousticMaterial } = {
+    // Wall materials
+    'concrete': {
         id: 'concrete',
-        name: 'Concrete (Painted)',
-        category: MaterialCategory.HARD_SURFACES,
-        absorption: [0.01, 0.01, 0.02, 0.02, 0.02, 0.02, 0.03, 0.03],
-        scattering: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10],
+        name: 'Concrete',
+        description: 'Smooth concrete wall',
+        absorption: [0.01, 0.01, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02],
+        scattering: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05],
         impedance: 1.8e6,
         roughness: 0.1,
-        color: '#808080'
+        density: 2400
     },
     
-    brick: {
+    'brick': {
         id: 'brick',
         name: 'Brick Wall',
-        category: MaterialCategory.HARD_SURFACES,
-        absorption: [0.03, 0.03, 0.03, 0.04, 0.05, 0.07, 0.07, 0.08],
-        scattering: [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.50],
-        impedance: 1.5e6,
-        roughness: 0.3,
-        color: '#8B4513'
+        description: 'Painted brick wall',
+        absorption: [0.03, 0.03, 0.03, 0.04, 0.05, 0.07, 0.09, 0.10],
+        scattering: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10],
+        impedance: 1.2e6,
+        roughness: 0.2,
+        density: 1800
     },
     
-    plaster: {
+    'plaster': {
         id: 'plaster',
-        name: 'Plaster on Concrete',
-        category: MaterialCategory.HARD_SURFACES,
-        absorption: [0.01, 0.01, 0.02, 0.03, 0.04, 0.05, 0.05, 0.05],
-        scattering: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10],
-        impedance: 1.4e6,
+        name: 'Plaster Wall',
+        description: 'Smooth plaster on lath',
+        absorption: [0.02, 0.02, 0.03, 0.04, 0.04, 0.03, 0.02, 0.02],
+        scattering: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05],
+        impedance: 8.5e5,
         roughness: 0.05,
-        color: '#F5F5DC'
+        density: 1200
     },
     
-    // Wood surfaces
-    wood_floor: {
-        id: 'wood_floor',
-        name: 'Wood Floor (Hardwood)',
-        category: MaterialCategory.WOOD,
-        absorption: [0.04, 0.04, 0.07, 0.06, 0.06, 0.07, 0.07, 0.08],
-        scattering: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10],
-        impedance: 5.0e5,
+    'drywall': {
+        id: 'drywall',
+        name: 'Drywall',
+        description: 'Painted gypsum board',
+        absorption: [0.05, 0.06, 0.07, 0.09, 0.08, 0.08, 0.08, 0.08],
+        scattering: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05],
+        impedance: 4.2e5,
+        roughness: 0.05,
+        density: 800
+    },
+    
+    // Floor materials
+    'hardwood': {
+        id: 'hardwood',
+        name: 'Hardwood Floor',
+        description: 'Polished hardwood flooring',
+        absorption: [0.04, 0.04, 0.07, 0.06, 0.06, 0.07, 0.07, 0.07],
+        scattering: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05],
+        impedance: 3.8e5,
         roughness: 0.1,
-        color: '#8B4513'
+        density: 700
     },
     
-    wood_panel: {
-        id: 'wood_panel',
-        name: 'Wood Paneling (Thin)',
-        category: MaterialCategory.WOOD,
-        absorption: [0.28, 0.22, 0.17, 0.09, 0.10, 0.11, 0.13, 0.15],
-        scattering: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10],
-        impedance: 3.0e5,
-        roughness: 0.15,
-        color: '#A0522D'
-    },
-    
-    // Fabric and soft materials
-    carpet_thick: {
-        id: 'carpet_thick',
-        name: 'Thick Carpet on Concrete',
-        category: MaterialCategory.FABRIC,
-        absorption: [0.08, 0.24, 0.57, 0.69, 0.71, 0.73, 0.75, 0.78],
-        scattering: [0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.85],
-        impedance: 2.0e4,
-        roughness: 0.8,
-        color: '#8B0000'
-    },
-    
-    curtain_heavy: {
-        id: 'curtain_heavy',
-        name: 'Heavy Curtains',
-        category: MaterialCategory.FABRIC,
-        absorption: [0.14, 0.35, 0.55, 0.72, 0.70, 0.65, 0.65, 0.65],
+    'carpet': {
+        id: 'carpet',
+        name: 'Carpet',
+        description: 'Heavy carpet on concrete',
+        absorption: [0.02, 0.06, 0.14, 0.37, 0.60, 0.65, 0.70, 0.75],
         scattering: [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
-        impedance: 1.5e4,
-        roughness: 0.7,
-        color: '#4B0082'
+        impedance: 2.1e4,
+        roughness: 0.8,
+        density: 400
     },
     
-    // Acoustic treatment
-    acoustic_foam: {
-        id: 'acoustic_foam',
-        name: 'Acoustic Foam (5cm)',
-        category: MaterialCategory.ACOUSTIC_TREATMENT,
-        absorption: [0.11, 0.28, 0.68, 0.90, 0.95, 0.96, 0.97, 0.98],
-        scattering: [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80],
-        impedance: 5.0e3,
-        roughness: 0.9,
-        color: '#2F4F4F'
-    },
-    
-    bass_trap: {
-        id: 'bass_trap',
-        name: 'Bass Trap (Corner)',
-        category: MaterialCategory.ACOUSTIC_TREATMENT,
-        absorption: [0.80, 0.90, 0.95, 0.95, 0.90, 0.85, 0.80, 0.75],
-        scattering: [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.85, 0.90],
-        impedance: 3.0e3,
-        roughness: 0.95,
-        color: '#000000'
-    },
-    
-    diffuser: {
-        id: 'diffuser',
-        name: 'QRD Diffuser',
-        category: MaterialCategory.ACOUSTIC_TREATMENT,
-        absorption: [0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20, 0.22],
-        scattering: [0.40, 0.60, 0.80, 0.90, 0.95, 0.95, 0.90, 0.85],
-        impedance: 4.0e5,
-        roughness: 1.0,
-        color: '#D2691E'
-    },
-    
-    // Glass
-    glass_window: {
-        id: 'glass_window',
-        name: 'Glass Window (6mm)',
-        category: MaterialCategory.GLASS,
-        absorption: [0.18, 0.06, 0.04, 0.03, 0.02, 0.02, 0.02, 0.02],
+    'tile': {
+        id: 'tile',
+        name: 'Ceramic Tile',
+        description: 'Glazed ceramic tile on concrete',
+        absorption: [0.01, 0.01, 0.01, 0.01, 0.02, 0.02, 0.02, 0.02],
         scattering: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05],
-        impedance: 1.2e7,
-        roughness: 0.01,
-        transmissionLoss: 25,
-        color: '#87CEEB'
+        impedance: 2.2e6,
+        roughness: 0.05,
+        density: 2300
     },
     
-    // Metal
-    steel: {
-        id: 'steel',
-        name: 'Steel Plate',
-        category: MaterialCategory.METAL,
-        absorption: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01],
+    // Ceiling materials
+    'acoustic_tile': {
+        id: 'acoustic_tile',
+        name: 'Acoustic Ceiling Tile',
+        description: 'Perforated acoustic ceiling tile',
+        absorption: [0.17, 0.86, 0.99, 0.93, 0.85, 0.85, 0.85, 0.85],
+        scattering: [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50],
+        impedance: 1.8e4,
+        roughness: 0.6,
+        density: 300
+    },
+    
+    'gypsum_board': {
+        id: 'gypsum_board',
+        name: 'Gypsum Board Ceiling',
+        description: 'Painted gypsum board ceiling',
+        absorption: [0.05, 0.06, 0.07, 0.09, 0.08, 0.08, 0.08, 0.08],
         scattering: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05],
-        impedance: 4.0e7,
-        roughness: 0.02,
-        color: '#C0C0C0'
+        impedance: 4.2e5,
+        roughness: 0.05,
+        density: 800
     },
     
     // Special materials
-    water: {
-        id: 'water',
-        name: 'Water Surface',
-        category: MaterialCategory.SPECIAL,
-        absorption: [0.01, 0.01, 0.01, 0.02, 0.02, 0.03, 0.03, 0.04],
-        scattering: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10],
-        impedance: 1.5e6,
-        roughness: 0.1,
-        color: '#00CED1'
+    'glass': {
+        id: 'glass',
+        name: 'Glass Window',
+        description: 'Large glass window',
+        absorption: [0.18, 0.06, 0.04, 0.03, 0.02, 0.02, 0.02, 0.02],
+        scattering: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05],
+        impedance: 1.8e7,
+        roughness: 0.01,
+        density: 2500
     },
     
-    audience: {
-        id: 'audience',
-        name: 'Audience Area',
-        category: MaterialCategory.SPECIAL,
-        absorption: [0.40, 0.50, 0.60, 0.70, 0.80, 0.85, 0.85, 0.85],
-        scattering: [0.30, 0.40, 0.50, 0.60, 0.70, 0.75, 0.80, 0.85],
-        impedance: 5.0e4,
-        roughness: 0.8,
-        color: '#FFB6C1'
+    'curtain': {
+        id: 'curtain',
+        name: 'Heavy Curtain',
+        description: 'Heavy fabric curtain',
+        absorption: [0.07, 0.31, 0.49, 0.75, 0.70, 0.60, 0.50, 0.40],
+        scattering: [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55],
+        impedance: 3.2e4,
+        roughness: 0.9,
+        density: 200
     }
 };
 
@@ -223,120 +152,70 @@ export function getMaterial(id: string): AcousticMaterial | undefined {
 }
 
 /**
- * Get materials by category
+ * Get all available material IDs
  */
-export function getMaterialsByCategory(category: MaterialCategory): AcousticMaterial[] {
-    return Object.values(ACOUSTIC_MATERIALS).filter(m => m.category === category);
+export function getMaterialIds(): string[] {
+    return Object.keys(ACOUSTIC_MATERIALS);
 }
 
 /**
- * Calculate average absorption coefficient
+ * Get materials by category
+ */
+export function getMaterialsByCategory(category: 'wall' | 'floor' | 'ceiling'): AcousticMaterial[] {
+    const categoryMaterials: { [key: string]: string[] } = {
+        wall: ['concrete', 'brick', 'plaster', 'drywall', 'glass'],
+        floor: ['hardwood', 'carpet', 'tile'],
+        ceiling: ['acoustic_tile', 'gypsum_board', 'plaster']
+    };
+    
+    return categoryMaterials[category]?.map(id => ACOUSTIC_MATERIALS[id]).filter(Boolean) || [];
+}
+
+/**
+ * Calculate Noise Reduction Coefficient (NRC)
+ * Average of absorption coefficients at 250, 500, 1000, and 2000 Hz
+ */
+export function calculateNRC(material: AcousticMaterial): number {
+    const frequencies = [1, 2, 3, 4]; // Indices for 250, 500, 1k, 2k Hz
+    const sum = frequencies.reduce((acc, idx) => acc + material.absorption[idx], 0);
+    return Math.round((sum / 4) * 20) / 20; // Round to nearest 0.05
+}
+
+/**
+ * Calculate average absorption across all frequencies
  */
 export function getAverageAbsorption(material: AcousticMaterial): number {
-    const sum = material.absorption.reduce((a, b) => a + b, 0);
+    const sum = material.absorption.reduce((acc, val) => acc + val, 0);
     return sum / material.absorption.length;
 }
 
 /**
- * Calculate NRC (Noise Reduction Coefficient)
- * Average of absorption coefficients at 250, 500, 1000, and 2000 Hz
+ * Calculate average scattering across all frequencies
  */
-export function calculateNRC(material: AcousticMaterial): number {
-    // Indices for 250Hz, 500Hz, 1kHz, 2kHz in our frequency bands
-    const indices = [1, 2, 3, 4];
-    const sum = indices.reduce((acc, i) => acc + material.absorption[i], 0);
-    return Math.round(sum / 4 * 100) / 100; // Round to 2 decimal places
+export function getAverageScattering(material: AcousticMaterial): number {
+    const sum = material.scattering.reduce((acc, val) => acc + val, 0);
+    return sum / material.scattering.length;
 }
 
 /**
- * Interpolate material properties between two materials
+ * Get frequency labels for the 8 bands
  */
-export function interpolateMaterials(
-    material1: AcousticMaterial,
-    material2: AcousticMaterial,
-    factor: number // 0 = material1, 1 = material2
-): AcousticMaterial {
-    const t = Math.max(0, Math.min(1, factor));
-    
-    return {
-        id: `${material1.id}_${material2.id}_${t}`,
-        name: `Mix: ${material1.name} / ${material2.name}`,
-        category: material1.category,
-        absorption: material1.absorption.map((v, i) => 
-            v * (1 - t) + material2.absorption[i] * t
-        ),
-        scattering: material1.scattering.map((v, i) => 
-            v * (1 - t) + material2.scattering[i] * t
-        ),
-        impedance: material1.impedance * (1 - t) + material2.impedance * t,
-        roughness: material1.roughness * (1 - t) + material2.roughness * t
-    };
+export function getFrequencyLabels(): string[] {
+    return ['125 Hz', '250 Hz', '500 Hz', '1 kHz', '2 kHz', '4 kHz', '8 kHz', '16 kHz'];
 }
 
 /**
- * Create custom material
+ * Get frequency values for the 8 bands
  */
-export function createCustomMaterial(
-    id: string,
-    name: string,
-    properties: Partial<AcousticMaterial>
-): AcousticMaterial {
-    return {
-        id,
-        name,
-        category: properties.category || MaterialCategory.SPECIAL,
-        absorption: properties.absorption || new Array(8).fill(0.1),
-        scattering: properties.scattering || new Array(8).fill(0.1),
-        impedance: properties.impedance || 1e6,
-        roughness: properties.roughness || 0.5,
-        ...properties
-    };
+export function getFrequencyValues(): number[] {
+    return [125, 250, 500, 1000, 2000, 4000, 8000, 16000];
 }
 
 /**
- * Material presets for common room types
+ * Default material assignments for room surfaces
  */
-export const ROOM_PRESETS = {
-    recording_studio: {
-        walls: 'acoustic_foam',
-        floor: 'carpet_thick',
-        ceiling: 'acoustic_foam',
-        bass_traps: 'bass_trap'
-    },
-    concert_hall: {
-        walls: 'wood_panel',
-        floor: 'wood_floor',
-        ceiling: 'plaster',
-        audience: 'audience'
-    },
-    living_room: {
-        walls: 'plaster',
-        floor: 'carpet_thick',
-        ceiling: 'plaster',
-        windows: 'glass_window'
-    },
-    bathroom: {
-        walls: 'plaster',
-        floor: 'concrete',
-        ceiling: 'plaster'
-    }
+export const DEFAULT_ROOM_MATERIALS = {
+    floor: 'hardwood',
+    ceiling: 'gypsum_board',
+    walls: 'plaster'
 };
-
-/**
- * Export material data as JSON
- */
-export function exportMaterialsJSON(): string {
-    return JSON.stringify(ACOUSTIC_MATERIALS, null, 2);
-}
-
-/**
- * Import materials from JSON
- */
-export function importMaterialsJSON(json: string): Record<string, AcousticMaterial> {
-    try {
-        return JSON.parse(json);
-    } catch (error) {
-        console.error('Failed to parse materials JSON:', error);
-        return {};
-    }
-}
