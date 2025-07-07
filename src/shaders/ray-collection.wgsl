@@ -150,17 +150,16 @@ fn normalize_impulse_response(@builtin(global_invocation_id) global_id: vec3<u32
         let normalized_phase_real = phase_real / sample_count_f;
         let normalized_phase_imag = phase_imag / sample_count_f;
 
-        // Store normalized values back in the first 3 float positions for readback
+        // Store normalized values back in the first 4 float positions for readback
         // This overwrites the atomic values but that's OK since we're done collecting
         let bin_ptr = &impulse_response[bin_index];
 
-        // Write to memory as floats (reinterpret the atomic memory)
-        // Note: This is a bit hacky but works since we're done with atomic operations
-        let float_ptr = bitcast<ptr<storage, f32, read_write>>(bin_ptr);
-        *float_ptr = normalized_energy;                    // Position 0: energy
-        *(float_ptr + 1) = normalized_phase_real;          // Position 1: phase_real
-        *(float_ptr + 2) = normalized_phase_imag;          // Position 2: phase_imag
-        *(float_ptr + 3) = f32(sample_count);              // Position 3: sample_count as float
+        // Use array-style access on the pointer (correct WGSL syntax)
+        let float_array_ptr = bitcast<ptr<storage, array<f32, 4>, read_write>>(bin_ptr);
+        (*float_array_ptr)[0] = normalized_energy;         // Position 0: energy
+        (*float_array_ptr)[1] = normalized_phase_real;     // Position 1: phase_real
+        (*float_array_ptr)[2] = normalized_phase_imag;     // Position 2: phase_imag
+        (*float_array_ptr)[3] = f32(sample_count);         // Position 3: sample_count as float
     }
 }
 
