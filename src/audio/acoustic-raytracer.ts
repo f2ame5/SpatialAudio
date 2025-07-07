@@ -1188,46 +1188,61 @@ export class AcousticRaytracer {
     }
 
     /**
-     * Update collection parameters
+     * Update collection parameters with correct 16-byte alignment
      */
     private updateCollectionParams(listenerConfig: ListenerConfig): void {
         if (!this.collectionParamsBuffer) return;
 
         const params = new Float32Array(16); // 64 bytes / 4 bytes per float
 
-        // Listener position and radius
+        // --- CORRECTED LAYOUT FOR WGSL ALIGNMENT ---
+
+        // listener_position (vec3<f32>): Occupies indices 0, 1, 2. Index 3 is padding.
         params[0] = listenerConfig.position[0];
         params[1] = listenerConfig.position[1];
         params[2] = listenerConfig.position[2];
-        params[3] = listenerConfig.radius;
+        // params[3] is intentionally left empty for padding (vec3 alignment)
 
-        // Collection parameters (matching WGSL struct)
-        params[4] = this.config.sampleRate; // sample_rate
-        params[5] = this.config.impulseResponseLength; // ir_length in seconds
+        // listener_radius (f32): Starts at index 4 (byte 16)
+        params[4] = listenerConfig.radius;
 
-        const timeBinSize = 1.0 / this.config.sampleRate; // One sample duration
-        params[6] = timeBinSize; // time_bin_size
+        // sample_rate (f32): Starts at index 5 (byte 20)
+        params[5] = this.config.sampleRate;
 
+        // ir_length (f32): Starts at index 6 (byte 24)
+        params[6] = this.config.impulseResponseLength;
+
+        // time_bin_size (f32): Starts at index 7 (byte 28)
+        const timeBinSize = 1.0 / this.config.sampleRate;
+        params[7] = timeBinSize;
+
+        // max_bins (u32): Starts at index 8 (byte 32)
         const maxBins = Math.floor(this.config.impulseResponseLength * this.config.sampleRate);
-        params[7] = maxBins; // max_bins (as float, will be cast to u32 in shader)
+        // Writing to a Float32Array, will be interpreted as u32 in the shader
+        params[8] = maxBins;
 
-        params[8] = this.config.minEnergy; // energy_threshold
-        params[9] = 0; // padding
+        // energy_threshold (f32): Starts at index 9 (byte 36)
+        params[9] = this.config.minEnergy;
+
+        // padding (f32): Starts at index 10 (byte 40)
+        params[10] = 0.0;
 
         // Additional padding to reach 64 bytes
-        for (let i = 10; i < 16; i++) {
+        for (let i = 11; i < 16; i++) {
             params[i] = 0;
         }
 
-        console.log('Collection params:', {
+        console.log('Collection params (corrected alignment):', {
             listenerPos: [params[0], params[1], params[2]],
-            radius: params[3],
-            sampleRate: params[4],
-            irLength: params[5],
-            timeBinSize: params[6],
-            maxBins: params[7],
-            energyThreshold: params[8],
-            timeBinSizeMs: params[6] * 1000,
+            padding_after_vec3: params[3], // Should be 0 (padding)
+            radius: params[4],
+            sampleRate: params[5],
+            irLength: params[6],
+            timeBinSize: params[7],
+            maxBins: params[8],
+            energyThreshold: params[9],
+            padding: params[10],
+            timeBinSizeMs: params[7] * 1000,
             maxTimeMs: params[5] * 1000,
             bufferSizeBytes: this.impulseResponseBuffer?.size,
             expectedBins: Math.floor(this.config.impulseResponseLength * this.config.sampleRate)
