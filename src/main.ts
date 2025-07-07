@@ -37,7 +37,7 @@ export class Main {
   private rayVisualizationMode: 'initial' | 'bounced' | 'full-path' = 'full-path';
   private spatialAudioController!: SpatialAudioController;
 
-  constructor(canvas: HTMLCanvasElement, device: GPUDevice) {
+  constructor(canvas: HTMLCanvasElement, device: GPUDevice, private adapter: GPUAdapter) {
     this.canvas = canvas;
     this.device = device;
     this.context = canvas.getContext("webgpu") as GPUCanvasContext;
@@ -343,7 +343,7 @@ export class Main {
    */
   private async initializeRaytracing(): Promise<void> {
     try {
-      this.raytracer = new AcousticRaytracer(this.device, {
+      this.raytracer = new AcousticRaytracer(this.device, this.adapter, {
         maxRays: 1024,
         maxBounces: 10,
         minEnergy: 0.001
@@ -1428,7 +1428,7 @@ async function init() {
   if (!adapter) throw new Error("No GPU adapter found");
 
   const device = await adapter.requestDevice();
-  const main = new Main(canvas, device);
+  const main = new Main(canvas, device, adapter);
 
   // Start animation loop
   requestAnimationFrame((time) => animate(main, time));

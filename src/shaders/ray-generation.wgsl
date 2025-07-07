@@ -140,7 +140,8 @@ fn generate_phase(seed: u32, ray_index: u32) -> f32 {
 }
 
 // Main ray generation compute shader
-@compute @workgroup_size(64)
+// Note: Workgroup size is now configurable and set at pipeline creation time
+@compute @workgroup_size(64) // Default size, will be overridden by specialization constants
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let ray_index = global_id.x;
 

@@ -21,6 +21,14 @@ import {
 } from './ray-types';
 import { AcousticMaterial } from './acoustic-materials';
 import { FREQUENCY_BANDS } from './audio-utils';
+import {
+    AtmosphericConditions,
+    STANDARD_CONDITIONS,
+    ATMOSPHERIC_PRESETS,
+    calculateRaytracingAbsorption,
+    getAbsorptionSummary,
+    validateAtmosphericConditions
+} from './atmospheric-absorption';
 
 // Import shaders as text
 import rayGenerationShader from '../shaders/ray-generation.wgsl?raw';
@@ -99,6 +107,29 @@ enum BufferBinding {
 }
 
 /**
+ * GPU architecture types for optimization
+ */
+export enum GPUArchitecture {
+    DESKTOP_DISCRETE = 'desktop_discrete',
+    DESKTOP_INTEGRATED = 'desktop_integrated',
+    MOBILE = 'mobile',
+    UNKNOWN = 'unknown'
+}
+
+/**
+ * GPU capabilities and optimization settings
+ */
+export interface GPUCapabilities {
+    architecture: GPUArchitecture;
+    vendor: string;
+    maxWorkgroupSize: number;
+    optimalWorkgroupSize: number;
+    supportsSubgroups: boolean;
+    maxComputeUnitsEstimate: number;
+    memoryBandwidthClass: 'low' | 'medium' | 'high';
+}
+
+/**
  * Acoustic raytracer configuration
  */
 export interface RaytracerConfig {
@@ -109,6 +140,8 @@ export interface RaytracerConfig {
     sampleRate: number;
     impulseResponseLength: number; // seconds
     workgroupSize: number;
+    adaptiveWorkgroupSize: boolean; // Auto-adjust based on GPU capabilities
+    atmosphericConditions: AtmosphericConditions; // For ISO 9613-1 air absorption
 }
 
 /**
@@ -121,12 +154,112 @@ const DEFAULT_CONFIG: RaytracerConfig = {
     speedOfSound: 343.0, // m/s at 20°C
     sampleRate: 48000,
     impulseResponseLength: 2.0,
-    workgroupSize: 64
+    workgroupSize: 64, // Will be auto-adjusted if adaptiveWorkgroupSize is true
+    adaptiveWorkgroupSize: true,
+    atmosphericConditions: STANDARD_CONDITIONS
 };
+
+/**
+ * Detect GPU capabilities and architecture for optimization
+ */
+function detectGPUCapabilities(device: GPUDevice, adapter: GPUAdapter): GPUCapabilities {
+    const adapterInfo = adapter.info || {};
+    const vendor = (adapterInfo.vendor || '').toLowerCase();
+    const description = (adapterInfo.description || '').toLowerCase();
+
+    // Detect architecture based on vendor and description
+    let architecture = GPUArchitecture.UNKNOWN;
+    let optimalWorkgroupSize = 64; // Default
+    let memoryBandwidthClass: 'low' | 'medium' | 'high' = 'medium';
+    let maxComputeUnitsEstimate = 16; // Conservative default
+
+    // Vendor-specific detection
+    if (vendor.includes('nvidia')) {
+        if (description.includes('mobile') || description.includes('tegra')) {
+            architecture = GPUArchitecture.MOBILE;
+            optimalWorkgroupSize = 32;
+            memoryBandwidthClass = 'low';
+            maxComputeUnitsEstimate = 8;
+        } else {
+            architecture = GPUArchitecture.DESKTOP_DISCRETE;
+            optimalWorkgroupSize = 64;
+            memoryBandwidthClass = 'high';
+            maxComputeUnitsEstimate = 32;
+        }
+    } else if (vendor.includes('amd') || vendor.includes('ati')) {
+        if (description.includes('mobile') || description.includes('apu')) {
+            architecture = GPUArchitecture.DESKTOP_INTEGRATED;
+            optimalWorkgroupSize = 64; // AMD prefers 64 even on APUs
+            memoryBandwidthClass = 'medium';
+            maxComputeUnitsEstimate = 12;
+        } else {
+            architecture = GPUArchitecture.DESKTOP_DISCRETE;
+            optimalWorkgroupSize = 64;
+            memoryBandwidthClass = 'high';
+            maxComputeUnitsEstimate = 40; // AMD typically has more CUs
+        }
+    } else if (vendor.includes('intel')) {
+        if (description.includes('iris') || description.includes('uhd') || description.includes('hd')) {
+            architecture = GPUArchitecture.DESKTOP_INTEGRATED;
+            optimalWorkgroupSize = 32; // Intel integrated prefers smaller workgroups
+            memoryBandwidthClass = 'low';
+            maxComputeUnitsEstimate = 8;
+        } else {
+            architecture = GPUArchitecture.DESKTOP_DISCRETE;
+            optimalWorkgroupSize = 64;
+            memoryBandwidthClass = 'medium';
+            maxComputeUnitsEstimate = 16;
+        }
+    } else if (vendor.includes('apple')) {
+        // Apple Silicon
+        architecture = GPUArchitecture.DESKTOP_INTEGRATED;
+        optimalWorkgroupSize = 32; // Apple Silicon prefers 32
+        memoryBandwidthClass = 'high'; // Unified memory architecture
+        maxComputeUnitsEstimate = 16;
+    } else if (vendor.includes('qualcomm') || vendor.includes('arm') || vendor.includes('mali')) {
+        architecture = GPUArchitecture.MOBILE;
+        optimalWorkgroupSize = 32;
+        memoryBandwidthClass = 'low';
+        maxComputeUnitsEstimate = 6;
+    }
+
+    // Get actual device limits
+    const limits = device.limits;
+    const maxWorkgroupSize = Math.min(limits.maxComputeWorkgroupSizeX || 256, 256);
+
+    // Ensure optimal workgroup size doesn't exceed device limits
+    optimalWorkgroupSize = Math.min(optimalWorkgroupSize, maxWorkgroupSize);
+
+    // Detect subgroup support (approximate - WebGPU doesn't expose this directly)
+    const supportsSubgroups = vendor.includes('nvidia') || vendor.includes('amd') || vendor.includes('intel');
+
+    console.log('🔍 GPU Capabilities Detected:', {
+        vendor,
+        description,
+        architecture,
+        optimalWorkgroupSize,
+        maxWorkgroupSize,
+        memoryBandwidthClass,
+        maxComputeUnitsEstimate,
+        supportsSubgroups
+    });
+
+    return {
+        architecture,
+        vendor,
+        maxWorkgroupSize,
+        optimalWorkgroupSize,
+        supportsSubgroups,
+        maxComputeUnitsEstimate,
+        memoryBandwidthClass
+    };
+}
 
 export class AcousticRaytracer {
     private device: GPUDevice;
+    private adapter: GPUAdapter;
     private config: RaytracerConfig;
+    private gpuCapabilities: GPUCapabilities;
     
     // Buffers
     private rayBuffer: GPUBuffer | null = null;
@@ -171,9 +304,66 @@ export class AcousticRaytracer {
     private debugStats: RaytracingDebugStats = this.createEmptyDebugStats();
     private frameStartTime: number = 0;
     
-    constructor(device: GPUDevice, config: Partial<RaytracerConfig> = {}) {
+    constructor(device: GPUDevice, adapter: GPUAdapter, config: Partial<RaytracerConfig> = {}) {
         this.device = device;
-        this.config = { ...DEFAULT_CONFIG, ...config };
+        this.adapter = adapter;
+
+        // Detect GPU capabilities for optimization
+        this.gpuCapabilities = detectGPUCapabilities(device, adapter);
+
+        // Apply GPU-specific optimizations to config
+        const optimizedConfig = this.applyGPUOptimizations({ ...DEFAULT_CONFIG, ...config });
+        this.config = optimizedConfig;
+
+        console.log('🚀 AcousticRaytracer initialized with optimized config:', {
+            architecture: this.gpuCapabilities.architecture,
+            workgroupSize: this.config.workgroupSize,
+            adaptiveWorkgroupSize: this.config.adaptiveWorkgroupSize,
+            vendor: this.gpuCapabilities.vendor
+        });
+    }
+
+    /**
+     * Apply GPU-specific optimizations to configuration
+     */
+    private applyGPUOptimizations(config: RaytracerConfig): RaytracerConfig {
+        if (!config.adaptiveWorkgroupSize) {
+            return config; // User has disabled adaptive sizing
+        }
+
+        // Apply optimal workgroup size based on GPU architecture
+        config.workgroupSize = this.gpuCapabilities.optimalWorkgroupSize;
+
+        // Adjust ray count based on GPU compute capability
+        const baseRayCount = config.maxRays;
+        switch (this.gpuCapabilities.architecture) {
+            case GPUArchitecture.DESKTOP_DISCRETE:
+                // High-end GPUs can handle more rays
+                config.maxRays = Math.max(baseRayCount, 4096);
+                break;
+            case GPUArchitecture.DESKTOP_INTEGRATED:
+                // Integrated GPUs - moderate ray count
+                config.maxRays = Math.min(baseRayCount, 2048);
+                break;
+            case GPUArchitecture.MOBILE:
+                // Mobile GPUs - conservative ray count
+                config.maxRays = Math.min(baseRayCount, 1024);
+                break;
+            default:
+                // Unknown architecture - use conservative settings
+                config.maxRays = Math.min(baseRayCount, 1024);
+                config.workgroupSize = 32;
+                break;
+        }
+
+        // Adjust bounce count based on memory bandwidth
+        if (this.gpuCapabilities.memoryBandwidthClass === 'low') {
+            config.maxBounces = Math.min(config.maxBounces, 15);
+        } else if (this.gpuCapabilities.memoryBandwidthClass === 'high') {
+            config.maxBounces = Math.max(config.maxBounces, 25);
+        }
+
+        return config;
     }
     
     /**
@@ -204,12 +394,15 @@ export class AcousticRaytracer {
         }
 
         this.initialized = true;
-        console.log('AcousticRaytracer initialized successfully');
+        console.log('🚀 AcousticRaytracer initialized successfully');
         console.log('- Generation pipeline:', !!this.generationPipeline);
         console.log('- Bouncing pipeline:', !!this.bouncingPipeline);
         console.log('- Collection pipeline:', !!this.collectionPipeline);
         console.log('- All bind groups created:', !!this.generationBindGroup && !!this.bouncingBindGroup && !!this.collectionBindGroup);
         console.log('- GPU basic test:', gpuTestPassed ? 'PASSED' : 'FAILED');
+
+        // Log comprehensive system information
+        this.logSystemInfo();
     }
     
     /**
@@ -443,19 +636,38 @@ export class AcousticRaytracer {
     }
 
     /**
-     * Get shader code by filename
+     * Get shader code by filename with dynamic workgroup size
      */
     private getShaderCode(filename: string): string {
+        let shaderCode: string;
+
         switch (filename) {
             case 'ray-generation.wgsl':
-                return rayGenerationShader;
+                shaderCode = rayGenerationShader;
+                break;
             case 'ray-bouncing.wgsl':
-                return rayBouncingShader;
+                shaderCode = rayBouncingShader;
+                break;
             case 'ray-collection.wgsl':
-                return rayCollectionShader;
+                shaderCode = rayCollectionShader;
+                break;
             default:
                 throw new Error(`Unknown shader: ${filename}`);
         }
+
+        // Replace workgroup size with optimized value
+        const workgroupSizeRegex = /@compute @workgroup_size\(\d+\)/g;
+        const optimizedShaderCode = shaderCode.replace(
+            workgroupSizeRegex,
+            `@compute @workgroup_size(${this.config.workgroupSize})`
+        );
+
+        // Log the optimization for debugging
+        if (optimizedShaderCode !== shaderCode) {
+            console.log(`🔧 Optimized ${filename} workgroup size to ${this.config.workgroupSize} for ${this.gpuCapabilities.architecture}`);
+        }
+
+        return optimizedShaderCode;
     }
     
     /**
@@ -755,7 +967,7 @@ export class AcousticRaytracer {
         this.clearImpulseResponseBuffer(collectionEncoder);
 
         // Clear statistics buffer before collection
-        collectionEncoder.clearBuffer(this.statisticsBuffer!, 0, 16); // Clear first 16 bytes (4 u32 values)
+        collectionEncoder.clearBuffer(this.statisticsBuffer!);
 
         const collectStart = performance.now();
         this.runCollectionPass(collectionEncoder, listenerConfig);
@@ -894,7 +1106,7 @@ export class AcousticRaytracer {
     }
     
     /**
-     * Update bouncing parameters
+     * Update bouncing parameters with ISO 9613-1 air absorption
      */
     private updateBouncingParams(): void {
         if (!this.bouncingParamsBuffer) return;
@@ -920,18 +1132,20 @@ export class AcousticRaytracer {
         params[10] = this.config.speedOfSound;
         params[11] = 0.016; // time step
 
-        // Air absorption coefficients (split into two vec4s)
+        // Calculate ISO 9613-1 air absorption coefficients
+        const absorption = calculateRaytracingAbsorption(this.config.atmosphericConditions);
+
         // Low frequency air absorption (125, 250, 500, 1k Hz)
-        params[12] = 0.0001; // 125 Hz
-        params[13] = 0.0002; // 250 Hz
-        params[14] = 0.0004; // 500 Hz
-        params[15] = 0.0008; // 1 kHz
+        params[12] = absorption.low[0]; // 125 Hz
+        params[13] = absorption.low[1]; // 250 Hz
+        params[14] = absorption.low[2]; // 500 Hz
+        params[15] = absorption.low[3]; // 1 kHz
 
         // High frequency air absorption (2k, 4k, 8k, 16k Hz)
-        params[16] = 0.0016; // 2 kHz
-        params[17] = 0.0032; // 4 kHz
-        params[18] = 0.0064; // 8 kHz
-        params[19] = 0.0128; // 16 kHz
+        params[16] = absorption.high[0]; // 2 kHz
+        params[17] = absorption.high[1]; // 4 kHz
+        params[18] = absorption.high[2]; // 8 kHz
+        params[19] = absorption.high[3]; // 16 kHz
 
         // Surface materials (material IDs for each face)
         params[20] = 0; // +X face (right wall)
@@ -952,14 +1166,20 @@ export class AcousticRaytracer {
 
         // Debug bouncing parameters on first frame
         if (this.currentFrame === 0) {
-            console.log('Bouncing params:', {
+            console.log('Bouncing params (ISO 9613-1):', {
                 roomMin: [params[0], params[1], params[2]],
                 roomMax: [params[4], params[5], params[6]],
                 maxBounces: params[8],
                 minEnergy: params[9],
                 speedOfSound: params[10],
-                roomBoundsSet: !!this.roomBounds
+                roomBoundsSet: !!this.roomBounds,
+                atmosphericConditions: this.config.atmosphericConditions,
+                airAbsorptionLow: [params[12], params[13], params[14], params[15]],
+                airAbsorptionHigh: [params[16], params[17], params[18], params[19]]
             });
+
+            // Log detailed absorption summary
+            console.log(getAbsorptionSummary(this.config.atmosphericConditions));
         }
     }
 
@@ -1273,13 +1493,107 @@ export class AcousticRaytracer {
      */
     updateConfig(config: Partial<RaytracerConfig>): void {
         const oldMaxRays = this.config.maxRays;
+        const oldAtmosphericConditions = this.config.atmosphericConditions;
+
         this.config = { ...this.config, ...config };
-        
+
+        // Validate atmospheric conditions if they were updated
+        if (config.atmosphericConditions && !validateAtmosphericConditions(config.atmosphericConditions)) {
+            console.warn('Invalid atmospheric conditions provided, using previous values');
+            this.config.atmosphericConditions = oldAtmosphericConditions;
+        }
+
+        // Log atmospheric changes
+        if (config.atmosphericConditions && config.atmosphericConditions !== oldAtmosphericConditions) {
+            console.log('🌡️ Atmospheric conditions updated:', this.config.atmosphericConditions);
+            console.log(getAbsorptionSummary(this.config.atmosphericConditions));
+        }
+
         // Recreate buffers if ray count changed
         if (this.config.maxRays !== oldMaxRays && this.initialized) {
             this.dispose();
             this.initialize();
         }
+    }
+
+    /**
+     * Update atmospheric conditions for air absorption
+     */
+    updateAtmosphericConditions(conditions: AtmosphericConditions): void {
+        if (!validateAtmosphericConditions(conditions)) {
+            console.error('Invalid atmospheric conditions:', conditions);
+            return;
+        }
+
+        this.config.atmosphericConditions = { ...conditions };
+        console.log('🌡️ Atmospheric conditions updated:', conditions);
+        console.log(getAbsorptionSummary(conditions));
+    }
+
+    /**
+     * Get current atmospheric conditions
+     */
+    getAtmosphericConditions(): AtmosphericConditions {
+        return { ...this.config.atmosphericConditions };
+    }
+
+    /**
+     * Set atmospheric conditions from preset
+     */
+    setAtmosphericPreset(presetName: keyof typeof ATMOSPHERIC_PRESETS): void {
+        const preset = ATMOSPHERIC_PRESETS[presetName];
+        if (preset) {
+            this.updateAtmosphericConditions(preset);
+        } else {
+            console.error('Unknown atmospheric preset:', presetName);
+        }
+    }
+
+    /**
+     * Get GPU capabilities information
+     */
+    getGPUCapabilities(): GPUCapabilities {
+        return { ...this.gpuCapabilities };
+    }
+
+    /**
+     * Get optimization summary for debugging
+     */
+    getOptimizationSummary(): string {
+        const caps = this.gpuCapabilities;
+        let summary = `GPU Optimization Summary:\n`;
+        summary += `  Architecture: ${caps.architecture}\n`;
+        summary += `  Vendor: ${caps.vendor}\n`;
+        summary += `  Workgroup Size: ${this.config.workgroupSize} (optimal: ${caps.optimalWorkgroupSize})\n`;
+        summary += `  Max Rays: ${this.config.maxRays}\n`;
+        summary += `  Max Bounces: ${this.config.maxBounces}\n`;
+        summary += `  Memory Bandwidth: ${caps.memoryBandwidthClass}\n`;
+        summary += `  Compute Units (est.): ${caps.maxComputeUnitsEstimate}\n`;
+        summary += `  Subgroup Support: ${caps.supportsSubgroups ? 'Yes' : 'No'}\n`;
+        summary += `  Adaptive Sizing: ${this.config.adaptiveWorkgroupSize ? 'Enabled' : 'Disabled'}\n`;
+
+        return summary;
+    }
+
+    /**
+     * Log comprehensive system information
+     */
+    logSystemInfo(): void {
+        console.log('🔧 Acoustic Raytracer System Information:');
+        console.log(this.getOptimizationSummary());
+        console.log(getAbsorptionSummary(this.config.atmosphericConditions));
+
+        // Log buffer sizes
+        console.log('Buffer Information:');
+        console.log(`  Ray Buffer: ${this.rayBuffer?.size || 0} bytes`);
+        console.log(`  Materials Buffer: ${this.materialsBuffer?.size || 0} bytes`);
+        console.log(`  Impulse Response Buffer: ${this.impulseResponseBuffer?.size || 0} bytes`);
+
+        // Log pipeline status
+        console.log('Pipeline Status:');
+        console.log(`  Generation: ${this.generationPipeline ? 'Ready' : 'Not Ready'}`);
+        console.log(`  Bouncing: ${this.bouncingPipeline ? 'Ready' : 'Not Ready'}`);
+        console.log(`  Collection: ${this.collectionPipeline ? 'Ready' : 'Not Ready'}`);
     }
     
     /**

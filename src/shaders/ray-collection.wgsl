@@ -50,7 +50,8 @@ const PI: f32 = 3.14159265359;
 const EPSILON: f32 = 1e-6;
 
 // MINIMAL but functional ray collection compute shader with debugging
-@compute @workgroup_size(64)
+// Note: Workgroup size is now configurable and set at pipeline creation time
+@compute @workgroup_size(64) // Default size, will be overridden by specialization constants
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let ray_index = global_id.x;
 

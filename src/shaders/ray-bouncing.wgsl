@@ -287,76 +287,47 @@ fn apply_air_absorption(ray_index: u32, distance: f32) {
     rays[ray_index].energy_phase.x = total_energy;
 }
 
-// Main ray bouncing compute shader
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let ray_index = global_id.x;
-
-    if (ray_index >= arrayLength(&rays)) {
-        return;
-    }
+// Helper function to check ray termination conditions
+fn should_terminate_ray(ray_index: u32) -> i32 {
+    // Return codes: 0 = continue, -1 = max bounces, -2 = min energy, -3 = inactive
 
     // Skip inactive rays
     if (rays[ray_index].path_data.w < 0.5) {
-        return;
+        return -3;
     }
 
     // Check if ray has exceeded maximum bounces
     if (u32(rays[ray_index].path_data.z) >= params.max_bounces) {
-        rays[ray_index].path_data.w = 0.0; // Deactivate ray
-        // Store termination reason in material_data for debugging
-        rays[ray_index].material_data.x = -1.0; // Max bounces
-        return;
+        return -1;
     }
 
     // Check if ray energy is below threshold
     if (rays[ray_index].energy_phase.x < params.min_energy) {
-        rays[ray_index].path_data.w = 0.0; // Deactivate ray
-        // Store termination reason in material_data for debugging
-        rays[ray_index].material_data.x = -2.0; // Min energy
-        return;
+        return -2;
     }
 
-    // Get ray properties
-    let ray_origin = rays[ray_index].origin.xyz;
-    let ray_direction = rays[ray_index].direction.xyz;
+    return 0; // Continue processing
+}
 
-    // Find intersection with room
-    let intersection = intersect_room(ray_origin, ray_direction);
-
-    if (!intersection.hit) {
-        // Ray escaped room - deactivate
-        rays[ray_index].path_data.w = 0.0;
-        // Store termination reason in material_data for debugging
-        rays[ray_index].material_data.x = -3.0; // Escaped room
-        return;
-    }
-
-    // Apply air absorption during travel
-    apply_air_absorption(ray_index, intersection.distance);
-
-    // Update path length and arrival time
-    rays[ray_index].path_data.x += intersection.distance; // path_length
-    rays[ray_index].path_data.y += intersection.distance / params.speed_of_sound; // arrival_time
-
-    // Get material for this surface
-    var material_id: u32;
-    if (intersection.surface_id < 4u) {
-        material_id = params.surface_materials[intersection.surface_id];
-    } else if (intersection.surface_id == 4u) {
-        material_id = params.surface_materials_zw.x; // +Z face
+// Helper function to get material ID for surface
+fn get_surface_material_id(surface_id: u32) -> u32 {
+    if (surface_id < 4u) {
+        return params.surface_materials[surface_id];
+    } else if (surface_id == 4u) {
+        return params.surface_materials_zw.x; // +Z face
     } else {
-        material_id = params.surface_materials_zw.y; // -Z face
+        return params.surface_materials_zw.y; // -Z face
     }
+}
 
-    // Calculate new direction after reflection
-    let new_direction = apply_material_interaction(
-        ray_index,
-        material_id,
-        ray_direction,
-        intersection.normal
-    );
+// Helper function to update ray path data
+fn update_ray_path(ray_index: u32, distance: f32) {
+    rays[ray_index].path_data.x += distance; // path_length
+    rays[ray_index].path_data.y += distance / params.speed_of_sound; // arrival_time
+}
 
+// Helper function to update ray position and direction after bounce
+fn update_ray_after_bounce(ray_index: u32, intersection: IntersectionResult, new_direction: vec3<f32>, material_id: u32) {
     // Update ray position and direction
     rays[ray_index].origin = vec4<f32>(intersection.point + intersection.normal * EPSILON, 0.0);
     rays[ray_index].direction = vec4<f32>(normalize(new_direction), 0.0);
@@ -366,7 +337,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Update material history and store surface normal for energy calculation
     rays[ray_index].material_data.x = f32(material_id);
-    rays[ray_index].material_data.y = intersection.normal.x; // Store surface normal
+    rays[ray_index].material_data.y = intersection.normal.x;
     rays[ray_index].material_data.z = intersection.normal.y;
     rays[ray_index].material_data.w = intersection.normal.z;
 
@@ -378,6 +349,60 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (rays[ray_index].energy_phase.y > TWO_PI) {
         rays[ray_index].energy_phase.y -= TWO_PI;
     }
+}
+
+// Main ray bouncing compute shader - optimized for register efficiency
+// Note: Workgroup size is now configurable and set at pipeline creation time
+@compute @workgroup_size(64) // Default size, will be overridden by specialization constants
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let ray_index = global_id.x;
+
+    // Early bounds check
+    if (ray_index >= arrayLength(&rays)) {
+        return;
+    }
+
+    // Check termination conditions (moved to helper function)
+    let termination_code = should_terminate_ray(ray_index);
+    if (termination_code != 0) {
+        rays[ray_index].path_data.w = 0.0; // Deactivate ray
+        rays[ray_index].material_data.x = f32(termination_code); // Store termination reason
+        return;
+    }
+
+    // Get ray properties (minimize local variables)
+    let ray_origin = rays[ray_index].origin.xyz;
+    let ray_direction = rays[ray_index].direction.xyz;
+
+    // Find intersection with room
+    let intersection = intersect_room(ray_origin, ray_direction);
+
+    if (!intersection.hit) {
+        // Ray escaped room - deactivate
+        rays[ray_index].path_data.w = 0.0;
+        rays[ray_index].material_data.x = -3.0; // Escaped room
+        return;
+    }
+
+    // Apply air absorption during travel (helper function call)
+    apply_air_absorption(ray_index, intersection.distance);
+
+    // Update path data (helper function call)
+    update_ray_path(ray_index, intersection.distance);
+
+    // Get material ID (helper function call)
+    let material_id = get_surface_material_id(intersection.surface_id);
+
+    // Calculate new direction after reflection
+    let new_direction = apply_material_interaction(
+        ray_index,
+        material_id,
+        ray_direction,
+        intersection.normal
+    );
+
+    // Update ray after bounce (helper function call)
+    update_ray_after_bounce(ray_index, intersection, new_direction, material_id);
 }
 
 
