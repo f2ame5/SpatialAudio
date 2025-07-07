@@ -1736,14 +1736,35 @@ export class AcousticRaytracer {
      * Check if raytracer is properly initialized
      */
     isFullyInitialized(): boolean {
-        return this.initialized &&
-               !!this.rayBuffer &&
-               !!this.generationPipeline &&
-               !!this.bouncingPipeline &&
-               !!this.collectionPipeline &&
-               !!this.generationBindGroup &&
-               !!this.bouncingBindGroup &&
-               !!this.collectionBindGroup;
+        const checks = {
+            initialized: this.initialized,
+            rayBuffer: !!this.rayBuffer,
+            generationPipeline: !!this.generationPipeline,
+            bouncingPipeline: !!this.bouncingPipeline,
+            collectionPipeline: !!this.collectionPipeline,
+            normalizationPipeline: !!this.normalizationPipeline,
+            generationBindGroup: !!this.generationBindGroup,
+            bouncingBindGroup: !!this.bouncingBindGroup,
+            collectionBindGroup: !!this.collectionBindGroup,
+            normalizationBindGroup: !!this.normalizationBindGroup
+        };
+
+        const isFullyReady = checks.initialized &&
+               checks.rayBuffer &&
+               checks.generationPipeline &&
+               checks.bouncingPipeline &&
+               checks.collectionPipeline &&
+               checks.normalizationPipeline &&
+               checks.generationBindGroup &&
+               checks.bouncingBindGroup &&
+               checks.collectionBindGroup &&
+               checks.normalizationBindGroup;
+
+        if (!isFullyReady) {
+            console.warn('🚨 AcousticRaytracer not fully initialized:', checks);
+        }
+
+        return isFullyReady;
     }
 
     /**

@@ -38,6 +38,7 @@ export interface AudioSourceConfig {
 
 export class SpatialAudioController {
     private device: GPUDevice;
+    private adapter: GPUAdapter;
     private room: Room;
     private roomAcoustics: RoomAcoustics;
     private camera: Camera;
@@ -69,12 +70,14 @@ export class SpatialAudioController {
     
     constructor(
         device: GPUDevice,
+        adapter: GPUAdapter,
         room: Room,
         camera: Camera,
         sphere: Sphere,
         gui: dat.GUI
     ) {
         this.device = device;
+        this.adapter = adapter;
         this.room = room;
         this.camera = camera;
         this.sphere = sphere;
@@ -149,7 +152,7 @@ export class SpatialAudioController {
             });
             
             // Create raytracer
-            this.raytracer = new AcousticRaytracer(this.device, {
+            this.raytracer = new AcousticRaytracer(this.device, this.adapter, {
                 maxRays: this.config.rayCount,
                 maxBounces: this.config.maxBounces,
                 impulseResponseLength: this.config.impulseResponseLength,

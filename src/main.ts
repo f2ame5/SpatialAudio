@@ -90,6 +90,7 @@ export class Main {
     // Initialize spatial audio controller
     this.spatialAudioController = new SpatialAudioController(
       device,
+      adapter,
       this.room,
       this.camera,
       this.sphere,
