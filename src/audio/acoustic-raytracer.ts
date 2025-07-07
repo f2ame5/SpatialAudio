@@ -451,7 +451,7 @@ export class AcousticRaytracer {
         
         // Impulse response buffer
         const irSamples = Math.floor(impulseResponseLength * sampleRate);
-        // ImpulseBin structure: energy(1) + phase_real(1) + phase_imag(1) + sample_count(1) + freq_low(4) + freq_high(4) + padding(3) = 15 floats
+        // ImpulseBin structure: energy_atomic(u32) + phase_real_atomic(i32) + phase_imag_atomic(i32) + sample_count(u32) + freq_low(4*f32) + freq_high(4*f32) + padding(3*f32) = 15 floats
         const irSize = irSamples * 15 * 4; // 15 floats per bin * 4 bytes per float
         this.impulseResponseBuffer = this.device.createBuffer({
             size: irSize,
@@ -615,7 +615,7 @@ export class AcousticRaytracer {
                 }),
                 compute: {
                     module: collectionModule,
-                    entryPoint: 'normalize_statistics'
+                    entryPoint: 'normalize_impulse_response'
                 }
             });
 
@@ -971,6 +971,10 @@ export class AcousticRaytracer {
 
         const collectStart = performance.now();
         this.runCollectionPass(collectionEncoder, listenerConfig);
+
+        // Run normalization pass to convert atomic values back to floats
+        this.runNormalizationPass(collectionEncoder);
+
         this.debugStats.collectionTime = performance.now() - collectStart;
         this.device.queue.submit([collectionEncoder.finish()]);
 
@@ -1318,8 +1322,10 @@ export class AcousticRaytracer {
         pass.setPipeline(this.normalizationPipeline);
         pass.setBindGroup(0, this.normalizationBindGroup);
 
-        // Single workgroup for normalization
-        pass.dispatchWorkgroups(1);
+        // Dispatch workgroups to cover all impulse response bins
+        const irSamples = Math.floor(this.config.impulseResponseLength * this.config.sampleRate);
+        const workgroups = Math.ceil(irSamples / this.config.workgroupSize);
+        pass.dispatchWorkgroups(workgroups);
         pass.end();
     }
 
@@ -1354,17 +1360,44 @@ export class AcousticRaytracer {
 
         // Convert from ImpulseBin format to simple Float32Array
         const impulseResponse = new Float32Array(irLength);
-        const floatsPerBin = 15; // ImpulseBin has 15 floats total
+
+        // After normalization, the ImpulseBin structure contains:
+        // Position 0: energy (f32) - normalized energy
+        // Position 1: phase_real (f32) - normalized real component
+        // Position 2: phase_imag (f32) - normalized imaginary component
+        // Position 3: sample_count (f32) - number of samples as float
+        // Position 4-7: frequency_energy_low (vec4<f32>)
+        // Position 8-11: frequency_energy_high (vec4<f32>)
+        // Position 12-14: padding (vec3<f32>)
+        // Total: 15 floats per bin
+
+        const floatsPerBin = 15;
 
         for (let i = 0; i < irLength && i < rawData.length / floatsPerBin; i++) {
             const binIndex = i * floatsPerBin;
-            const energy = rawData[binIndex]; // energy field
-            const phaseReal = rawData[binIndex + 1]; // phase_real field
-            const phaseImag = rawData[binIndex + 2]; // phase_imag field
+
+            // Read normalized float values directly
+            const energy = rawData[binIndex];           // Position 0: normalized energy
+            const phaseReal = rawData[binIndex + 1];    // Position 1: normalized phase real
+            const phaseImag = rawData[binIndex + 2];    // Position 2: normalized phase imaginary
+            const sampleCount = rawData[binIndex + 3];  // Position 3: sample count as float
 
             // Calculate magnitude from complex phase representation
             const magnitude = Math.sqrt(phaseReal * phaseReal + phaseImag * phaseImag);
-            impulseResponse[i] = energy * magnitude;
+
+            // Use magnitude if we have phase information, otherwise use energy directly
+            if (magnitude > 0.0001) {
+                impulseResponse[i] = magnitude; // Phase-weighted energy magnitude
+            } else if (energy > 0.0001) {
+                impulseResponse[i] = energy; // Fallback to raw energy
+            } else {
+                impulseResponse[i] = 0.0; // No energy
+            }
+
+            // Debug logging for first few non-zero bins
+            if (i < 10 && (energy > 0.001 || magnitude > 0.001)) {
+                console.log(`Bin ${i}: energy=${energy.toFixed(6)}, phaseReal=${phaseReal.toFixed(6)}, phaseImag=${phaseImag.toFixed(6)}, magnitude=${magnitude.toFixed(6)}, samples=${sampleCount.toFixed(0)}`);
+            }
         }
 
         // Proper cleanup
