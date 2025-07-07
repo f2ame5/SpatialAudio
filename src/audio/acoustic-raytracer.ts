@@ -1377,11 +1377,12 @@ export class AcousticRaytracer {
         const impulseResponse = new Float32Array(irLength);
 
         // After normalization, the ImpulseBin structure contains:
-        // Position 0: energy (f32) - normalized energy
-        // Position 1: phase_real (f32) - normalized real component
-        // Position 2: phase_imag (f32) - normalized imaginary component
-        // Position 3: sample_count (f32) - number of samples as float
-        // Position 4-7: frequency_energy_low (vec4<f32>)
+        // Position 0-3: energy_atomic, phase_real_atomic, phase_imag_atomic, sample_count (atomic integers)
+        // Position 4-7: frequency_energy_low (vec4<f32>) - NORMALIZED VALUES STORED HERE
+        //   - frequency_energy_low.x = normalized energy
+        //   - frequency_energy_low.y = normalized phase real
+        //   - frequency_energy_low.z = normalized phase imaginary
+        //   - frequency_energy_low.w = sample count as float
         // Position 8-11: frequency_energy_high (vec4<f32>)
         // Position 12-14: padding (vec3<f32>)
         // Total: 15 floats per bin
@@ -1391,11 +1392,11 @@ export class AcousticRaytracer {
         for (let i = 0; i < irLength && i < rawData.length / floatsPerBin; i++) {
             const binIndex = i * floatsPerBin;
 
-            // Read normalized float values directly
-            const energy = rawData[binIndex];           // Position 0: normalized energy
-            const phaseReal = rawData[binIndex + 1];    // Position 1: normalized phase real
-            const phaseImag = rawData[binIndex + 2];    // Position 2: normalized phase imaginary
-            const sampleCount = rawData[binIndex + 3];  // Position 3: sample count as float
+            // Read normalized values from frequency_energy_low field (positions 4-7)
+            const energy = rawData[binIndex + 4];       // frequency_energy_low.x: normalized energy
+            const phaseReal = rawData[binIndex + 5];    // frequency_energy_low.y: normalized phase real
+            const phaseImag = rawData[binIndex + 6];    // frequency_energy_low.z: normalized phase imaginary
+            const sampleCount = rawData[binIndex + 7];  // frequency_energy_low.w: sample count as float
 
             // Calculate magnitude from complex phase representation
             const magnitude = Math.sqrt(phaseReal * phaseReal + phaseImag * phaseImag);

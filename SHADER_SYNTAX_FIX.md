@@ -24,40 +24,39 @@ let float_ptr = bitcast<ptr<storage, f32, read_write>>(bin_ptr);
 
 ### Corrected Code (After)
 ```wgsl
-// CORRECT: Array-style access on bitcast pointer
-let float_array_ptr = bitcast<ptr<storage, array<f32, 4>, read_write>>(bin_ptr);
-(*float_array_ptr)[0] = normalized_energy;         // Position 0: energy
-(*float_array_ptr)[1] = normalized_phase_real;     // Position 1: phase_real
-(*float_array_ptr)[2] = normalized_phase_imag;     // Position 2: phase_imag
-(*float_array_ptr)[3] = f32(sample_count);         // Position 3: sample_count as float
+// CORRECT: Store in existing vec4 field to avoid bitcast limitations
+impulse_response[bin_index].frequency_energy_low.x = normalized_energy;         // Position 0: energy
+impulse_response[bin_index].frequency_energy_low.y = normalized_phase_real;     // Position 1: phase_real
+impulse_response[bin_index].frequency_energy_low.z = normalized_phase_imag;     // Position 2: phase_imag
+impulse_response[bin_index].frequency_energy_low.w = f32(sample_count);         // Position 3: sample_count as float
 ```
 
 ### Key Changes
 
-#### 1. **Proper Bitcast Target**
+#### 1. **Avoid Bitcast Limitations**
 ```wgsl
-// OLD: Bitcast to single float pointer
-let float_ptr = bitcast<ptr<storage, f32, read_write>>(bin_ptr);
-
-// NEW: Bitcast to array of 4 floats pointer
+// OLD: Invalid bitcast from struct pointer to array pointer
 let float_array_ptr = bitcast<ptr<storage, array<f32, 4>, read_write>>(bin_ptr);
+
+// NEW: Use existing vec4 field in struct
+impulse_response[bin_index].frequency_energy_low.x = normalized_energy;
 ```
 
-#### 2. **Array Index Access**
+#### 2. **Direct Field Access**
 ```wgsl
-// OLD: Invalid pointer arithmetic
+// OLD: Complex pointer manipulation
 *(float_ptr + 1) = value;
 
-// NEW: Valid array index access
-(*float_array_ptr)[1] = value;
+// NEW: Simple struct field access
+impulse_response[bin_index].frequency_energy_low.y = value;
 ```
 
-#### 3. **Consistent Syntax**
-All four positions now use the same array access pattern:
-- `(*float_array_ptr)[0]` - Position 0
-- `(*float_array_ptr)[1]` - Position 1  
-- `(*float_array_ptr)[2]` - Position 2
-- `(*float_array_ptr)[3]` - Position 3
+#### 3. **Consistent Storage Pattern**
+All four normalized values stored in frequency_energy_low vec4:
+- `.x` - Normalized energy
+- `.y` - Normalized phase real
+- `.z` - Normalized phase imaginary
+- `.w` - Sample count as float
 
 ## WGSL Language Rules
 
