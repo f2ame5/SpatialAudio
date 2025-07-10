@@ -25,6 +25,8 @@ export class AudioProcessor {
   private lastImpulseData: Float32Array | null;
   private spatialProcessor: SpatialAudioProcessor;
   private room: Room;
+  private currentSoundSource: AudioBufferSourceNode | null = null;
+  private currentGainNode: GainNode | null = null;
 
   constructor(device: GPUDevice, room: Room, sampleRate: number = 44100) {
     // Create an Audio Context (uses webkitAudioContext as fallback)
@@ -666,5 +668,95 @@ export class AudioProcessor {
     } catch (error) {
         console.error("Error playing debug sine wave:", error);
     }
+  }
+
+  /**
+   * Loads an audio file from the given path and plays it convolved with the current impulse response.
+   *
+   * @param filePath - Path to the audio file to load
+   */
+  public async loadAndPlaySoundFile(filePath: string): Promise<void> {
+    try {
+        if (!this.impulseResponseBuffer) {
+            console.warn("No impulse response available. Generate one first.");
+            return;
+        }
+
+        // Stop any currently playing sound
+        this.stopCurrentSound();
+
+        // Fetch the audio file
+        const response = await fetch(filePath);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch audio file: ${response.statusText}`);
+        }
+
+        const arrayBuffer = await response.arrayBuffer();
+        const audioBuffer = await this.audioCtx.decodeAudioData(arrayBuffer);
+
+        // Create audio nodes
+        const sourceNode = this.audioCtx.createBufferSource();
+        sourceNode.buffer = audioBuffer;
+
+        const convolverNode = this.audioCtx.createConvolver();
+        convolverNode.buffer = this.impulseResponseBuffer;
+
+        const gainNode = this.audioCtx.createGain();
+        gainNode.gain.value = 0.5; // Adjust volume as needed
+
+        // Connect nodes: Source → Convolver → Gain → Destination
+        sourceNode.connect(convolverNode);
+        convolverNode.connect(gainNode);
+        gainNode.connect(this.audioCtx.destination);
+
+        // Store references for stopping later
+        this.currentSoundSource = sourceNode;
+        this.currentGainNode = gainNode;
+
+        // Set up event listener for when sound ends
+        sourceNode.onended = () => {
+            this.currentSoundSource = null;
+            this.currentGainNode = null;
+        };
+
+        // Resume audio context if suspended
+        if (this.audioCtx.state === 'suspended') {
+            await this.audioCtx.resume();
+        }
+
+        // Start playback
+        sourceNode.start();
+        console.log(`Playing convolved sound file: ${filePath}`);
+
+    } catch (error) {
+        console.error("Error loading and playing sound file:", error);
+        throw error;
+    }
+  }
+
+  /**
+   * Stops the currently playing sound file.
+   */
+  public stopCurrentSound(): void {
+    try {
+        if (this.currentSoundSource) {
+            this.currentSoundSource.stop();
+            this.currentSoundSource = null;
+        }
+        if (this.currentGainNode) {
+            this.currentGainNode.disconnect();
+            this.currentGainNode = null;
+        }
+        console.log("Stopped current sound playback");
+    } catch (error) {
+        console.error("Error stopping current sound:", error);
+    }
+  }
+
+  /**
+   * Checks if a sound is currently playing.
+   */
+  public isPlaying(): boolean {
+    return this.currentSoundSource !== null;
   }
 }

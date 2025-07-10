@@ -32,6 +32,11 @@ export class Main {
     private sourceParams = {
         sourcePower: 0
     };
+    private soundFileParams = {
+        selectedFile: 'loop.wav',
+        isPlaying: false
+    };
+    private currentAudioSource: AudioBufferSourceNode | null = null;
 
     constructor(canvas: HTMLCanvasElement, device: GPUDevice) {
         this.canvas = canvas;
@@ -204,6 +209,27 @@ export class Main {
         audioFolder.add(audioControls, 'playClick').name('Play Convolved Click');
         audioFolder.add(audioControls, 'playNoise').name('Play Noise with IR');
         audioFolder.open();
+
+        // --- Sound File Controls ---
+        const soundFileFolder = this.gui.addFolder('Sound Files');
+
+        // Sound file selector
+        soundFileFolder.add(this.soundFileParams, 'selectedFile', ['loop.wav', 'snare.wav', 'top_loop.wav'])
+            .name('Select Sound')
+            .onChange((value: string) => {
+                this.soundFileParams.selectedFile = value;
+                // Stop current playback when changing files
+                this.stopSound();
+            });
+
+        const soundFileControls = {
+            playSound: () => this.playSelectedSound(),
+            stopSound: () => this.stopSound()
+        };
+
+        soundFileFolder.add(soundFileControls, 'playSound').name('Play Convolved');
+        soundFileFolder.add(soundFileControls, 'stopSound').name('Stop Sound');
+        soundFileFolder.open();
         // -------------------------------
 
         roomFolder.open();
@@ -371,6 +397,32 @@ export class Main {
 
         // Visualize both waveform and FFT
         await this.audioProcessor.visualizeImpulseResponse(this.waveformRenderer);
+    }
+
+    private async playSelectedSound(): Promise<void> {
+        try {
+            // Stop any currently playing sound
+            this.stopSound();
+
+            // Load and play the selected sound file
+            const soundPath = `src/soundfile/${this.soundFileParams.selectedFile}`;
+            await this.audioProcessor.loadAndPlaySoundFile(soundPath);
+
+            this.soundFileParams.isPlaying = true;
+            console.log(`Playing sound file: ${this.soundFileParams.selectedFile}`);
+        } catch (error) {
+            console.error('Error playing sound file:', error);
+        }
+    }
+
+    private stopSound(): void {
+        try {
+            this.audioProcessor.stopCurrentSound();
+            this.soundFileParams.isPlaying = false;
+            console.log('Stopped sound playback');
+        } catch (error) {
+            console.error('Error stopping sound:', error);
+        }
     }
 }
 
