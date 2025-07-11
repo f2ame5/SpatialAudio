@@ -33,8 +33,9 @@ export class Main {
         sourcePower: 0
     };
     private soundFileParams = {
-        selectedFile: 'loop.wav',
-        isPlaying: false
+        selectedFile: 'loop.mp3',
+        isPlaying: false,
+        masterVolume: 0.5
     };
     private currentAudioSource: AudioBufferSourceNode | null = null;
 
@@ -100,6 +101,9 @@ export class Main {
         // Initialize ray tracer
         this.rayTracer = new RayTracer(device, this.sphere, this.room);
         this.audioProcessor = new AudioProcessor(device, this.room);
+
+        // Set initial master volume
+        this.audioProcessor.setMasterVolume(this.soundFileParams.masterVolume);
 
         // Create waveform canvas element and style it to appear at the bottom of the screen.
         const waveformCanvas = document.createElement('canvas');
@@ -187,39 +191,36 @@ export class Main {
         const rayTracingControls = {
             calculateIR: async () => {
                 await this.calculateIR();
-            },
-            playConvolved: () => {
-                this.audioProcessor.playConvolvedSound();
             }
         };
         rayTracingFolder.add(rayTracingControls, 'calculateIR').name('Calculate IR');
-        rayTracingFolder.add(rayTracingControls, 'playConvolved').name('Play Convolved Sound');
 
         // --- Audio Debug Controls ---
         const audioFolder = this.gui.addFolder('Audio Debug');
         const audioControls = {
-            playSine: () => this.audioProcessor.debugPlaySineWave(),
-            playConvolvedSine: () => this.audioProcessor.playConvolvedSineWave(),
-            playClick: () => this.audioProcessor.playConvolvedSound(),
             playNoise: () => this.audioProcessor.playNoiseWithIR()
         };
 
-        audioFolder.add(audioControls, 'playSine').name('Play Sine Wave');
-        audioFolder.add(audioControls, 'playConvolvedSine').name('Play Convolved Sine');
-        audioFolder.add(audioControls, 'playClick').name('Play Convolved Click');
         audioFolder.add(audioControls, 'playNoise').name('Play Noise with IR');
         audioFolder.open();
 
         // --- Sound File Controls ---
         const soundFileFolder = this.gui.addFolder('Sound Files');
 
-        // Sound file selector
-        soundFileFolder.add(this.soundFileParams, 'selectedFile', ['loop.wav', 'snare.wav', 'top_loop.wav'])
+        // ADD YOUR MP3 FILE HERE
+        soundFileFolder.add(this.soundFileParams, 'selectedFile', ['loop.mp3', 'snare.mp3', 'top_loop.mp3'])
             .name('Select Sound')
             .onChange((value: string) => {
                 this.soundFileParams.selectedFile = value;
                 // Stop current playback when changing files
                 this.stopSound();
+            });
+
+        // Master volume control
+        soundFileFolder.add(this.soundFileParams, 'masterVolume', 0, 1, 0.01)
+            .name('Master Volume')
+            .onChange((value: number) => {
+                this.audioProcessor.setMasterVolume(value);
             });
 
         const soundFileControls = {
@@ -424,6 +425,8 @@ export class Main {
             console.error('Error stopping sound:', error);
         }
     }
+
+
 }
 
 // Animation loop

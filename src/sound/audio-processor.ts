@@ -27,6 +27,7 @@ export class AudioProcessor {
   private room: Room;
   private currentSoundSource: AudioBufferSourceNode | null = null;
   private currentGainNode: GainNode | null = null;
+  private masterVolume: number = 0.5; // Master volume control (0.0 to 1.0)
 
   constructor(device: GPUDevice, room: Room, sampleRate: number = 44100) {
     // Create an Audio Context (uses webkitAudioContext as fallback)
@@ -69,44 +70,59 @@ export class AudioProcessor {
     }
   ): Promise<void> {
     try {
-        // Sort ray hits by arrival time for proper wave superposition
         const sortedHits = [...rayHits].sort((a, b) => a.time - b.time);
 
-        // Get spatial audio data with improved frequency response
-        const [leftIR, rightIR] = await this.spatialProcessor.processSpatialAudio(
-            camera,
-            sortedHits,
-            params,
-            this.room
-        );
+        const [leftIR, rightIR] = this.createImpulseResponseFromHits(sortedHits, maxTime);
 
-        // Create stereo impulse response
+        // The rest of the function remains the same...
         const sampleCount = leftIR.length;
-
-        // Generate envelope considering wave properties
         const envelope = this.generateEnvelope(sampleCount, sortedHits);
 
-        // Add room modes for more realistic low frequency response
+        // (Optional) You can still add room modes if you wish
         const roomModes = this.calculateRoomModes(this.room.config.dimensions);
         this.addRoomModes(leftIR, rightIR, roomModes);
 
-        // Apply wave interference patterns based on phase relationships
-        this.applyWaveInterference(leftIR, rightIR, sortedHits);
-
-        // Normalize and apply envelope
         this.normalizeAndApplyEnvelope(leftIR, rightIR, envelope);
-
-        // Set up the impulse response buffer
         this.setupImpulseResponseBuffer(leftIR, rightIR);
-
-        // Store for visualization
         this.lastImpulseData = leftIR;
 
-        console.log("Impulse response processed successfully with wave properties");
+        // Debug: Log impulse response characteristics
+        this.debugImpulseResponse(leftIR, rightIR);
+
+        console.log("Impulse response processed successfully.");
     } catch (error) {
         console.error("Error processing ray hits:", error);
         throw error;
     }
+  }
+
+  // Add this new function to the AudioProcessor class
+  private createImpulseResponseFromHits(
+      rayHits: any[],
+      maxTime: number
+  ): [Float32Array, Float32Array] {
+    const sampleCount = Math.ceil(maxTime * this.sampleRate);
+    const leftIR = new Float32Array(sampleCount).fill(0);
+    const rightIR = new Float32Array(sampleCount).fill(0);
+
+    for (const hit of rayHits) {
+        const time = Math.max(hit.time || 0, 0);
+        if (time < maxTime) {
+            const sampleIndex = Math.floor(time * this.sampleRate);
+
+            const energy = ( (hit.energyLow || 0) + (hit.energyMid || 0) + (hit.energyHigh || 0) ) / 3;
+            const amplitude = Math.sqrt(Math.max(energy, 0));
+
+            const [leftGain, rightGain] = this.calculateSpatialGains(hit.position || [0, 0, 0]);
+
+            if (sampleIndex < sampleCount && isFinite(amplitude)) {
+                leftIR[sampleIndex] += amplitude * leftGain;
+                rightIR[sampleIndex] += amplitude * rightGain;
+            }
+        }
+    }
+
+    return [leftIR, rightIR];
   }
 
   private applyWaveInterference(leftIR: Float32Array, rightIR: Float32Array, rayHits: any[]): void {
@@ -328,30 +344,7 @@ export class AudioProcessor {
     this.playAudio();
   }
 
-  /**
-   * Debug method: Plays a sine wave for testing audio output.
-   *
-   * @param frequency The frequency of the sine wave in Hz (default: 440 Hz).
-   * @param duration The duration of the sine wave in seconds (default: 1 second).
-   */
-  debugPlaySineWave(frequency: number = 440, duration: number = 1): void {
-    const sampleCount = Math.ceil(duration * this.sampleRate);
-    const sineData = new Float32Array(sampleCount);
-    for (let i = 0; i < sampleCount; i++) {
-      const t = i / this.sampleRate;
-      sineData[i] = Math.sin(2 * Math.PI * frequency * t);
-    }
 
-    const sineBuffer = this.audioCtx.createBuffer(1, sampleCount, this.sampleRate);
-    sineBuffer.copyToChannel(sineData, 0, 0);
-
-    const source = this.audioCtx.createBufferSource();
-    source.buffer = sineBuffer;
-    source.connect(this.audioCtx.destination);
-    source.start();
-
-    console.log(`AudioProcessor: Playing debug sine wave with frequency ${frequency}Hz for ${duration} seconds.`);
-  }
 
   /**
    * Creates a short click sound and processes it with the impulse response
@@ -386,7 +379,7 @@ export class AudioProcessor {
         clickSource.buffer = clickBuffer;
 
         const gainNode = this.audioCtx.createGain();
-        gainNode.gain.value = 0.3;
+        gainNode.gain.value = this.masterVolume * 0.6; // Scale for click sound
 
         const convolver = this.audioCtx.createConvolver();
         convolver.buffer = this.impulseResponseBuffer;
@@ -417,70 +410,7 @@ export class AudioProcessor {
     }
   }
 
-  /**
-   * Plays a convolved sound with the current impulse response.
-   * Uses a sine wave as input for testing the room acoustics.
-   */
-  public async playConvolvedSound(): Promise<void> {
-    try {
-        if (!this.impulseResponseBuffer) {
-            console.warn("No impulse response available. Generate one first.");
-            return;
-        }
 
-        // Create sine wave buffer
-        const duration = 2.0; // 2 seconds
-        const frequency = 440; // 440 Hz (A4 note)
-        const sineBuffer = this.audioCtx.createBuffer(
-            1,
-            this.sampleRate * duration,
-            this.sampleRate
-        );
-        const sineData = sineBuffer.getChannelData(0);
-
-        // Generate sine wave
-        for (let i = 0; i < sineData.length; i++) {
-            const t = i / this.sampleRate;
-            sineData[i] = Math.sin(2 * Math.PI * frequency * t);
-
-            // Apply envelope to avoid clicks
-            const attack = 0.1; // 100ms attack
-            const release = 0.1; // 100ms release
-            if (t < attack) {
-                sineData[i] *= t / attack;
-            } else if (t > duration - release) {
-                sineData[i] *= (duration - t) / release;
-            }
-        }
-
-        // Create audio nodes
-        const sourceNode = this.audioCtx.createBufferSource();
-        sourceNode.buffer = sineBuffer;
-
-        const convolverNode = this.audioCtx.createConvolver();
-        convolverNode.buffer = this.impulseResponseBuffer;
-
-        const gainNode = this.audioCtx.createGain();
-        gainNode.gain.value = 0.3; // Lower volume for sine wave
-
-        // Connect nodes
-        sourceNode.connect(convolverNode);
-        convolverNode.connect(gainNode);
-        gainNode.connect(this.audioCtx.destination);
-
-        // Resume audio context if suspended
-        if (this.audioCtx.state === 'suspended') {
-            await this.audioCtx.resume();
-        }
-
-        // Start playback
-        sourceNode.start();
-        console.log("Playing convolved sine wave");
-
-    } catch (error) {
-        console.error("Error playing convolved sound:", error);
-    }
-  }
 
   /**
    * Plays a test sound with white noise to better hear the room effect.
@@ -514,7 +444,7 @@ export class AudioProcessor {
         convolverNode.buffer = this.impulseResponseBuffer;
 
         const gainNode = this.audioCtx.createGain();
-        gainNode.gain.value = 0.2; // Lower volume for noise
+        gainNode.gain.value = this.masterVolume * 0.4; // Scale for noise (quieter)
 
         // Connect nodes
         sourceNode.connect(convolverNode);
@@ -574,100 +504,65 @@ export class AudioProcessor {
     }
   }
 
+
+
+
+
   /**
-   * Plays a sine wave through the impulse response.
+   * Debug method to analyze impulse response characteristics
    */
-  async playConvolvedSineWave(): Promise<void> {
-    try {
-        if (!this.impulseResponseBuffer) {
-            console.warn("No impulse response available. Generate one first.");
-            return;
-        }
+  private debugImpulseResponse(leftIR: Float32Array, rightIR: Float32Array): void {
+    // Calculate basic statistics
+    const leftMax = Math.max(...leftIR);
+    const leftMin = Math.min(...leftIR);
+    const leftRMS = Math.sqrt(leftIR.reduce((sum, val) => sum + val * val, 0) / leftIR.length);
 
-        // Create sine wave buffer
-        const duration = 2.0; // 2 seconds
-        const frequency = 440; // 440 Hz (A4 note)
-        const sineBuffer = this.audioCtx.createBuffer(
-            1,
-            this.sampleRate * duration,
-            this.sampleRate
-        );
-        const sineData = sineBuffer.getChannelData(0);
+    // Check for NaN or infinite values
+    const hasNaN = leftIR.some(val => !isFinite(val));
 
-        // Generate sine wave
-        for (let i = 0; i < sineData.length; i++) {
-            const t = i / this.sampleRate;
-            sineData[i] = Math.sin(2 * Math.PI * frequency * t);
+    // Check for very high frequency content (potential noise)
+    let highFreqEnergy = 0;
+    for (let i = 1; i < leftIR.length; i++) {
+      const diff = Math.abs(leftIR[i] - leftIR[i-1]);
+      highFreqEnergy += diff;
+    }
+    highFreqEnergy /= leftIR.length;
 
-            // Apply envelope to avoid clicks
-            const attack = 0.1; // 100ms attack
-            const release = 0.1; // 100ms release
-            if (t < attack) {
-                sineData[i] *= t / attack;
-            } else if (t > duration - release) {
-                sineData[i] *= (duration - t) / release;
-            }
-        }
+    console.log("=== Impulse Response Debug ===");
+    console.log(`Length: ${leftIR.length} samples (${(leftIR.length / this.sampleRate).toFixed(3)}s)`);
+    console.log(`Peak amplitude: ${leftMax.toFixed(6)}`);
+    console.log(`Min amplitude: ${leftMin.toFixed(6)}`);
+    console.log(`RMS level: ${leftRMS.toFixed(6)}`);
+    console.log(`Has NaN/Infinite: ${hasNaN}`);
+    console.log(`High freq energy: ${highFreqEnergy.toFixed(6)}`);
+    console.log(`Dynamic range: ${(20 * Math.log10(leftMax / Math.max(leftRMS, 1e-10))).toFixed(1)} dB`);
 
-        // Create and connect audio nodes
-        const sourceNode = this.audioCtx.createBufferSource();
-        sourceNode.buffer = sineBuffer;
+    // Sample first few values
+    const firstSamples = Array.from(leftIR.slice(0, 10)).map(v => v.toFixed(4)).join(', ');
+    console.log(`First 10 samples: [${firstSamples}]`);
+  }
 
-        const convolverNode = this.audioCtx.createConvolver();
-        convolverNode.buffer = this.impulseResponseBuffer;
 
-        const gainNode = this.audioCtx.createGain();
-        gainNode.gain.value = 0.3; // Lower volume for sine wave
 
-        // Connect nodes
-        sourceNode.connect(convolverNode);
-        convolverNode.connect(gainNode);
-        gainNode.connect(this.audioCtx.destination);
+  /**
+   * Set the master volume for all audio playback
+   * @param volume - Volume level from 0.0 (silent) to 1.0 (full volume)
+   */
+  public setMasterVolume(volume: number): void {
+    this.masterVolume = Math.max(0, Math.min(1, volume)); // Clamp between 0 and 1
 
-        // Resume audio context if suspended
-        if (this.audioCtx.state === 'suspended') {
-            await this.audioCtx.resume();
-        }
-
-        // Start playback
-        sourceNode.start();
-        console.log("Playing convolved sine wave");
-
-    } catch (error) {
-        console.error("Error playing convolved sine wave:", error);
+    // Update current playing sound if any
+    if (this.currentGainNode) {
+      this.currentGainNode.gain.value = this.masterVolume;
     }
   }
 
   /**
-   * Debug method to play a simple sine wave without convolution.
+   * Get the current master volume
+   * @returns Current master volume (0.0 to 1.0)
    */
-  async debugPlaySineWave(): Promise<void> {
-    try {
-        const oscillator = this.audioCtx.createOscillator();
-        const gainNode = this.audioCtx.createGain();
-
-        oscillator.type = 'sine';
-        oscillator.frequency.setValueAtTime(440, this.audioCtx.currentTime);
-
-        gainNode.gain.setValueAtTime(0, this.audioCtx.currentTime);
-        gainNode.gain.linearRampToValueAtTime(0.3, this.audioCtx.currentTime + 0.1);
-        gainNode.gain.linearRampToValueAtTime(0, this.audioCtx.currentTime + 2);
-
-        oscillator.connect(gainNode);
-        gainNode.connect(this.audioCtx.destination);
-
-        // Resume audio context if suspended
-        if (this.audioCtx.state === 'suspended') {
-            await this.audioCtx.resume();
-        }
-
-        oscillator.start();
-        oscillator.stop(this.audioCtx.currentTime + 2);
-        console.log("Playing debug sine wave");
-
-    } catch (error) {
-        console.error("Error playing debug sine wave:", error);
-    }
+  public getMasterVolume(): number {
+    return this.masterVolume;
   }
 
   /**
@@ -702,7 +597,7 @@ export class AudioProcessor {
         convolverNode.buffer = this.impulseResponseBuffer;
 
         const gainNode = this.audioCtx.createGain();
-        gainNode.gain.value = 0.5; // Adjust volume as needed
+        gainNode.gain.value = this.masterVolume; // Use master volume
 
         // Connect nodes: Source → Convolver → Gain → Destination
         sourceNode.connect(convolverNode);
