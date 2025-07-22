@@ -24,13 +24,13 @@ export interface WallMaterial {
 // Add standard material presets
 export const MATERIAL_PRESETS = {
     CONCRETE: {
-        absorptionLow: 0.02,
-        absorptionMid: 0.03,
+        absorptionLow: 0.08,
+        absorptionMid: 0.08,
         absorptionHigh: 0.04,
         scatteringLow: 0.1,
         scatteringMid: 0.15,
         scatteringHigh: 0.2,
-        roughness: 0.1
+        roughness: 0.25
     },
     WOOD: {
         absorptionLow: 0.15,
@@ -41,5 +41,5 @@ export const MATERIAL_PRESETS = {
         scatteringHigh: 0.4,
         roughness: 0.3
     },
-    // Add more presets...
+    
 };

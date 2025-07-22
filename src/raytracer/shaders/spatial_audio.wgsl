@@ -5,13 +5,32 @@ struct ListenerData {
     right: vec3f,
 }
 
+// Add directional absorption struct
+struct DirectionalAbsorption {
+    front: vec3f, // [low, mid, high]
+    side: vec3f,
+    back: vec3f,
+};
+
+struct WallMaterial {
+    directional: DirectionalAbsorption,
+    scatteringLow: f32,
+    scatteringMid: f32,
+    scatteringHigh: f32,
+    roughness: f32,
+    phaseShift: f32,
+    phaseRandomization: f32
+}
+
 struct RayHit {
     position: vec3f,
     time: f32,
     normal: vec3f,
     energy: f32,
+    incomingDirection: vec3f,
     // Eight frequency bands
     energy63: f32,
+    hrtfIndex: u32,
     energy125: f32,
     energy250: f32,
     energy500: f32,
@@ -24,6 +43,12 @@ struct RayHit {
     frequency: f32,
     dopplerShift: f32,
     _padding: f32  // Maintain alignment
+}
+
+struct RoomMaterials {
+    walls: WallMaterial,
+    ceiling: WallMaterial,
+    floor: WallMaterial
 }
 
 struct FrequencyBands {
@@ -101,6 +126,8 @@ struct WaveProperties {
 @group(0) @binding(3) var<uniform> params: SpatialAudioParams;
 @group(0) @binding(4) var<uniform> acoustics: RoomAcoustics;
 @group(0) @binding(5) var<storage, read> waveProperties: array<WaveProperties>;
+@group(0) @binding(6) var<uniform> roomMaterials: RoomMaterials;
+@group(0) @binding(7) var<storage, read> hrtfCoefficients: array<f32>;
 
 // Update the constants and helper functions
 const SPEED_OF_SOUND = 343.0;
@@ -108,22 +135,38 @@ const AIR_DENSITY = 1.225;  // kg/m³ at room temperature
 const REFERENCE_PRESSURE = 2e-5;  // 20 micropascals (threshold of hearing)
 
 // Helper function to calculate directional attenuation
-fn calculateDirectionalAttenuation(direction: vec3f, listenerForward: vec3f) -> f32 {
-    let dir = normalize(direction);
-    let forward = normalize(listenerForward);
+// Added directional absorption logic
+fn getAbsorptionDirection(dotValue: f32) -> Direction {
+    let angle = acos(dotValue);
+    if (angle < 0.25 * PI) { return Front; }
+    if (angle < 0.75 * PI) { return Side; }
+    return Back;
+}
+
+fn applyDirectionalAbsorption(hit: RayHit, material: WallMaterial) -> vec3f {
+    let dot = dot(hit.incomingDirection, hit.normal);
+    let direction = getAbsorptionDirection(dot);
+        direction == Front ? material.directional.front :
+        direction == Side  ? material.directional.side  :
+        material.directional.back;
+    // or alternatively using ternary:
+    // return direction == Front ? material.directional.front :
+    //        direction == Side ? material.directional.side :
+    //        material.directional.back;
+}
+// Removed misplaced code
+//     let forward = normalize(listenerForward);
     let cosAngle = dot(dir, forward);
     return clamp((cosAngle + 1.0) * 0.5, 0.0, 1.0);
 }
 
 // HRTF approximation (simplified)
-fn calculateHRTF(direction: vec3f, listenerRight: vec3f) -> vec2f {
-    let dir = normalize(direction);
-    let right = normalize(listenerRight);
-    let rightDot = dot(dir, right);
-    // Simplified ITD and ILD simulation
-    let leftGain = clamp(1.0 - (rightDot + 1.0) * 0.25, 0.1, 1.0);  // 0.75 to 0.25
-    let rightGain = clamp(1.0 + (rightDot - 1.0) * 0.25, 0.1, 1.0); // 0.25 to 0.75
-    return vec2f(leftGain, rightGain);
+// Replace entire calculateHRTF function with new getHRTFCoefficient
+fn getHRTFCoefficient(index: u32) -> vec2f {
+    return vec2f(
+        hrtfCoefficients[index * 2],
+        hrtfCoefficients[index * 2 + 1]
+    );
 }
 
 // Calculate frequency-dependent scattering based on acoustic research
@@ -235,6 +278,36 @@ fn calculateWaveContribution(
     return validAmplitude * window * sin(totalPhase);
 }
 
+// Function to apply material absorption based on surface type
+fn applyMaterialAbsorption(hit: RayHit, distance: f32, materials: RoomMaterials) -> f32 {
+    // Determine which surface was hit based on normal direction
+    // This is a simplified approach - in a real implementation, you might pass the surface type directly
+    let upNormal = vec3f(0.0, 1.0, 0.0);
+    let downNormal = vec3f(0.0, -1.0, 0.0);
+    let floorCeilingThreshold = 0.9; // Threshold for determining floor/ceiling
+    
+    var material: WallMaterial;
+    
+    // Determine if hit is on floor or ceiling
+    if (dot(hit.normal, upNormal) > floorCeilingThreshold) {
+        // Hit on floor
+        material = materials.floor;
+    } else if (dot(hit.normal, downNormal) > floorCeilingThreshold) {
+        // Hit on ceiling
+        material = materials.ceiling;
+    } else {
+        // Hit on wall
+        material = materials.walls;
+    }
+    
+    // Calculate combined absorption factor
+    // This is a simplified model - you might want to use frequency-specific absorption
+    let absorptionFactor = (material.absorptionLow + material.absorptionMid + material.absorptionHigh) / 1.0;
+    
+    // Return the transmission factor (1 - absorption)
+    return 1.0 - absorptionFactor;
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_id: vec3u) {
     let hitIndex = global_id.x;
@@ -248,7 +321,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
     // Calculate basic spatial properties
     let distance = length(listener.position - hit.position);
     let dirAttenuation = calculateDirectionalAttenuation(toListener, listener.forward);
-    let hrtf = calculateHRTF(toListener, listener.right);
+    let hrtfCoeffs = getHRTFCoefficient(hit.hrtfIndex);
+    let hrtf = hrtfCoeffs;
 
     // Calculate wave properties
     let waveProps = waveProperties[hitIndex];
@@ -257,6 +331,14 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
     // Calculate frequency-dependent properties
     let airAbsorption = calculateAirAbsorption(distance);
     let energyDecay = calculateEnergyDecay(hit.time, distance, toListener, hit.normal);
+    
+    // Apply material absorption
+    // Calculate directional absorption
+    let directionalAbsorption = applyDirectionalAbsorption(hit, roomMaterials.walls.directional);
+    amplitude *= directionalAbsorption.x; // Low frequency absorption
+    amplitude *= directionalAbsorption.y; // Mid frequency absorption
+    amplitude *= directionalAbsorption.z; // High frequency absorption
+    amplitude = amplitude * materialTransmission;
     
     // Calculate wave contribution with interference
     let contribution = calculateWaveContribution(

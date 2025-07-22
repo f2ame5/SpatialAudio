@@ -1,0 +1,4591 @@
+src\camera\camera.ts:
+<code>
+import { mat4, vec3 } from 'gl-matrix';
+
+export class Camera {
+    private position: vec3;
+    private yaw: number;
+    private pitch: number;
+    private front: vec3;
+    private up: vec3;
+    private readonly PITCH_LIMIT = 89.0; // Prevent camera flip at 90 degrees
+    private readonly MOVEMENT_SPEED = 5.0;
+    private readonly MOUSE_SENSITIVITY = 0.1;
+    private readonly KEYBOARD_ROTATION_SPEED = 2.0; // New constant for keyboard rotation speed
+
+    constructor(position: vec3 = vec3.fromValues(0, 1.7, 3), yaw: number = -90, pitch: number = 0) {
+        this.position = position;
+        this.yaw = yaw;
+        this.pitch = pitch;
+        this.front = vec3.create();
+        this.up = vec3.fromValues(0, 1, 0);
+
+        // Initialize view direction
+        this.updateVectors();
+    }
+
+    private updateVectors(): void {
+        // Calculate new front vector
+        this.front = vec3.fromValues(
+            Math.cos(this.yaw * Math.PI / 180) * Math.cos(this.pitch * Math.PI / 180),
+            Math.sin(this.pitch * Math.PI / 180),
+            Math.sin(this.yaw * Math.PI / 180) * Math.cos(this.pitch * Math.PI / 180)
+        );
+        vec3.normalize(this.front, this.front);
+    }
+
+    public rotate(deltaX: number, deltaY: number): void {
+        // Apply mouse sensitivity
+        this.yaw += deltaX * this.MOUSE_SENSITIVITY;
+        this.pitch -= deltaY * this.MOUSE_SENSITIVITY;
+
+        // Constrain pitch to prevent flipping
+        this.pitch = Math.max(-this.PITCH_LIMIT, Math.min(this.PITCH_LIMIT, this.pitch));
+
+        this.updateVectors();
+    }
+
+    public moveForward(distance: number): void {
+        const movement = vec3.scale(vec3.create(), this.front, distance * this.MOVEMENT_SPEED);
+        vec3.add(this.position, this.position, movement);
+    }
+
+    public moveRight(distance: number): void {
+        const right = vec3.cross(vec3.create(), this.front, this.up);
+        vec3.normalize(right, right);
+        const movement = vec3.scale(vec3.create(), right, distance * this.MOVEMENT_SPEED);
+        vec3.add(this.position, this.position, movement);
+    }
+
+    public moveUp(distance: number): void {
+        const movement = vec3.scale(vec3.create(), this.up, distance * this.MOVEMENT_SPEED);
+        vec3.add(this.position, this.position, movement);
+    }
+
+    public getViewMatrix(): mat4 {
+        const target = vec3.add(vec3.create(), this.position, this.front);
+        const viewMatrix = mat4.create();
+        mat4.lookAt(viewMatrix, this.position, target, this.up);
+        return viewMatrix;
+    }
+
+    public getViewProjection(aspect: number): mat4 {
+        const projectionMatrix = mat4.create();
+        mat4.perspective(projectionMatrix, Math.PI / 4, aspect, 0.1, 100.0);
+
+        const viewProjection = mat4.create();
+        mat4.multiply(viewProjection, projectionMatrix, this.getViewMatrix());
+        return viewProjection;
+    }
+
+    public getPosition(): vec3 {
+        return vec3.clone(this.position);
+    }
+
+    public getFront(): vec3 {
+        return vec3.clone(this.front);
+    }
+
+    public getUp(): vec3 {
+        return vec3.clone(this.up);
+    }
+
+    // Debug methods
+    public getDebugInfo(): { position: vec3, yaw: number, pitch: number } {
+        return {
+            position: vec3.clone(this.position),
+            yaw: this.yaw,
+            pitch: this.pitch
+        };
+    }
+
+    public rotateWithKeyboard(direction: 'left' | 'right' | 'up' | 'down'): void {
+        switch (direction) {
+            case 'left':
+                this.yaw -= this.KEYBOARD_ROTATION_SPEED;
+                break;
+            case 'right':
+                this.yaw += this.KEYBOARD_ROTATION_SPEED;
+                break;
+            case 'up':
+                this.pitch += this.KEYBOARD_ROTATION_SPEED;
+                break;
+            case 'down':
+                this.pitch -= this.KEYBOARD_ROTATION_SPEED;
+                break;
+        }
+
+        // Constrain pitch to prevent flipping
+        this.pitch = Math.max(-this.PITCH_LIMIT, Math.min(this.PITCH_LIMIT, this.pitch));
+
+        this.updateVectors();
+    }
+
+    public setPosition(position: vec3): void {
+        this.position = vec3.clone(position);
+    }
+}
+
+</code>
+
+src\objects\sphere-renderer.ts:
+<code>
+import { vec3, mat4 } from 'gl-matrix';
+
+export class SphereRenderer {
+    private device: GPUDevice;
+    private pipeline: GPURenderPipeline;
+    private vertexBuffer: GPUBuffer;
+    private indexBuffer: GPUBuffer;
+    private uniformBuffer: GPUBuffer;
+    private uniformBindGroup: GPUBindGroup;
+    private indexCount: number;
+
+    constructor(device: GPUDevice) {
+        this.device = device;
+
+        // Create sphere mesh data
+        const { vertices, indices } = this.createSphereData();
+        this.indexCount = indices.length;
+
+        // Create buffers
+        this.vertexBuffer = device.createBuffer({
+            size: vertices.byteLength,
+            usage: GPUBufferUsage.VERTEX,
+            mappedAtCreation: true,
+        });
+        new Float32Array(this.vertexBuffer.getMappedRange()).set(vertices);
+        this.vertexBuffer.unmap();
+
+        this.indexBuffer = device.createBuffer({
+            size: indices.byteLength,
+            usage: GPUBufferUsage.INDEX,
+            mappedAtCreation: true,
+        });
+        new Uint16Array(this.indexBuffer.getMappedRange()).set(indices);
+        this.indexBuffer.unmap();
+
+        // Create uniform buffer - Fix size to accommodate both matrices
+        this.uniformBuffer = device.createBuffer({
+            size: 128, // 2 mat4x4 (64 bytes each)
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        // Create pipeline and bind group
+        this.pipeline = this.createPipeline();
+        this.uniformBindGroup = device.createBindGroup({
+            layout: this.pipeline.getBindGroupLayout(0),
+            entries: [{
+                binding: 0,
+                resource: { buffer: this.uniformBuffer },
+            }],
+        });
+    }
+
+    private createSphereData(radius: number = 1, segments: number = 16): { vertices: Float32Array, indices: Uint16Array } {
+        const vertices: number[] = [];
+        const indices: number[] = [];
+
+        // Generate vertices
+        for (let lat = 0; lat <= segments; lat++) {
+            const theta = lat * Math.PI / segments;
+            const sinTheta = Math.sin(theta);
+            const cosTheta = Math.cos(theta);
+
+            for (let lon = 0; lon <= segments; lon++) {
+                const phi = lon * 2 * Math.PI / segments;
+                const sinPhi = Math.sin(phi);
+                const cosPhi = Math.cos(phi);
+
+                const x = cosPhi * sinTheta;
+                const y = cosTheta;
+                const z = sinPhi * sinTheta;
+
+                vertices.push(x * radius, y * radius, z * radius);
+            }
+        }
+
+        // Generate indices
+        for (let lat = 0; lat < segments; lat++) {
+            for (let lon = 0; lon < segments; lon++) {
+                const first = (lat * (segments + 1)) + lon;
+                const second = first + segments + 1;
+
+                indices.push(first, second, first + 1);
+                indices.push(second, second + 1, first + 1);
+            }
+        }
+
+        return {
+            vertices: new Float32Array(vertices),
+            indices: new Uint16Array(indices),
+        };
+    }
+
+    private createPipeline(): GPURenderPipeline {
+        const shader = this.device.createShaderModule({
+            code: `
+                struct Uniforms {
+                    viewProjectionMatrix: mat4x4f,
+                    modelMatrix: mat4x4f,
+                };
+
+                @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+                struct VertexOutput {
+                    @builtin(position) position: vec4f,
+                    @location(0) normal: vec3f,
+                };
+
+                @vertex
+                fn vertexMain(@location(0) position: vec3f) -> VertexOutput {
+                    var output: VertexOutput;
+                    output.position = uniforms.viewProjectionMatrix * uniforms.modelMatrix * vec4f(position, 1.0);
+                    output.normal = position.xyz;  // For a unit sphere, position is the same as normal
+                    return output;
+                }
+
+                @fragment
+                fn fragmentMain(@location(0) normal: vec3f) -> @location(0) vec4f {
+                    let N = normalize(normal);
+                    let L = normalize(vec3f(1.0, 1.0, 1.0));
+                    let diffuse = max(dot(N, L), 0.0);
+                    return vec4f(vec3f(1.0, 1.0, 0.0) * (0.5 + 0.5 * diffuse), 1.0);
+                }
+            `
+        });
+
+        return this.device.createRenderPipeline({
+            layout: this.device.createPipelineLayout({
+                bindGroupLayouts: [
+                    this.device.createBindGroupLayout({
+                        entries: [{
+                            binding: 0,
+                            visibility: GPUShaderStage.VERTEX,
+                            buffer: { type: 'uniform' }
+                        }]
+                    })
+                ]
+            }),
+            vertex: {
+                module: shader,
+                entryPoint: 'vertexMain',
+                buffers: [{
+                    arrayStride: 12,
+                    attributes: [{
+                        shaderLocation: 0,
+                        offset: 0,
+                        format: 'float32x3'
+                    }]
+                }]
+            },
+            fragment: {
+                module: shader,
+                entryPoint: 'fragmentMain',
+                targets: [{
+                    format: 'bgra8unorm'
+                }]
+            },
+            primitive: {
+                topology: 'triangle-list',
+                cullMode: 'back'
+            },
+            depthStencil: {
+                depthWriteEnabled: true,
+                depthCompare: 'less',
+                format: 'depth24plus'
+            }
+        });
+    }
+
+    public render(
+        renderPass: GPURenderPassEncoder,
+        viewProjectionMatrix: Float32Array,
+        position: vec3,
+        radius: number
+    ): void {
+        // Create combined uniform data
+        const uniformData = new Float32Array(32); // 2 mat4 = 32 floats
+
+        // Copy view projection matrix to first half
+        uniformData.set(viewProjectionMatrix, 0);
+
+        // Create and copy model matrix to second half
+        const modelMatrix = mat4.create();
+        mat4.translate(modelMatrix, modelMatrix, position);
+        mat4.scale(modelMatrix, modelMatrix, [radius, radius, radius]);
+        uniformData.set(modelMatrix, 16); // Start at float 16 (64 bytes offset)
+
+        // Write entire uniform buffer at once
+        this.device.queue.writeBuffer(
+            this.uniformBuffer,
+            0,
+            uniformData
+        );
+
+        renderPass.setPipeline(this.pipeline);
+        renderPass.setBindGroup(0, this.uniformBindGroup);
+        renderPass.setVertexBuffer(0, this.vertexBuffer);
+        renderPass.setIndexBuffer(this.indexBuffer, 'uint16');
+        renderPass.drawIndexed(this.indexCount);
+    }
+}
+</code>
+
+src\objects\sphere.ts:
+<code>
+import { vec3 } from 'gl-matrix';
+
+export class Sphere {
+    private position: vec3;
+    private radius: number;
+    private readonly DEFAULT_RADIUS = 0.2; // Smaller radius for sound source visualization
+
+    constructor(position: vec3 = vec3.fromValues(0, 1.7, 0), radius: number = 0.2) {
+        this.position = vec3.clone(position); // Clone to ensure we have our own copy
+        this.radius = radius;
+    }
+
+    public update(deltaTime: number, roomDimensions: { width: number, height: number, depth: number }): void {
+        // Sound source is static, no update needed
+    }
+
+    public setPosition(position: vec3): void {
+        vec3.copy(this.position, position);
+    }
+
+    public getPosition(): vec3 {
+        return vec3.clone(this.position);
+    }
+
+    public getRadius(): number {
+        return this.radius;
+    }
+}
+</code>
+
+src\raytracer\shaders\raytracer.wgsl:
+<code>
+struct Ray {
+    origin: vec3f,
+    direction: vec3f,
+    energy: f32,
+    pathLength: f32,
+    bounces: u32,
+    isActive: u32,
+    frequency: f32,    // Frequency of the wave in Hz
+    phase: f32,        // Current phase of the wave
+    time: f32         // Time elapsed for this ray
+};
+
+struct Surface {
+    normal: vec3f,
+    position: vec3f,
+    absorption: f32
+};
+
+struct RayHit {
+    position: vec3f,
+    energy: f32,
+    time: f32,
+    phase: f32,       // Phase at hit point
+    frequency: f32    // Frequency of the wave at hit point
+};
+
+struct RayIntersection {
+    hit: bool,
+    distance: f32,
+    position: vec3f,
+    normal: vec3f,
+    surfaceIndex: u32
+};
+
+// Helper function to find closest intersection
+fn findClosestIntersection(ray: Ray) -> RayIntersection {
+    var closest: RayIntersection;
+    closest.hit = false;
+    closest.distance = 999999.0;
+
+    for (var i = 0u; i < arrayLength(&surfaces); i++) {
+        let surface = surfaces[i];
+
+        // Calculate intersection with plane
+        let denom = dot(ray.direction, surface.normal);
+        if (abs(denom) > 0.0001) { // Avoid parallel rays
+            let t = dot(surface.position - ray.origin, surface.normal) / denom;
+            if (t > 0.0001 && t < closest.distance) {
+                closest.hit = true;
+                closest.distance = t;
+                closest.position = ray.origin + ray.direction * t;
+                closest.normal = surface.normal;
+                closest.surfaceIndex = i;
+            }
+        }
+    }
+
+    return closest;
+}
+
+// Calculate reflected direction
+fn reflect(incident: vec3f, normal: vec3f) -> vec3f {
+    return incident - 2.0 * dot(incident, normal) * normal;
+}
+
+@group(0) @binding(0) var<storage, read_write> rays: array<Ray>;
+@group(0) @binding(1) var<storage, read> surfaces: array<Surface>;
+@group(0) @binding(2) var<storage, read_write> hits: array<RayHit>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) global_id: vec3u) {
+    let ray_index = global_id.x;
+    if (ray_index >= arrayLength(&rays)) {
+        return;
+    }
+
+    var ray = rays[ray_index];
+    if (ray.isActive == 0u || ray.bounces >= 50u || ray.energy < 0.01) {
+        return;
+    }
+
+    let intersection = findClosestIntersection(ray);
+    if (intersection.hit) {
+        let distance = intersection.distance;
+        let speed_of_sound = 343.0;  // Speed of sound in m/s
+        let travel_time = distance / speed_of_sound;
+        
+        // Calculate phase change over distance
+        // Phase = 2π * frequency * time
+        let phase_change = 2.0 * 3.14159 * ray.frequency * travel_time;
+        let new_phase = ray.phase + phase_change;
+
+        // Record hit with wave properties
+        hits[ray_index] = RayHit(
+            intersection.position,
+            ray.energy,
+            ray.time + travel_time,
+            new_phase,
+            ray.frequency
+        );
+
+        // Update ray for next bounce
+        let surface = surfaces[intersection.surfaceIndex];
+        let reflected = reflect(ray.direction, intersection.normal);
+
+        ray.origin = intersection.position;
+        ray.direction = reflected;
+        ray.energy *= (1.0 - surface.absorption);
+        ray.pathLength += distance;
+        ray.bounces += 1u;
+        ray.time += travel_time;
+        ray.phase = new_phase;
+
+        rays[ray_index] = ray;
+    } else {
+        ray.isActive = 0u;
+        rays[ray_index] = ray;
+    }
+}
+</code>
+
+src\raytracer\shaders\spatial_audio.wgsl:
+<code>
+struct ListenerData {
+    position: vec3f,
+    forward: vec3f,
+    up: vec3f,
+    right: vec3f,
+}
+
+// Add directional absorption struct
+struct DirectionalAbsorption {
+    front: vec3f, // [low, mid, high]
+    side: vec3f,
+    back: vec3f,
+};
+
+struct WallMaterial {
+    directional: DirectionalAbsorption,
+    scatteringLow: f32,
+    scatteringMid: f32,
+    scatteringHigh: f32,
+    roughness: f32,
+    phaseShift: f32,
+    phaseRandomization: f32
+}
+
+struct RayHit {
+    position: vec3f,
+    time: f32,
+    normal: vec3f,
+    energy: f32,
+    incomingDirection: vec3f,
+    // Eight frequency bands
+    energy63: f32,
+    hrtfIndex: u32,
+    energy125: f32,
+    energy250: f32,
+    energy500: f32,
+    energy1k: f32,
+    energy2k: f32,
+    energy4k: f32,
+    energy8k: f32,
+    // Wave properties
+    phase: f32,
+    frequency: f32,
+    dopplerShift: f32,
+    _padding: f32  // Maintain alignment
+}
+
+struct RoomMaterials {
+    walls: WallMaterial,
+    ceiling: WallMaterial,
+    floor: WallMaterial
+}
+
+struct FrequencyBands {
+    band63: f32,    // Sub-bass
+    band125: f32,   // Bass
+    band250: f32,   // Low-mids
+    band500: f32,   // Mids
+    band1k: f32,    // Upper-mids
+    band2k: f32,    // Presence
+    band4k: f32,    // Brilliance
+    band8k: f32     // Air
+}
+
+struct RoomAcoustics {
+    // RT60 for each frequency band
+    rt60_63: f32,
+    rt60_125: f32,
+    rt60_250: f32,
+    rt60_500: f32,
+    rt60_1k: f32,
+    rt60_2k: f32,
+    rt60_4k: f32,
+    rt60_8k: f32,
+
+    // Air absorption coefficients (increases with frequency)
+    absorption_63: f32,
+    absorption_125: f32,
+    absorption_250: f32,
+    absorption_500: f32,
+    absorption_1k: f32,
+    absorption_2k: f32,
+    absorption_4k: f32,
+    absorption_8k: f32,
+
+    // Scattering coefficients (frequency dependent)
+    scattering_63: f32,
+    scattering_125: f32,
+    scattering_250: f32,
+    scattering_500: f32,
+    scattering_1k: f32,
+    scattering_2k: f32,
+    scattering_4k: f32,
+    scattering_8k: f32,
+
+    // Room characteristics
+    earlyReflectionTime: f32,
+    roomVolume: f32,
+    totalSurfaceArea: f32,
+}
+
+struct SpatialAudioParams {
+    speedOfSound: f32,
+    maxDistance: f32,
+    minDistance: f32,
+    temperature: f32,    // For air absorption calculation
+    humidity: f32,       // For air absorption calculation
+    sourcePower: f32,    // Source power in dB
+    _padding1: f32,
+    _padding2: f32,
+    _padding3: f32,
+    _padding4: f32,
+    _padding5: f32      // Total size: 48 bytes (12 floats)
+}
+
+struct WaveProperties {
+    phase: f32,
+    frequency: f32,
+    dopplerShift: f32,
+    _padding: f32
+}
+
+@group(0) @binding(0) var<uniform> listener: ListenerData;
+@group(0) @binding(1) var<storage, read> rayHits: array<RayHit>;
+@group(0) @binding(2) var<storage, read_write> spatialIR: array<vec4f>;
+@group(0) @binding(3) var<uniform> params: SpatialAudioParams;
+@group(0) @binding(4) var<uniform> acoustics: RoomAcoustics;
+@group(0) @binding(5) var<storage, read> waveProperties: array<WaveProperties>;
+@group(0) @binding(6) var<uniform> roomMaterials: RoomMaterials;
+@group(0) @binding(7) var<storage, read> hrtfCoefficients: array<f32>;
+
+// Update the constants and helper functions
+const SPEED_OF_SOUND = 343.0;
+const AIR_DENSITY = 1.225;  // kg/m³ at room temperature
+const REFERENCE_PRESSURE = 2e-5;  // 20 micropascals (threshold of hearing)
+
+// Helper function to calculate directional attenuation
+// Added directional absorption logic
+fn getAbsorptionDirection(dotValue: f32) -> Direction {
+    let angle = acos(dotValue);
+    if (angle < 0.25 * PI) { return Front; }
+    if (angle < 0.75 * PI) { return Side; }
+    return Back;
+}
+
+fn applyDirectionalAbsorption(hit: RayHit, material: WallMaterial) -> vec3f {
+    let dot = dot(hit.incomingDirection, hit.normal);
+    let direction = getAbsorptionDirection(dot);
+        direction == Front ? material.directional.front :
+        direction == Side  ? material.directional.side  :
+        material.directional.back;
+    // or alternatively using ternary:
+    // return direction == Front ? material.directional.front :
+    //        direction == Side ? material.directional.side :
+    //        material.directional.back;
+}
+// Removed misplaced code
+//     let forward = normalize(listenerForward);
+    let cosAngle = dot(dir, forward);
+    return clamp((cosAngle + 1.0) * 0.5, 0.0, 1.0);
+}
+
+// HRTF approximation (simplified)
+// Replace entire calculateHRTF function with new getHRTFCoefficient
+fn getHRTFCoefficient(index: u32) -> vec2f {
+    return vec2f(
+        hrtfCoefficients[index * 2],
+        hrtfCoefficients[index * 2 + 1]
+    );
+}
+
+// Calculate frequency-dependent scattering based on acoustic research
+fn calculateScattering(direction: vec3f, normal: vec3f) -> FrequencyBands {
+    let incidentAngle = acos(dot(normalize(direction), normalize(normal)));
+
+    // Scattering increases with frequency according to acoustic theory
+    // Based on surface roughness relative to wavelength
+    return FrequencyBands(
+        mix(0.9, cos(incidentAngle), acoustics.scattering_63),   // More diffuse at low freq
+        mix(0.8, cos(incidentAngle), acoustics.scattering_125),
+        mix(0.7, cos(incidentAngle), acoustics.scattering_250),
+        mix(0.6, cos(incidentAngle), acoustics.scattering_500),
+        mix(0.5, cos(incidentAngle), acoustics.scattering_1k),
+        mix(0.4, cos(incidentAngle), acoustics.scattering_2k),
+        mix(0.3, cos(incidentAngle), acoustics.scattering_4k),
+        mix(0.2, cos(incidentAngle), acoustics.scattering_8k)    // More specular at high freq
+    );
+}
+
+// Calculate air absorption based on ISO 9613-1
+fn calculateAirAbsorption(distance: f32) -> FrequencyBands {
+    let d = max(distance, 0.001);
+    return FrequencyBands(
+        exp(-acoustics.absorption_63 * d),
+        exp(-acoustics.absorption_125 * d),
+        exp(-acoustics.absorption_250 * d),
+        exp(-acoustics.absorption_500 * d),
+        exp(-acoustics.absorption_1k * d),
+        exp(-acoustics.absorption_2k * d),
+        exp(-acoustics.absorption_4k * d),
+        exp(-acoustics.absorption_8k * d)
+    );
+}
+
+// Calculate energy decay with Sabine's formula for each band
+fn calculateEnergyDecay(time: f32, distance: f32, direction: vec3f, normal: vec3f) -> FrequencyBands {
+    let t = max(time, 0.0);
+
+    // Basic decay based on RT60
+    let timeDecay = FrequencyBands(
+        exp(-3.0 * t / acoustics.rt60_63),
+        exp(-3.0 * t / acoustics.rt60_125),
+        exp(-3.0 * t / acoustics.rt60_250),
+        exp(-3.0 * t / acoustics.rt60_500),
+        exp(-3.0 * t / acoustics.rt60_1k),
+        exp(-3.0 * t / acoustics.rt60_2k),
+        exp(-3.0 * t / acoustics.rt60_4k),
+        exp(-3.0 * t / acoustics.rt60_8k)
+    );
+
+    // Combine with scattering
+    let scattering = calculateScattering(direction, normal);
+
+    return FrequencyBands(
+        timeDecay.band63 * scattering.band63,
+        timeDecay.band125 * scattering.band125,
+        timeDecay.band250 * scattering.band250,
+        timeDecay.band500 * scattering.band500,
+        timeDecay.band1k * scattering.band1k,
+        timeDecay.band2k * scattering.band2k,
+        timeDecay.band4k * scattering.band4k,
+        timeDecay.band8k * scattering.band8k
+    );
+}
+
+// Improved early reflection detection
+fn isEarlyReflection(time: f32, distance: f32) -> bool {
+    // Consider both time and order of reflection
+    let directSound = distance / SPEED_OF_SOUND;
+    let normalizedTime = (time - directSound) / acoustics.earlyReflectionTime;
+    return normalizedTime < 1.0;
+}
+
+// Add helper function for dB to linear conversion
+fn dbToLinear(db: f32) -> f32 {
+    return pow(10.0, db / 20.0);
+}
+
+// Helper function to calculate Doppler shift
+fn calculateDopplerShift(rayVelocity: vec3f, rayDirection: vec3f, speedOfSound: f32) -> f32 {
+    let relativeVelocity = dot(rayVelocity, rayDirection);
+    return speedOfSound / (speedOfSound - relativeVelocity);
+}
+
+// Helper function to calculate wave contribution
+fn calculateWaveContribution(
+    time: f32,
+    phase: f32,
+    frequency: f32,
+    dopplerShift: f32,
+    amplitude: f32,
+    distance: f32
+) -> f32 {
+    // Validate inputs
+    let validFreq = max(frequency, 20.0);  // Ensure frequency is at least 20Hz
+    let validAmplitude = max(amplitude, 0.0);  // Ensure non-negative amplitude
+    let validDistance = max(distance, 0.001);  // Prevent division by zero
+    
+    let shiftedFreq = validFreq * max(dopplerShift, 0.1);  // Limit minimum doppler shift
+    let wavelength = SPEED_OF_SOUND / shiftedFreq;
+    let distancePhase = 2.0 * 3.14159 * validDistance / wavelength;
+    let totalPhase = phase + distancePhase;
+    
+    // Apply window function (Hann window)
+    let windowPos = clamp(time / (validDistance / SPEED_OF_SOUND), 0.0, 1.0);
+    let window = 0.5 * (1.0 - cos(2.0 * 3.14159 * windowPos));
+    
+    return validAmplitude * window * sin(totalPhase);
+}
+
+// Function to apply material absorption based on surface type
+fn applyMaterialAbsorption(hit: RayHit, distance: f32, materials: RoomMaterials) -> f32 {
+    // Determine which surface was hit based on normal direction
+    // This is a simplified approach - in a real implementation, you might pass the surface type directly
+    let upNormal = vec3f(0.0, 1.0, 0.0);
+    let downNormal = vec3f(0.0, -1.0, 0.0);
+    let floorCeilingThreshold = 0.9; // Threshold for determining floor/ceiling
+    
+    var material: WallMaterial;
+    
+    // Determine if hit is on floor or ceiling
+    if (dot(hit.normal, upNormal) > floorCeilingThreshold) {
+        // Hit on floor
+        material = materials.floor;
+    } else if (dot(hit.normal, downNormal) > floorCeilingThreshold) {
+        // Hit on ceiling
+        material = materials.ceiling;
+    } else {
+        // Hit on wall
+        material = materials.walls;
+    }
+    
+    // Calculate combined absorption factor
+    // This is a simplified model - you might want to use frequency-specific absorption
+    let absorptionFactor = (material.absorptionLow + material.absorptionMid + material.absorptionHigh) / 1.0;
+    
+    // Return the transmission factor (1 - absorption)
+    return 1.0 - absorptionFactor;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) global_id: vec3u) {
+    let hitIndex = global_id.x;
+    if (hitIndex >= arrayLength(&rayHits)) {
+        return;
+    }
+
+    let hit = rayHits[hitIndex];
+    let toListener = normalize(listener.position - hit.position);
+    
+    // Calculate basic spatial properties
+    let distance = length(listener.position - hit.position);
+    let dirAttenuation = calculateDirectionalAttenuation(toListener, listener.forward);
+    let hrtfCoeffs = getHRTFCoefficient(hit.hrtfIndex);
+    let hrtf = hrtfCoeffs;
+
+    // Calculate wave properties
+    let waveProps = waveProperties[hitIndex];
+    let amplitude = sqrt(max(hit.energy, 0.0));  // Ensure non-negative energy
+    
+    // Calculate frequency-dependent properties
+    let airAbsorption = calculateAirAbsorption(distance);
+    let energyDecay = calculateEnergyDecay(hit.time, distance, toListener, hit.normal);
+    
+    // Apply material absorption
+    // Calculate directional absorption
+    let directionalAbsorption = applyDirectionalAbsorption(hit, roomMaterials.walls.directional);
+    amplitude *= directionalAbsorption.x; // Low frequency absorption
+    amplitude *= directionalAbsorption.y; // Mid frequency absorption
+    amplitude *= directionalAbsorption.z; // High frequency absorption
+    amplitude = amplitude * materialTransmission;
+    
+    // Calculate wave contribution with interference
+    let contribution = calculateWaveContribution(
+        hit.time,
+        waveProps.phase,
+        waveProps.frequency,
+        waveProps.dopplerShift,
+        amplitude,
+        distance
+    );
+
+    // Apply spatial and frequency-dependent effects
+    // Ensure we have non-zero contributions
+    let leftContribution = max(contribution * hrtf.x * dirAttenuation * 0.5, 0.0001);
+    let rightContribution = max(contribution * hrtf.y * dirAttenuation * 0.5, 0.0001);
+
+    // Store result with frequency band information
+    spatialIR[hitIndex] = vec4f(
+        leftContribution,
+        rightContribution,
+        waveProps.frequency,  // Store frequency for later processing
+        hit.time             // Store time for sorting
+    );
+}
+</code>
+
+src\raytracer\ray-renderer.ts:
+<code>
+import { vec3 } from 'gl-matrix';
+
+export class RayRenderer {
+    private device: GPUDevice;
+    private pipeline: GPURenderPipeline;
+    private vertexBuffer: GPUBuffer;
+    private uniformBuffer: GPUBuffer;
+    private uniformBindGroup: GPUBindGroup;
+
+    constructor(device: GPUDevice) {
+        this.device = device;
+
+        // Create pipeline with shader that renders rays with color based on energy
+        const shader = this.device.createShaderModule({
+            code: `
+                struct Uniforms {
+                    viewProjection: mat4x4f,
+                };
+
+                struct VertexInput {
+                    @location(0) position: vec3f,
+                    @location(1) energy: f32,
+                };
+
+                struct VertexOutput {
+                    @builtin(position) position: vec4f,
+                    @location(0) energy: f32,
+                };
+
+                @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+                @vertex
+                fn vertexMain(input: VertexInput) -> VertexOutput {
+                    var output: VertexOutput;
+                    output.position = uniforms.viewProjection * vec4f(input.position, 1.0);
+                    output.energy = input.energy;
+                    return output;
+                }
+
+                @fragment
+                fn fragmentMain(@location(0) energy: f32) -> @location(0) vec4f {
+                    // Make rays invisible below threshold
+                    if (energy < 0.05) {
+                        return vec4f(0.0);
+                    }
+                    // Make rays more visible with higher alpha
+                    let alpha = mix(0.3, 1.0, energy);
+                    return vec4f(1.0, energy, 0.0, alpha);
+                }
+            `
+        });
+
+        // Create pipeline
+        this.pipeline = device.createRenderPipeline({
+            vertex: {
+                module: shader,
+                entryPoint: 'vertexMain',
+                buffers: [{
+                    arrayStride: 16, // vec3f position + f32 energy
+                    attributes: [
+                        { shaderLocation: 0, offset: 0, format: 'float32x3' },
+                        { shaderLocation: 1, offset: 12, format: 'float32' }
+                    ]
+                }]
+            },
+            fragment: {
+                module: shader,
+                entryPoint: 'fragmentMain',
+                targets: [{
+                    format: 'bgra8unorm',
+                    blend: {
+                        color: {
+                            srcFactor: 'src-alpha',
+                            dstFactor: 'one-minus-src-alpha',
+                        },
+                        alpha: {
+                            srcFactor: 'one',
+                            dstFactor: 'one-minus-src-alpha',
+                        },
+                    },
+                }]
+            },
+            primitive: {
+                topology: 'line-list'
+            },
+            depthStencil: {
+                depthWriteEnabled: true,
+                depthCompare: 'less',
+                format: 'depth24plus'
+            },
+            layout: 'auto'
+        });
+
+        // Create uniform buffer
+        this.uniformBuffer = device.createBuffer({
+            size: 64, // mat4x4
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        // Create bind group
+        this.uniformBindGroup = device.createBindGroup({
+            layout: this.pipeline.getBindGroupLayout(0),
+            entries: [{
+                binding: 0,
+                resource: { buffer: this.uniformBuffer }
+            }]
+        });
+
+        // Create empty vertex buffer (will be updated with ray data)
+        this.vertexBuffer = device.createBuffer({
+            size: 1024, // Initial size, will be recreated as needed
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        });
+    }
+
+    public render(
+        pass: GPURenderPassEncoder,
+        viewProjection: Float32Array,
+        rays: { origin: vec3, direction: vec3, energy: number }[],
+        roomDimensions: { width: number, height: number, depth: number }
+    ): void {
+        // Update uniform buffer with view projection matrix
+        this.device.queue.writeBuffer(this.uniformBuffer, 0, viewProjection);
+
+        // Create vertex data for rays
+        const vertices = new Float32Array(rays.length * 8); // 2 points per ray, 4 floats per point
+        let vertexOffset = 0;
+
+        const { width, height, depth } = roomDimensions;
+        const halfWidth = width / 2;
+        const halfDepth = depth / 2;
+
+        for (const ray of rays) {
+            // Start point
+            vertices[vertexOffset++] = ray.origin[0];
+            vertices[vertexOffset++] = ray.origin[1];
+            vertices[vertexOffset++] = ray.origin[2];
+            vertices[vertexOffset++] = ray.energy;
+
+            // Calculate intersection with room boundaries
+            let minT = Infinity;
+            let validIntersection = false;
+
+            // Check X planes (left/right walls)
+            if (Math.abs(ray.direction[0]) > 0.0001) {
+                const tx1 = (-halfWidth - ray.origin[0]) / ray.direction[0];
+                const tx2 = (halfWidth - ray.origin[0]) / ray.direction[0];
+                const tx = tx1 > 0 ? tx1 : tx2 > 0 ? tx2 : Infinity;
+                if (tx > 0) {
+                    minT = Math.min(minT, tx);
+                    validIntersection = true;
+                }
+            }
+
+            // Check Y planes (floor/ceiling)
+            if (Math.abs(ray.direction[1]) > 0.0001) {
+                const ty1 = (0 - ray.origin[1]) / ray.direction[1];  // Floor intersection
+                const ty2 = (height - ray.origin[1]) / ray.direction[1];  // Ceiling intersection
+
+                // Take the closest valid intersection
+                let ty = Infinity;
+
+                // Check both floor and ceiling intersections
+                if (ty1 > 0 && ray.origin[1] + ty1 * ray.direction[1] <= height) {
+                    ty = ty1;
+                }
+                if (ty2 > 0 && ray.origin[1] + ty2 * ray.direction[1] >= 0 && ty2 < ty) {
+                    ty = ty2;
+                }
+
+                if (ty < Infinity) {
+                    minT = Math.min(minT, ty);
+                    validIntersection = true;
+                }
+            }
+
+            // Check Z planes (front/back walls)
+            if (Math.abs(ray.direction[2]) > 0.0001) {
+                const tz1 = (-halfDepth - ray.origin[2]) / ray.direction[2];
+                const tz2 = (halfDepth - ray.origin[2]) / ray.direction[2];
+                const tz = tz1 > 0 ? tz1 : tz2 > 0 ? tz2 : Infinity;
+                if (tz > 0) {
+                    minT = Math.min(minT, tz);
+                    validIntersection = true;
+                }
+            }
+
+            // Use the intersection distance for ray length
+            const rayLength = validIntersection ? minT : 50.0; // Use default length if no intersection
+            const endPoint = vec3.scaleAndAdd(vec3.create(), ray.origin, ray.direction, rayLength);
+            vertices[vertexOffset++] = endPoint[0];
+            vertices[vertexOffset++] = endPoint[1];
+            vertices[vertexOffset++] = endPoint[2];
+            vertices[vertexOffset++] = ray.energy * 0.2;
+        }
+
+        // Recreate vertex buffer if needed
+        if (this.vertexBuffer.size < vertices.byteLength) {
+            this.vertexBuffer.destroy();
+            this.vertexBuffer = this.device.createBuffer({
+                size: vertices.byteLength,
+                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            });
+        }
+
+        // Update vertex buffer
+        this.device.queue.writeBuffer(this.vertexBuffer, 0, vertices);
+
+        // Draw rays
+        pass.setPipeline(this.pipeline);
+        pass.setBindGroup(0, this.uniformBindGroup);
+        pass.setVertexBuffer(0, this.vertexBuffer);
+        pass.draw(rays.length * 2, 1, 0, 0); // 2 vertices per ray
+    }
+}
+</code>
+
+src\raytracer\ray.ts:
+<code>
+import { vec3 } from 'gl-matrix';
+
+export class Ray {
+    private origin: vec3;
+    private direction: vec3;
+    private energyLow: number;
+    private energyMid: number;
+    private energyHigh: number;
+    private pathLength: number;
+    private bounces: number;
+    private isActive: boolean;
+    private time: number;
+    private phase: number;
+    private frequency: number;
+
+    constructor(origin: vec3, direction: vec3, initialEnergy: number = 1.0, frequency: number = 1000) {
+        this.origin = vec3.clone(origin);
+        this.direction = vec3.normalize(vec3.create(), direction);
+        this.energyLow = initialEnergy;
+        this.energyMid = initialEnergy;
+        this.energyHigh = initialEnergy;
+        this.pathLength = 0;
+        this.bounces = 0;
+        this.isActive = true;
+        this.time = 0;
+        this.phase = 0;
+        this.frequency = frequency;
+    }
+
+    public getOrigin(): vec3 {
+        return vec3.clone(this.origin);
+    }
+
+    public getDirection(): vec3 {
+        return vec3.clone(this.direction);
+    }
+
+    public getEnergy(): number {
+        return (this.energyLow + this.energyMid + this.energyHigh) / 3;
+    }
+
+    public getEnergyLow(): number {
+        return this.energyLow;
+    }
+
+    public getEnergyMid(): number {
+        return this.energyMid;
+    }
+
+    public getEnergyHigh(): number {
+        return this.energyHigh;
+    }
+
+    public getBounces(): number {
+        return this.bounces;
+    }
+
+    public isRayActive(): boolean {
+        return this.isActive;
+    }
+
+    public getTime(): number {
+        return this.time;
+    }
+
+    public getPhase(): number {
+        return this.phase;
+    }
+
+    public getFrequency(): number {
+        return this.frequency;
+    }
+
+    public updateTime(newTime: number): void {
+        this.time = newTime;
+    }
+
+    public updatePhase(newPhase: number): void {
+        this.phase = newPhase;
+    }
+
+    public updateRay(
+        newOrigin: vec3,
+        newDirection: vec3,
+        energyLoss: {low: number, mid: number, high: number},
+        distance: number,
+        temperature: number = 20,
+        humidity: number = 50
+    ): void {
+        vec3.copy(this.origin, newOrigin);
+        vec3.normalize(this.direction, newDirection);
+
+        // Apply frequency-dependent air absorption
+        const airAbsorption = this.calculateAirAbsorption(distance, temperature, humidity);
+
+        // Update energy levels with both material absorption and air absorption
+        this.energyLow *= (1 - energyLoss.low) * airAbsorption.low;
+        this.energyMid *= (1 - energyLoss.mid) * airAbsorption.mid;
+        this.energyHigh *= (1 - energyLoss.high) * airAbsorption.high;
+
+        this.pathLength += distance;
+        this.bounces++;
+
+        // Calculate speed of sound (simplified formula)
+        const speedOfSound = 331.3 + 0.6 * temperature;
+
+        // Update time
+        const travelTime = distance / speedOfSound;
+        this.time += travelTime;
+
+        // Update phase (2π * frequency * time)
+        const phaseChange = 2 * Math.PI * this.frequency * travelTime;
+        this.phase = (this.phase + phaseChange) % (2 * Math.PI); // Keep phase between 0 and 2π
+    }
+
+    private calculateAirAbsorption(distance: number, temperature: number, humidity: number): {
+        low: number,
+        mid: number,
+        high: number
+    } {
+        // ISO 9613-1 standard air absorption calculation
+        const T = temperature + 273.15;
+        const T0 = 293.15;
+        const T01 = T / T0;
+
+        const hr = humidity * Math.pow(T01, -4.17);
+
+        // Calculate absorption for each frequency band
+        const calculateBandAbsorption = (freq: number): number => {
+            const fr = freq * T01;
+            const alpha = 1.84e-11 * (1 / T01) * Math.sqrt(T01) +
+                Math.pow(fr, 2.5) * (0.10680 * Math.exp(-3352 / T) * 1 / (fr + 3352 / T)) +
+                Math.pow(fr, 2.5) * (0.01278 * Math.exp(-2239.1 / T) * 1 / (fr + 2239.1 / T));
+
+            return Math.exp(-alpha * distance);
+        };
+
+        return {
+            low: calculateBandAbsorption(250),   // Center frequency for low band
+            mid: calculateBandAbsorption(1000),  // Center frequency for mid band
+            high: calculateBandAbsorption(4000)  // Center frequency for high band
+        };
+    }
+
+    public deactivate(): void {
+        this.isActive = false;
+    }
+}
+</code>
+
+src\raytracer\raytracer.ts:
+<code>
+import { vec3 } from 'gl-matrix';
+import { Ray } from './ray';
+import { Room } from '../room/room';
+import { Sphere } from '../objects/sphere';
+import { RayRenderer } from './ray-renderer';
+import { WallMaterial } from '../room/room-materials';
+import { loadHRTFData } from '../sound/hrtf-loader';
+import { Camera } from '../camera/camera';
+
+// Type definitions for image source method
+interface ImageSource {
+    position: vec3;
+    imageOrder: number;
+    reflectionSequence: number[];
+}
+
+interface RayPath {
+    origin: vec3;
+    direction: vec3;
+    energy: number;
+    bounces: number[];
+    time: number;
+}
+
+export interface RayTracerConfig {
+    numRays: number;
+    maxBounces: number;
+    minEnergy: number;
+}
+
+export interface RayHit {
+    position: vec3;
+    energy: number;
+    energyLow: number;
+    energyMid: number;
+    energyHigh: number;
+    time: number;      // Arrival time
+    phase: number;     // Phase at hit
+    frequency: number; // Frequency of the ray
+    hrtfIndex?: number; // HRTF lookup index for spatial audio
+    incomingDirection: vec3; // Added with semicolon
+ 
+}
+
+export interface RayPathPoint extends RayHit {
+    bounceNumber: number;
+    rayIndex: number;
+    direction: vec3;      // Add direction to resolve TypeScript error
+}
+
+export interface ImpulseResponse {
+    time: Float32Array;     // Time points
+    amplitude: Float32Array; // Amplitude values
+    sampleRate: number;     // Sample rate of the impulse response
+    frequencies: Float32Array; // Frequency content at each time point
+}
+
+export class RayTracer {
+    private device: GPUDevice;
+    private soundSource: Sphere;
+    private room: Room;
+    private config: RayTracerConfig;
+    private rays: Ray[] = [];
+    private hits: RayHit[] = [];
+    private rayPaths: { origin: vec3, direction: vec3, energy: number }[] = [];
+    private rayPathPoints: RayPathPoint[] = []; // Store all points along ray paths
+    private readonly VISIBILITY_THRESHOLD = 0.05; // Rays below 5% energy become invisible
+    private readonly SPEED_OF_SOUND = 343.0; // Speed of sound in m/s at 20°C
+    private readonly AIR_TEMPERATURE = 20.0;  // Air temperature in Celsius
+    private rayRenderer: RayRenderer;
+    private listenerBuffer!: GPUBuffer;
+    private rayHitsBuffer!: GPUBuffer;
+    private spatialIRBuffer!: GPUBuffer;
+    private paramsBuffer!: GPUBuffer;
+    private acousticsBuffer!: GPUBuffer;
+    private wavePropertiesBuffer!: GPUBuffer;
+    private roomMaterialsBuffer!: GPUBuffer;
+ 
+    
+    private computePipeline!: GPUComputePipeline;
+    private hrtfBuffer!: GPUBuffer; // Ensure only one declaration
+
+    constructor(
+        device: GPUDevice,
+        soundSource: Sphere,
+        room: Room,
+        config: RayTracerConfig = {
+            numRays: 1000,
+            maxBounces: 50,
+            minEnergy: 0.01
+        }
+    )
+    {
+        this.device = device;
+        this.soundSource = soundSource;
+        this.room = room;
+        this.config = config;
+        this.rayRenderer = new RayRenderer(device);
+        // Removed 'await' from constructor
+    }
+    private generateRays(): void {
+        this.rays = [];
+        const sourcePos = this.soundSource.getPosition();
+        const sphereRadius = this.soundSource.getRadius();
+
+        // Define frequency bands for analysis
+        const frequencies = [250, 500, 1000, 2000, 4000]; // Hz
+
+        for (let i = 0; i < this.config.numRays; i++) {
+            // Generate random direction using spherical coordinates
+            const theta = 2 * Math.PI * Math.random();
+            const phi = Math.acos(2 * Math.random() - 1);
+
+            const direction = vec3.fromValues(
+                Math.sin(phi) * Math.cos(theta),
+                Math.sin(phi) * Math.sin(theta),
+                Math.cos(phi)
+            );
+
+            // Calculate the ray origin on the sphere's surface
+            const rayOrigin = vec3.create();
+            vec3.scale(rayOrigin, direction, sphereRadius);
+            vec3.add(rayOrigin, rayOrigin, sourcePos);
+
+            // Distribute rays across frequency bands
+            const frequency = frequencies[i % frequencies.length];
+            
+            // Create ray starting from the sphere's surface
+            this.rays.push(new Ray(rayOrigin, direction, 1.0, frequency));
+        }
+    }
+
+    private isPointInRoom(point: vec3): boolean {
+        const { width, height, depth } = this.room.config.dimensions;
+        const halfWidth = width / 2;
+        const halfDepth = depth / 2;
+
+        return point[0] >= -halfWidth && point[0] <= halfWidth &&
+               point[1] >= 0 && point[1] <= height &&
+               point[2] >= -halfDepth && point[2] <= halfDepth;
+    }
+
+    public async calculateRayPaths(camera?: Camera): Promise<void> {
+        // Clear previous data
+        this.hits = [];
+        this.rays = [];
+        this.rayPaths = [];
+        this.rayPathPoints = [];
+
+        // Generate initial rays
+        this.generateRays();
+
+        // Store initial ray paths
+        for (const ray of this.rays) {
+            this.rayPaths.push({
+                origin: ray.getOrigin(),
+                direction: ray.getDirection(),
+                energy: ray.getEnergy()
+            });
+        }
+
+        // Calculate early reflections using image source method
+        await this.calculateEarlyReflections(camera);
+
+        // Calculate late reflections using stochastic ray tracing
+        await this.calculateLateReflections(camera);
+
+        console.log(`Completed ray tracing with early and late reflections`);
+    }
+
+    private async calculateEarlyReflections(camera?: Camera): Promise<void> {
+        const sourcePos = this.soundSource.getPosition();
+        const maxOrder = 3; // Maximum reflection order for image sources
+
+        // Generate image sources up to maxOrder
+        const imageSources = this.generateImageSources(sourcePos, maxOrder);
+
+        // Process each image source
+        for (const imageSource of imageSources) {
+            const path = this.validateImageSourcePath(imageSource);
+            if (path) {
+                this.processImageSourcePath(path, camera);
+            }
+        }
+    }
+
+    private generateImageSources(sourcePos: vec3, maxOrder: number): ImageSource[] {
+        const imageSources: ImageSource[] = [];
+        // Implementation of image source generation
+        // This is a recursive process that mirrors the source across room surfaces
+        return imageSources;
+    }
+
+    private validateImageSourcePath(imageSource: ImageSource): RayPath | null {
+        // Validate visibility and calculate reflection path
+        // Returns null if path is invalid (blocked)
+        return null; // Placeholder
+    }
+
+    private processImageSourcePath(path: RayPath, camera?: Camera): void {
+        // Calculate energy and add to hits
+        // Early reflections are more precise than stochastic rays
+        // For now, this is a placeholder - when implemented, it should also calculate HRTF indices
+    }
+
+    private async calculateLateReflections(camera?: Camera): Promise<void> {
+        const { width, height, depth } = this.room.config.dimensions;
+        const halfWidth = width / 2;
+        const halfDepth = depth / 2;
+
+        // Define room planes (normal points inward)
+        const planes = [
+            // Use walls material for all wall surfaces
+            { normal: vec3.fromValues(1, 0, 0), d: halfWidth,  material: this.room.config.materials.walls },   // Left wall
+            { normal: vec3.fromValues(-1, 0, 0), d: halfWidth, material: this.room.config.materials.walls },  // Right wall
+            { normal: vec3.fromValues(0, 1, 0), d: 0,         material: this.room.config.materials.floor },   // Floor
+            { normal: vec3.fromValues(0, -1, 0), d: height,   material: this.room.config.materials.ceiling }, // Ceiling
+            { normal: vec3.fromValues(0, 0, 1), d: halfDepth, material: this.room.config.materials.walls },   // Back wall
+            { normal: vec3.fromValues(0, 0, -1), d: halfDepth, material: this.room.config.materials.walls },  // Front wall
+        ];
+
+        // Process each ray
+        for (let rayIndex = 0; rayIndex < this.rays.length; rayIndex++) {
+            const ray = this.rays[rayIndex];
+            let bounces = 0;
+            let currentTime = 0; // Track cumulative time for this ray
+            
+            // Calculate HRTF index for initial point if camera is provided
+            let initialHrtfIndex: number | undefined;
+            if (camera) {
+                const listenerPos = camera.getPosition();
+                const toListener = vec3.subtract(vec3.create(), listenerPos, ray.getOrigin());
+                vec3.normalize(toListener, toListener);
+                
+                // Convert to spherical coordinates
+                const azimuth = Math.atan2(toListener[2], toListener[0]); // -π to π
+                const elevation = Math.asin(toListener[1]); // -π/2 to π/2
+                
+                // Map to HRTF indices (assuming 360° azimuth, 180° elevation)
+                const azimuthIndex = Math.floor(((azimuth + Math.PI) / (2 * Math.PI)) * 360) % 360;
+                const elevationIndex = Math.floor(((elevation + Math.PI/2) / Math.PI) * 180) % 180;
+                
+                initialHrtfIndex = elevationIndex * 360 + azimuthIndex;
+            }
+
+            // Store initial point
+            this.rayPathPoints.push({
+                // Initial ray position without hit data (no surface interaction yet)
+                position: ray.getOrigin(),
+                direction: ray.getDirection(), // Add missing direction property
+                energy: ray.getEnergy(),
+                energyLow: ray.getEnergyLow(),
+                energyMid: ray.getEnergyMid(),
+                energyHigh: ray.getEnergyHigh(),
+                time: 0,
+                phase: ray.getPhase(),
+                frequency: ray.getFrequency(),
+                bounceNumber: 0,
+                rayIndex: rayIndex,
+                incomingDirection: ray.getDirection(),
+                hrtfIndex: initialHrtfIndex
+            });
+
+            while (ray.isRayActive() && bounces < this.config.maxBounces && ray.getEnergy() > this.config.minEnergy) {
+                let closestT = Infinity;
+                let closestPlane = null;
+                const origin = ray.getOrigin();
+                const direction = ray.getDirection();
+
+                for (const plane of planes) {
+                    const denom = vec3.dot(direction, plane.normal);
+                    if (Math.abs(denom) > 0.0001) { // Avoid parallel rays
+                        const t = -(vec3.dot(origin, plane.normal) + plane.d) / denom;
+                        if (t > 0.0001 && t < closestT) {
+                            closestT = t;
+                            closestPlane = plane;
+                        }
+                    }
+                }
+
+                if (closestPlane && closestPlane.material) {
+                    const hitPoint = vec3.scaleAndAdd(vec3.create(), origin, direction, closestT - 0.0001);
+                    
+                    // Calculate time taken for the ray to reach this point
+                    const distanceTraveled = vec3.distance(origin, hitPoint);
+                    const travelTime = this.calculateTravelTime(distanceTraveled);
+                    currentTime += travelTime;
+
+                    // Calculate phase change based on distance and frequency
+                    const wavelength = this.calculateSpeedOfSound() / ray.getFrequency();
+                    const phaseChange = (2 * Math.PI * distanceTraveled) / wavelength;
+                    const newPhase = (ray.getPhase() + phaseChange) % (2 * Math.PI);
+
+                    // Calculate HRTF index for hit point if camera is provided
+                    let hitHrtfIndex: number | undefined;
+                    if (camera) {
+                        const listenerPos = camera.getPosition();
+                        const toListener = vec3.subtract(vec3.create(), listenerPos, hitPoint);
+                        vec3.normalize(toListener, toListener);
+                        
+                        // Convert to spherical coordinates
+                        const azimuth = Math.atan2(toListener[2], toListener[0]); // -π to π
+                        const elevation = Math.asin(toListener[1]); // -π/2 to π/2
+                        
+                        // Map to HRTF indices (assuming 360° azimuth, 180° elevation)
+                        const azimuthIndex = Math.floor(((azimuth + Math.PI) / (2 * Math.PI)) * 360) % 360;
+                        const elevationIndex = Math.floor(((elevation + Math.PI/2) / Math.PI) * 180) % 180;
+                        
+                        hitHrtfIndex = elevationIndex * 360 + azimuthIndex;
+                    }
+
+                    // Explicitly construct hit data instead of spreading undefined 'hit'
+                    this.rayPathPoints.push({
+                        position: vec3.clone(hitPoint),
+                        direction: direction, // Add direction property
+                        energy: ray.getEnergy(),
+                        energyLow: ray.getEnergyLow(),
+                        energyMid: ray.getEnergyMid(),
+                        energyHigh: ray.getEnergyHigh(),
+                        time: currentTime,
+                        phase: newPhase,
+                        frequency: ray.getFrequency(),
+                        bounceNumber: bounces + 1, // Increment bounce count
+                        rayIndex: rayIndex,
+                        incomingDirection: direction, // Define incoming direction
+                        hrtfIndex: hitHrtfIndex
+                    });
+
+                    // Update ray properties with new time and phase
+                    ray.updateTime(currentTime);
+                    ray.updatePhase(newPhase);
+
+                    // Calculate reflection
+                    const reflected = vec3.create();
+                    const dot = vec3.dot(direction, closestPlane.normal);
+                    vec3.scale(reflected, closestPlane.normal, -2 * dot);
+                    vec3.add(reflected, direction, reflected);
+
+                    // Apply scattering based on frequency-dependent coefficients
+                    const material = closestPlane.material;
+                    
+                    
+                    
+                    const avgScattering = (material.scatteringLow + material.scatteringMid + material.scatteringHigh) / 3;
+
+                    if (avgScattering > 0) {
+                        // Generate random vector for scattering
+                        const randomDir = this.generateRandomDirection(closestPlane.normal, material.roughness);
+
+                        // Blend reflected direction with random direction based on scattering coefficient
+                        vec3.lerp(reflected, reflected, randomDir, avgScattering);
+                        vec3.normalize(reflected, reflected);
+                    }
+
+                    // Move new origin slightly away from the surface
+                    const newOrigin = vec3.scaleAndAdd(vec3.create(), hitPoint, closestPlane.normal, 0.0001);
+
+                    // Get material properties for frequency-dependent absorption
+                    // The energyLoss object is used in updateRay to apply material absorption
+                    // along with air absorption to the ray's energy values
+                    const energyLoss = {
+                        low: material.absorptionLow,
+                        mid: material.absorptionMid,
+                        high: material.absorptionHigh
+                    };
+
+                    // Calculate HRTF index if camera is provided
+                    let hrtfIndex: number | undefined;
+                    if (camera) {
+                        const listenerPos = camera.getPosition();
+                        const toListener = vec3.subtract(vec3.create(), listenerPos, hitPoint);
+                        vec3.normalize(toListener, toListener);
+                        
+                        // Convert to spherical coordinates
+                        const azimuth = Math.atan2(toListener[2], toListener[0]); // -π to π
+                        const elevation = Math.asin(toListener[1]); // -π/2 to π/2
+                        
+                        // Map to HRTF indices (assuming 360° azimuth, 180° elevation)
+                        const azimuthIndex = Math.floor(((azimuth + Math.PI) / (2 * Math.PI)) * 360) % 360;
+                        const elevationIndex = Math.floor(((elevation + Math.PI/2) / Math.PI) * 180) % 180;
+                        
+                        hrtfIndex = elevationIndex * 360 + azimuthIndex;
+                    }
+
+                    // Record hit with frequency-dependent energies
+                    this.hits.push({
+                        position: hitPoint,
+                        energy: ray.getEnergy(),
+                        time: currentTime,
+                        energyLow: ray.getEnergyLow(),
+                        energyMid: ray.getEnergyMid(),
+                        energyHigh: ray.getEnergyHigh(),
+                        phase: newPhase,
+                        frequency: ray.getFrequency(),
+                        hrtfIndex: hrtfIndex,
+                        incomingDirection: vec3.clone(direction)
+                        
+                    });
+
+                    // Update ray with environmental parameters
+                    ray.updateRay(
+                        newOrigin,
+                        reflected,
+                        energyLoss,
+                        closestT,
+                        this.room.getTemperature(),
+                        this.room.getHumidity()
+                    );
+
+                    // Store ray segment if energy is above visibility threshold
+                    if (ray.getEnergy() > this.VISIBILITY_THRESHOLD) {
+                        this.rayPaths.push({
+                            origin: newOrigin,
+                            direction: vec3.clone(reflected),
+                            energy: ray.getEnergy()
+                        });
+                    }
+
+                    bounces++;
+                } else {
+                    // No intersection or no material, deactivate ray
+                    ray.deactivate();
+                }
+            }
+        }
+        console.log(`Completed late reflections`);
+    }
+
+    private calculateSpeedOfSound(temperature: number = this.AIR_TEMPERATURE): number {
+        // Speed of sound formula: c = 331.3 + 0.606 * T
+        // where T is temperature in Celsius
+        return 331.3 + 0.606 * temperature;
+    }
+
+    private calculateTravelTime(distance: number): number {
+        // Time = Distance / Speed
+        return distance / this.calculateSpeedOfSound();
+    }
+
+    private generateRandomDirection(normal: vec3, roughness: number): vec3 {
+        // Create orthonormal basis with normal
+        const basis = this.createOrthonormalBasis(normal);
+
+        // Generate random direction with roughness-based perturbation
+        const phi = 2 * Math.PI * Math.random();
+        const r = roughness * Math.sqrt(-Math.log(Math.random()));
+
+        const x = r * Math.cos(phi);
+        const y = r * Math.sin(phi);
+        const z = Math.sqrt(Math.max(0.0, 1 - x*x - y*y));
+
+        // Transform direction from local space to world space
+        const result = vec3.create();
+        vec3.scale(result, basis[0], x);
+        vec3.scaleAndAdd(result, result, basis[1], y);
+        vec3.scaleAndAdd(result, result, basis[2], z);
+
+        return vec3.normalize(vec3.create(), result);
+    }
+
+    private createOrthonormalBasis(normal: vec3): vec3[] {
+        const tangent = vec3.create();
+        const bitangent = vec3.create();
+
+        // Find least dominant axis of normal
+        const absX = Math.abs(normal[0]);
+        const absY = Math.abs(normal[1]);
+        const absZ = Math.abs(normal[2]);
+
+        if (absX <= absY && absX <= absZ) {
+            vec3.set(tangent, 0, -normal[2], normal[1]);
+        } else if (absY <= absX && absY <= absZ) {
+            vec3.set(tangent, -normal[2], 0, normal[0]);
+        } else {
+            vec3.set(tangent, -normal[1], normal[0], 0);
+        }
+
+        vec3.normalize(tangent, tangent);
+        vec3.cross(bitangent, normal, tangent);
+        vec3.normalize(bitangent, bitangent);
+
+        return [tangent, bitangent, normal];
+    }
+
+    public getRayHits(): RayHit[] {
+        return this.hits;
+    }
+
+    async initializeHRTF(): Promise<void> {
+        const hrtfData = await loadHRTFData();
+        this.hrtfBuffer = this.device.createBuffer({
+            size: hrtfData.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            label: 'HRTF Coefficients'
+        });
+        this.device.queue.writeBuffer(this.hrtfBuffer, 0, hrtfData as BufferSource);
+    }
+
+    private applyWindowFunction(t: number, windowSize: number): number {
+        // Hann window function: 0.5 * (1 - cos(2π * t/N))
+        return 0.5 * (1 - Math.cos(2 * Math.PI * t / windowSize));
+    }
+
+    private calculateDopplerFrequency(point: RayPathPoint, nextPoint: RayPathPoint | null): number {
+        if (!nextPoint) return point.frequency;
+
+        const speedOfSound = this.calculateSpeedOfSound();
+        
+        // Calculate ray velocity between points
+        const distance = vec3.distance(point.position, nextPoint.position);
+        const timeDiff = nextPoint.time - point.time;
+        const rayVelocity = distance / timeDiff;
+
+        // Calculate direction vector between points
+        const direction = vec3.create();
+        vec3.subtract(direction, nextPoint.position, point.position);
+        vec3.normalize(direction, direction);
+
+        // Project ray velocity onto direction to receiver
+        // For simplicity, assume receiver is at (0,0,0)
+        const toReceiver = vec3.create();
+        vec3.negate(toReceiver, point.position);
+        vec3.normalize(toReceiver, toReceiver);
+        
+        const relativeVelocity = rayVelocity * vec3.dot(direction, toReceiver);
+
+        // Doppler equation: f' = f * (c / (c ± v))
+        // where c is speed of sound, v is relative velocity
+        return point.frequency * (speedOfSound / (speedOfSound - relativeVelocity));
+    }
+
+    public generateImpulseResponse(sampleRate: number = 44100): ImpulseResponse {
+        if (this.rayPathPoints.length === 0) {
+            throw new Error("No ray path points available. Run calculateRayPaths first.");
+        }
+
+        // Sort ray path points by time
+        const sortedPoints = [...this.rayPathPoints].sort((a, b) => a.time - b.time);
+
+        // Find the maximum time to determine the length of the impulse response
+        const maxTime = sortedPoints[sortedPoints.length - 1].time;
+        const numSamples = Math.ceil(maxTime * sampleRate);
+
+        // Create arrays for the impulse response
+        const timeArray = new Float32Array(numSamples);
+        const amplitudeArray = new Float32Array(numSamples);
+        const frequencyArray = new Float32Array(numSamples);
+
+        // Fill time array
+        for (let i = 0; i < numSamples; i++) {
+            timeArray[i] = i / sampleRate;
+        }
+
+        // Process each path point and add its contribution to the impulse response
+        for (let i = 0; i < sortedPoints.length; i++) {
+            const point = sortedPoints[i];
+            const nextPoint = i < sortedPoints.length - 1 ? sortedPoints[i + 1] : null;
+            
+            const startSample = Math.floor(point.time * sampleRate);
+            const amplitude = Math.sqrt(point.energy); // Convert energy to amplitude
+
+            // Calculate Doppler-shifted frequency
+            const dopplerFrequency = this.calculateDopplerFrequency(point, nextPoint);
+
+            // Add the contribution of this point to nearby samples
+            const windowSize = Math.ceil(sampleRate / dopplerFrequency);
+            
+            for (let j = 0; j < windowSize && (startSample + j) < numSamples; j++) {
+                const t = timeArray[startSample + j];
+                
+                // Apply window function to avoid discontinuities
+                const windowValue = this.applyWindowFunction(j, windowSize);
+                
+                // Calculate phase with Doppler-shifted frequency
+                const phase = point.phase + 2 * Math.PI * dopplerFrequency * (t - point.time);
+                
+                // Apply frequency-dependent absorption based on distance and material
+                const distanceAttenuation = Math.exp(-0.1 * dopplerFrequency * point.time); // Simple frequency-dependent air absorption
+                
+                // Combine all factors for final amplitude
+                const contribution = amplitude * windowValue * distanceAttenuation * Math.sin(phase);
+                
+                // Add to impulse response
+                amplitudeArray[startSample + j] += contribution;
+                
+                // Store frequency information (weighted average based on energy)
+                const currentFreq = frequencyArray[startSample + j];
+                const currentEnergy = Math.pow(amplitudeArray[startSample + j], 2);
+                const newEnergy = Math.pow(contribution, 2);
+                frequencyArray[startSample + j] = 
+                    (currentFreq * currentEnergy + dopplerFrequency * newEnergy) / 
+                    (currentEnergy + newEnergy || 1);
+            }
+        }
+
+        // Normalize the impulse response
+        const maxAmplitude = Math.max(...Array.from(amplitudeArray).map(Math.abs));
+        if (maxAmplitude > 0) {
+            for (let i = 0; i < numSamples; i++) {
+                amplitudeArray[i] /= maxAmplitude;
+            }
+        }
+
+        return {
+            time: timeArray,
+            amplitude: amplitudeArray,
+            sampleRate: sampleRate,
+            frequencies: frequencyArray
+        };
+    }
+
+    public render(pass: GPURenderPassEncoder, viewProjection: Float32Array): void {
+        
+        this.rayRenderer.render(
+            pass,
+            viewProjection,
+            this.rayPaths,
+            this.room.config.dimensions
+        );
+    }
+
+    // Add bind group entry setup for HRTF buffer
+    private setupComputeBindGroup(): GPUBindGroup {
+        return this.device.createBindGroup({
+            layout: this.computePipeline.getBindGroupLayout(0),
+            entries: [
+               { binding: 0, resource: { buffer: this.listenerBuffer } },
+               { binding: 1, resource: { buffer: this.rayHitsBuffer } },
+               { binding: 2, resource: { buffer: this.spatialIRBuffer } },
+               { binding: 3, resource: { buffer: this.paramsBuffer } },
+               { binding: 4, resource: { buffer: this.acousticsBuffer } },
+               { binding: 5, resource: { buffer: this.wavePropertiesBuffer } },
+               { binding: 6, resource: { buffer: this.roomMaterialsBuffer } },
+               { binding: 7, resource: { buffer: this.hrtfBuffer } },
+            ],
+        });
+    }
+}
+</code>
+
+src\research\diffraction-models.md:
+<code>
+# Diffraction Model Research
+
+## Evaluation Criteria
+1. Computational complexity
+2. Physical accuracy
+3. GPU implementation feasibility
+
+## Candidate Models
+
+### Uniform Theory of Diffraction (UTD)
+- **Pros**:
+  - Well-established for audio frequencies
+  - Edge-diffraction handling
+- **Cons**:
+  - Requires explicit edge detection
+  - Increased ray complexity
+
+### Wave-based Approaches
+- **Pros**:
+  - Physically accurate
+  - Handles complex geometries
+- **Cons**:
+  - Computationally expensive
+  - Difficult to parallelize
+
+### Hybrid Approach
+- Combine UTD for primary diffraction with:
+  - Wavelet-based approximations for secondary effects
+  - Precomputed diffraction kernels
+
+## Implementation Roadmap
+```mermaid
+graph TD
+    A[Edge Detection] --> B[UTD Kernel]
+    B --> C[Phase-aware Energy Summation]
+    C --> D[GPU Acceleration]
+```
+
+## References
+- IEEE 2018: "Real-Time Audio Diffraction Using Modified UTD"
+</code>
+
+src\room\room-materials.ts:
+<code>
+export interface RoomMaterials {
+    left:   WallMaterial;
+    right:  WallMaterial;
+    top:    WallMaterial;
+    bottom: WallMaterial;
+    front:  WallMaterial;
+    back:   WallMaterial;
+}
+
+export interface WallMaterial {
+    absorptionLow: number;   // 125-500Hz
+    absorptionMid: number;   // 500-2000Hz
+    absorptionHigh: number;  // 2000-8000Hz
+
+    scatteringLow: number;   // Low frequency scattering
+    scatteringMid: number;   // Mid frequency scattering
+    scatteringHigh: number;  // High frequency scattering
+
+    roughness: number;       // 0-1, affects reflection pattern
+    phaseShift: number;      // Fixed phase shift on reflection (radians)
+    phaseRandomization: number; // Max random phase variation (radians)
+}
+
+// Add standard material presets
+export const MATERIAL_PRESETS = {
+    CONCRETE: {
+        absorptionLow: 0.08,
+        absorptionMid: 0.08,
+        absorptionHigh: 0.04,
+        scatteringLow: 0.1,
+        scatteringMid: 0.15,
+        scatteringHigh: 0.2,
+        roughness: 0.25
+    },
+    WOOD: {
+        absorptionLow: 0.15,
+        absorptionMid: 0.10,
+        absorptionHigh: 0.07,
+        scatteringLow: 0.2,
+        scatteringMid: 0.3,
+        scatteringHigh: 0.4,
+        roughness: 0.3
+    },
+    
+};
+</code>
+
+src\room\room.ts:
+<code>
+import { mat4, vec3 } from 'gl-matrix';
+import { WallMaterial } from './room-materials';
+
+enum Surface {
+    FLOOR = 0.0,
+    CEILING = 1.0,
+    WALL_FRONT_BACK = 2.0,
+    WALL_LEFT_RIGHT = 3.0
+}
+
+export interface RoomConfig {
+    dimensions: RoomDimensions;
+    materials: RoomMaterials;
+}
+
+export interface RoomDimensions {
+    width: number;
+    height: number;
+    depth: number;
+}
+
+export interface RoomMaterials {
+    walls: WallMaterial;
+    ceiling: WallMaterial;
+    floor: WallMaterial;
+}
+
+// Import WallMaterial interface from room-materials.ts
+
+// Add default materials
+const DEFAULT_WALL_MATERIAL: WallMaterial = {
+    absorptionLow: 0.3,
+    absorptionMid: 0.2,
+    absorptionHigh: 0.1,
+    scatteringLow: 0.5,
+    scatteringMid: 0.5,
+    scatteringHigh: 0.5,
+    roughness: 0.1,
+    phaseShift: 0.0,
+    phaseRandomization: 0.0
+};
+
+const DEFAULT_ROOM_MATERIALS: RoomMaterials = {
+    walls: DEFAULT_WALL_MATERIAL,
+    ceiling: DEFAULT_WALL_MATERIAL, // Or a specific default for ceiling
+    floor: DEFAULT_WALL_MATERIAL,   // Or a specific default for floor
+};
+
+export class Room {
+    private device: GPUDevice;
+    private pipeline!: GPURenderPipeline;
+    private vertexBuffer!: GPUBuffer;
+    private indexBuffer!: GPUBuffer;
+    private uniformBuffer!: GPUBuffer;
+    private uniformBindGroup!: GPUBindGroup;
+    private projectionMatrix: mat4;
+    private viewMatrix: mat4;
+    public config: RoomConfig;
+
+    constructor(device: GPUDevice, config: RoomConfig) {
+        this.device = device;
+
+        // Apply default materials if not provided
+        this.config = {
+            dimensions: config.dimensions,
+            materials: { ...DEFAULT_ROOM_MATERIALS, ...config.materials }, // Merge defaults with provided
+        };
+        // Ensure that individual wall materials are also defaulted
+        this.config.materials.walls = { ...DEFAULT_WALL_MATERIAL, ...this.config.materials.walls };
+        this.config.materials.ceiling = { ...DEFAULT_WALL_MATERIAL, ...this.config.materials.ceiling };
+        this.config.materials.floor = { ...DEFAULT_WALL_MATERIAL, ...this.config.materials.floor };
+
+        this.projectionMatrix = mat4.create();
+        this.viewMatrix = mat4.create();
+
+        // Create uniform buffer for view-projection matrix
+        this.uniformBuffer = device.createBuffer({
+            size: 16 * 4, // 4x4 matrix of floats
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        // Initialize buffers and pipeline
+        this.initializeGeometry();
+        this.createPipeline();
+
+        // Create bind group after pipeline creation
+        this.uniformBindGroup = device.createBindGroup({
+            layout: this.pipeline.getBindGroupLayout(0),
+            entries: [{
+                binding: 0,
+                resource: {
+                    buffer: this.uniformBuffer,
+                },
+            }],
+        });
+    }
+
+    private initializeGeometry(): void {
+        const { width, height, depth } = this.config.dimensions;
+        const halfWidth = width / 2;
+        const halfDepth = depth / 2;
+
+        // Generate vertices for a proper square room, centered at origin
+        const vertices = new Float32Array([
+            // Position (XYZ) + Surface Type
+            // Floor (Y=0)
+            -halfWidth, 0, -halfDepth, Surface.FLOOR,
+            halfWidth, 0, -halfDepth, Surface.FLOOR,
+            halfWidth, 0, halfDepth, Surface.FLOOR,
+            -halfWidth, 0, halfDepth, Surface.FLOOR,
+
+            // Ceiling (Y=height)
+            -halfWidth, height, -halfDepth, Surface.CEILING,
+            halfWidth, height, -halfDepth, Surface.CEILING,
+            halfWidth, height, halfDepth, Surface.CEILING,
+            -halfWidth, height, halfDepth, Surface.CEILING,
+
+            // Front wall (Z=halfDepth)
+            -halfWidth, 0, halfDepth, Surface.WALL_FRONT_BACK,
+            halfWidth, 0, halfDepth, Surface.WALL_FRONT_BACK,
+            halfWidth, height, halfDepth, Surface.WALL_FRONT_BACK,
+            -halfWidth, height, halfDepth, Surface.WALL_FRONT_BACK,
+
+            // Back wall (Z=-halfDepth)
+            -halfWidth, 0, -halfDepth, Surface.WALL_FRONT_BACK,
+            halfWidth, 0, -halfDepth, Surface.WALL_FRONT_BACK,
+            halfWidth, height, -halfDepth, Surface.WALL_FRONT_BACK,
+            -halfWidth, height, -halfDepth, Surface.WALL_FRONT_BACK,
+
+            // Left wall (X=-halfWidth)
+            -halfWidth, 0, -halfDepth, Surface.WALL_LEFT_RIGHT,
+            -halfWidth, 0, halfDepth, Surface.WALL_LEFT_RIGHT,
+            -halfWidth, height, halfDepth, Surface.WALL_LEFT_RIGHT,
+            -halfWidth, height, -halfDepth, Surface.WALL_LEFT_RIGHT,
+
+            // Right wall (X=halfWidth)
+            halfWidth, 0, -halfDepth, Surface.WALL_LEFT_RIGHT,
+            halfWidth, 0, halfDepth, Surface.WALL_LEFT_RIGHT,
+            halfWidth, height, halfDepth, Surface.WALL_LEFT_RIGHT,
+            halfWidth, height, -halfDepth, Surface.WALL_LEFT_RIGHT,
+        ]);
+
+        // Define indices for drawing triangles
+        const indices = new Uint16Array([
+            // Floor
+            0, 1, 2,    0, 2, 3,
+            // Ceiling
+            4, 6, 5,    4, 7, 6,  // Note: Changed winding order for ceiling
+            // Front wall
+            8, 9, 10,   8, 10, 11,
+            // Back wall
+            12, 14, 13, 12, 15, 14,
+            // Left wall
+            16, 17, 18, 16, 18, 19,
+            // Right wall
+            20, 22, 21, 20, 23, 22
+        ]);
+
+        // Create and initialize the vertex buffer
+        this.vertexBuffer = this.device.createBuffer({
+            size: vertices.byteLength,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        });
+        this.device.queue.writeBuffer(this.vertexBuffer, 0, vertices);
+
+        // Create and initialize the index buffer
+        this.indexBuffer = this.device.createBuffer({
+            size: indices.byteLength,
+            usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+        });
+        this.device.queue.writeBuffer(this.indexBuffer, 0, indices);
+    }
+
+    private createPipeline(): void {
+        const shaderModule = this.device.createShaderModule({
+            code: `
+                struct VertexInput {
+                    @location(0) position: vec3f,
+                    @location(1) surfaceType: f32
+                };
+
+                struct VertexOutput {
+                    @builtin(position) position: vec4f,
+                    @location(0) surfaceType: f32,
+                    @location(1) worldPos: vec3f
+                };
+
+                struct Uniforms {
+                    viewProjectionMatrix: mat4x4f
+                };
+
+                @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+                @vertex
+                fn vertexMain(input: VertexInput) -> VertexOutput {
+                    var output: VertexOutput;
+                    output.position = uniforms.viewProjectionMatrix * vec4f(input.position, 1.0);
+                    output.surfaceType = input.surfaceType;
+                    output.worldPos = input.position;
+                    return output;
+                }
+
+                @fragment
+                fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
+                    // Using more neutral, muted colors
+                    let floorColor = vec3f(0.6, 0.55, 0.5);     // Beige/wood tone
+                    let ceilingColor = vec3f(0.95, 0.95, 0.95); // Off-white
+                    let wallColorFB = vec3f(0.8, 0.8, 0.75);    // Light warm gray
+                    let wallColorLR = vec3f(0.75, 0.75, 0.7);   // Slightly darker warm gray
+
+                    var baseColor: vec3f;
+                    if (input.surfaceType < 0.5) {          // FLOOR = 0.0
+                        baseColor = floorColor;
+                    } else if (input.surfaceType < 1.5) {   // CEILING = 1.0
+                        baseColor = ceilingColor;
+                    } else if (input.surfaceType < 2.5) {   // WALL_FRONT_BACK = 2.0
+                        baseColor = wallColorFB;
+                    } else {                                // WALL_LEFT_RIGHT = 3.0
+                        baseColor = wallColorLR;
+                    }
+
+                    // Simple lighting
+                    let lightPos = vec3f(2.0, 2.0, 2.0);
+                    let lightDir = normalize(lightPos - input.worldPos);
+
+                    // Calculate normal from world position derivatives
+                    let normal = normalize(cross(
+                        dpdx(input.worldPos),
+                        dpdy(input.worldPos)
+                    ));
+
+                    // Basic lighting calculation with stronger ambient
+                    let ambient = 0.7;  // Increased ambient light
+                    let diffuse = max(dot(normal, lightDir), 0.0) * 0.3;
+                    let finalColor = baseColor * (ambient + diffuse);
+
+                    return vec4f(finalColor, 1.0);
+                }
+            `
+        });
+
+        const pipelineLayout = this.device.createPipelineLayout({
+            bindGroupLayouts: [this.device.createBindGroupLayout({
+                entries: [{
+                    binding: 0,
+                    visibility: GPUShaderStage.VERTEX,
+                    buffer: { type: 'uniform' }
+                }]
+            })]
+        });
+
+        this.pipeline = this.device.createRenderPipeline({
+            layout: pipelineLayout,
+            vertex: {
+                module: shaderModule,
+                entryPoint: 'vertexMain',
+                buffers: [{
+                    arrayStride: 16, // vec3 position (12 bytes) + float surfaceType (4 bytes)
+                    attributes: [
+                        {
+                            format: 'float32x3',
+                            offset: 0,
+                            shaderLocation: 0  // position
+                        },
+                        {
+                            format: 'float32',
+                            offset: 12,
+                            shaderLocation: 1  // surfaceType
+                        }
+                    ]
+                }]
+            },
+            fragment: {
+                module: shaderModule,
+                entryPoint: 'fragmentMain',
+                targets: [{
+                    format: 'bgra8unorm'
+                }]
+            },
+            primitive: {
+                topology: 'triangle-list',
+                cullMode: 'none'
+            },
+            depthStencil: {
+                depthWriteEnabled: true,
+                depthCompare: 'less',
+                format: 'depth24plus'
+            }
+        });
+
+        this.uniformBindGroup = this.device.createBindGroup({
+            layout: this.pipeline.getBindGroupLayout(0),
+            entries: [{
+                binding: 0,
+                resource: {
+                    buffer: this.uniformBuffer,
+                }
+            }]
+        });
+    }
+
+    public updateDimensions(dimensions: RoomDimensions): void {
+        this.config.dimensions = dimensions;
+        this.initializeGeometry();
+    }
+
+    public updateMaterials(materials: RoomMaterials): void {
+        this.config.materials = materials;
+        // IMPORTANT:  We would need to update the GPU buffers here
+        // that hold the material properties.  This is a key step
+        // for dynamic material updates.  For simplicity, I'm omitting
+        // the buffer update code here, but it's essential for a real
+        // implementation.
+    }
+
+    public render(pass: GPURenderPassEncoder): void {
+        pass.setPipeline(this.pipeline);
+        pass.setBindGroup(0, this.uniformBindGroup);
+        pass.setVertexBuffer(0, this.vertexBuffer);
+        pass.setIndexBuffer(this.indexBuffer, 'uint16');
+        pass.drawIndexed(36, 1, 0, 0, 0);
+    }
+
+    public updateViewProjection(aspect: number): void {
+        // Create perspective projection matrix
+        const fov = Math.PI / 4; // 45 degrees FOV
+        mat4.perspective(this.projectionMatrix, fov, aspect, 0.1, 100.0);
+
+        // Calculate camera position
+        const { width, height, depth } = this.config.dimensions;
+        const maxDim = Math.max(width, depth);
+        const distance = maxDim * 1.5; // Camera distance from center
+
+        // Position camera for a 3/4 view of the room
+        const cameraPos = vec3.fromValues(
+            distance * 0.8,  // X: Slightly right
+            distance * 0.8,  // Y: Higher up for better floor visibility
+            distance * 1.0   // Z: Further back for better perspective
+        );
+
+        const target = vec3.fromValues(0, 0, 0);  // Look at center of room
+        const up = vec3.fromValues(0, 1, 0);      // Y-up orientation
+
+        // Create view matrix
+        mat4.lookAt(this.viewMatrix, cameraPos, target, up);
+
+        // Combine view and projection matrices
+        const viewProjection = mat4.create();
+        mat4.multiply(viewProjection, this.projectionMatrix, this.viewMatrix);
+
+        // Update uniform buffer with new matrix
+        this.device.queue.writeBuffer(this.uniformBuffer, 0, viewProjection as Float32Array);
+    }
+
+    public isPointInside(point: vec3): boolean {
+        const halfWidth = this.config.dimensions.width / 2;
+        const halfDepth = this.config.dimensions.depth / 2;
+
+        return point[0] >= -halfWidth && point[0] <= halfWidth &&
+               point[1] >= 0 && point[1] <= this.config.dimensions.height &&
+               point[2] >= -halfDepth && point[2] <= halfDepth;
+    }
+
+    public getClosestValidPosition(point: vec3): vec3 {
+        const halfWidth = this.config.dimensions.width / 2;
+        const halfDepth = this.config.dimensions.depth / 2;
+
+        return vec3.fromValues(
+            Math.max(-halfWidth + 0.5, Math.min(halfWidth - 0.5, point[0])),
+            Math.max(0.5, Math.min(this.config.dimensions.height - 0.5, point[1])),
+            Math.max(-halfDepth + 0.5, Math.min(halfDepth - 0.5, point[2]))
+        );
+    }
+
+    public getVolume(): number {
+        return this.config.dimensions.width *
+               this.config.dimensions.height *
+               this.config.dimensions.depth;
+    }
+
+    public getSurfaceArea(): number {
+        const w = this.config.dimensions.width;
+        const h = this.config.dimensions.height;
+        const d = this.config.dimensions.depth;
+
+        // Calculate surface area of all walls, floor, and ceiling
+        return 2 * (w * h + h * d + w * d);
+    }
+
+    public getTemperature(): number {
+        // Default room temperature in Celsius
+        return 20;
+    }
+
+    public getHumidity(): number {
+        // Default relative humidity percentage
+        return 50;
+    }
+}
+</code>
+
+src\room\types.ts:
+<code>
+
+interface RoomConfig {
+    dimensions: {
+        width: number;
+        height: number;
+        depth: number;
+    };
+    materials: {
+        walls: { absorption: number };
+        ceiling: { absorption: number };
+        floor: { absorption: number };
+    };
+}
+
+interface RoomDimensions {
+    width: number;
+    height: number;
+    depth: number;
+}
+
+interface RoomMaterials {
+    walls: { absorption: number };
+    ceiling: { absorption: number };
+    floor: { absorption: number };
+}
+
+export enum Surface {
+    FLOOR = 0,
+    CEILING = 1,
+    WALL_FRONT_BACK = 2,
+    WALL_LEFT_RIGHT = 3
+}
+</code>
+
+src\sound\audio-processor.ts:
+<code>
+/**
+ * AudioProcessor
+ *
+ * This class integrates real-time audio processing using the Web Audio API.
+ * It converts ray hit data (each with a time and energy value) into an impulse response
+ * and plays that sound through the device's audio output.
+ *
+ * Methods:
+ *   - processRayHits: Converts ray hit data into an impulse response.
+ *   - playAudio: Plays the generated impulse response.
+ *   - generateAndPlay: Convenience method combining the above two.
+ *   - debugPlaySineWave: Plays a test sine wave for debug purposes.
+ *   - playSoundWithImpulseResponse: Convolves a dry white noise signal with the impulse response and plays it.
+ */
+import { Camera } from '../camera/camera';
+import { SpatialAudioProcessor } from './spatial-audio-processor';
+import { Room } from '../room/room';
+import { WaveformRenderer } from '../visualization/waveform-renderer';
+import { vec3 } from 'gl-matrix/vec3';
+
+export class AudioProcessor {
+  private audioCtx: AudioContext;
+  private sampleRate: number;
+  private impulseResponseBuffer: AudioBuffer | null;
+  private lastImpulseData: Float32Array | null;
+  private spatialProcessor: SpatialAudioProcessor;
+  private room: Room;
+  private currentSoundSource: AudioBufferSourceNode | null = null;
+  private currentGainNode: GainNode | null = null;
+  private masterVolume: number = 0.5; // Master volume control (0.0 to 1.0)
+
+  constructor(device: GPUDevice, room: Room, sampleRate: number = 44100) {
+    // Create an Audio Context (uses webkitAudioContext as fallback)
+    this.audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    this.sampleRate = this.audioCtx.sampleRate || sampleRate;
+    this.impulseResponseBuffer = null;
+    this.lastImpulseData = null;
+    this.spatialProcessor = new SpatialAudioProcessor(device, this.sampleRate);
+    this.room = room;
+  }
+
+  /**
+   * Processes an array of ray hit data to generate an impulse response.
+   *
+   * @param rayHits - Array of objects representing ray hits, each with a time (in seconds) and energy.
+   * @param camera - The camera object to use for spatial audio processing.
+   * @param maxTime - Maximum duration of the impulse response in seconds (default: 0.5).
+   * @param params - Additional parameters for spatial audio processing.
+   */
+  async processRayHits(
+    rayHits: Array<{
+        position: vec3,
+        energyLow: number,
+        energyMid: number,
+        energyHigh: number,
+        time: number,
+        phase: number,
+        frequency: number,
+        dopplerShift: number
+    }>,
+    camera: Camera,
+    maxTime: number = 0.5,
+    params = {
+        speedOfSound: 343,
+        maxDistance: 20,
+        minDistance: 1,
+        temperature: 20,
+        humidity: 50,
+        sourcePower: 0
+    }
+  ): Promise<void> {
+    try {
+        const sortedHits = [...rayHits].sort((a, b) => a.time - b.time);
+
+        const [leftIR, rightIR] = this.createImpulseResponseFromHits(sortedHits, maxTime);
+
+        // The rest of the function remains the same...
+        const sampleCount = leftIR.length;
+        const envelope = this.generateEnvelope(sampleCount, sortedHits);
+
+        // (Optional) You can still add room modes if you wish
+        const roomModes = this.calculateRoomModes(this.room.config.dimensions);
+        this.addRoomModes(leftIR, rightIR, roomModes);
+
+        this.normalizeAndApplyEnvelope(leftIR, rightIR, envelope);
+        this.setupImpulseResponseBuffer(leftIR, rightIR);
+        this.lastImpulseData = leftIR;
+
+        // Debug: Log impulse response characteristics
+        this.debugImpulseResponse(leftIR, rightIR);
+
+        console.log("Impulse response processed successfully.");
+    } catch (error) {
+        console.error("Error processing ray hits:", error);
+        throw error;
+    }
+  }
+
+  // Add this new function to the AudioProcessor class
+  private createImpulseResponseFromHits(
+      rayHits: any[],
+      maxTime: number
+  ): [Float32Array, Float32Array] {
+    const sampleCount = Math.ceil(maxTime * this.sampleRate);
+    const leftIR = new Float32Array(sampleCount).fill(0);
+    const rightIR = new Float32Array(sampleCount).fill(0);
+
+    for (const hit of rayHits) {
+        const time = Math.max(hit.time || 0, 0);
+        if (time < maxTime) {
+            const sampleIndex = Math.floor(time * this.sampleRate);
+
+            const energy = ( (hit.energyLow || 0) + (hit.energyMid || 0) + (hit.energyHigh || 0) ) / 3;
+            const amplitude = Math.sqrt(Math.max(energy, 0));
+
+            const [leftGain, rightGain] = this.calculateSpatialGains(hit.position || [0, 0, 0]);
+
+            if (sampleIndex < sampleCount && isFinite(amplitude)) {
+                leftIR[sampleIndex] += amplitude * leftGain;
+                rightIR[sampleIndex] += amplitude * rightGain;
+            }
+        }
+    }
+
+    return [leftIR, rightIR];
+  }
+
+  private applyWaveInterference(leftIR: Float32Array, rightIR: Float32Array, rayHits: any[]): void {
+    const timeStep = 1 / this.sampleRate;
+    
+    // Process each sample
+    for (let i = 0; i < leftIR.length; i++) {
+        const currentTime = i * timeStep;
+        let leftSum = 0;
+        let rightSum = 0;
+
+        // Sum contributions from all rays that have arrived by this time
+        for (const hit of rayHits) {
+            if (hit.time <= currentTime) {
+                // Validate inputs to prevent NaN
+                const frequency = Math.max(hit.frequency || 440, 20); // Minimum 20Hz
+                const dopplerShift = Math.max(hit.dopplerShift || 1, 0.1); // Minimum 0.1
+                const phase = hit.phase || 0;
+                
+                // Calculate phase at current time
+                const timeSinceArrival = Math.max(currentTime - hit.time, 0);
+                const instantPhase = phase + 
+                    2 * Math.PI * frequency * (1 + dopplerShift) * timeSinceArrival;
+
+                // Calculate amplitude with validation
+                const energyLow = Math.max(hit.energyLow || 0, 0);
+                const energyMid = Math.max(hit.energyMid || 0, 0);
+                const energyHigh = Math.max(hit.energyHigh || 0, 0);
+                const amplitude = Math.sqrt((energyLow + energyMid + energyHigh) / 3);
+
+                // Add wave contribution with proper phase
+                const contribution = amplitude * Math.sin(instantPhase);
+                
+                // Validate position for spatial gains
+                const position = hit.position || [0, 0, 0];
+                const [leftGain, rightGain] = this.calculateSpatialGains(position);
+                
+                // Add validated contributions
+                if (!isNaN(contribution) && isFinite(contribution)) {
+                    leftSum += contribution * leftGain;
+                    rightSum += contribution * rightGain;
+                }
+            }
+        }
+
+        // Update impulse response with validated sums
+        leftIR[i] = isFinite(leftSum) ? leftSum : 0;
+        rightIR[i] = isFinite(rightSum) ? rightSum : 0;
+    }
+  }
+
+  private calculateSpatialGains(position: vec3): [number, number] {
+    // Simple stereo panning based on x-position
+    // Could be enhanced with HRTF in the future
+    const x = position[0];
+    const maxPan = 0.8; // Maximum panning amount (0.8 = 80% to either side)
+    const pan = Math.max(-maxPan, Math.min(maxPan, x / 5)); // Normalize position to pan range
+        
+    // Convert pan to gains using constant power panning
+    const leftGain = Math.cos((pan + 1) * Math.PI / 4);
+    const rightGain = Math.sin((pan + 1) * Math.PI / 4);
+        
+    return [leftGain, rightGain];
+  }
+
+  private calculateRT60(rayHits: Array<{ time: number, energyLow: number, energyMid: number, energyHigh: number }>): number {
+    if (rayHits.length === 0) {
+        return 1.0; // Default RT60 if no hits
+    }
+
+    // Sort hits by time
+    const sortedHits = [...rayHits].sort((a, b) => a.time - b.time);
+
+    // Calculate energy decay curve
+    const times: number[] = [];
+    const energies: number[] = [];
+    let totalEnergy = 0;
+
+    sortedHits.forEach(hit => {
+        times.push(hit.time);
+        // Average energy across frequency bands
+        const avgEnergy = (hit.energyLow + hit.energyMid + hit.energyHigh) / 3;
+        totalEnergy += avgEnergy;
+        energies.push(totalEnergy);
+    });
+
+    // Normalize energies
+    const maxEnergy = Math.max(...energies);
+    const normalizedEnergies = energies.map(e => e / maxEnergy);
+
+    // Find -60dB point (energy = 0.001)
+    let rt60Time = times[times.length - 1]; // Default to last time
+    for (let i = 0; i < normalizedEnergies.length; i++) {
+        if (normalizedEnergies[i] <= 0.001) { // -60dB
+            rt60Time = times[i];
+            break;
+        }
+    }
+
+    // Apply Sabine's formula correction based on room volume and surface area
+    const volume = this.room.getVolume();
+    const surfaceArea = this.room.getSurfaceArea();
+
+    // Get average absorption coefficient
+    const avgAbsorption = this.calculateAverageAbsorption();
+
+    // Sabine's formula: RT60 = 0.161 * V / (A * S)
+    // where V is volume, A is average absorption, S is surface area
+    const sabineRT60 = 0.161 * volume / (avgAbsorption * surfaceArea);
+
+    // Blend measured and theoretical RT60
+    return (rt60Time + sabineRT60) / 2;
+  }
+
+  private calculateAverageAbsorption(): number {
+    const materials = this.room.config.materials;
+    let totalAbsorption = 0;
+    let count = 0;
+
+    // Calculate average absorption across all surfaces and frequency bands
+    Object.values(materials).forEach(material => {
+        totalAbsorption += material.absorptionLow;
+        totalAbsorption += material.absorptionMid;
+        totalAbsorption += material.absorptionHigh;
+        count += 3; // Three frequency bands
+    });
+
+    return totalAbsorption / count;
+  }
+
+  private generateEnvelope(sampleCount: number, rayHits: any[]): Float32Array {
+    const envelope = new Float32Array(sampleCount);
+
+    // Calculate RT60 from ray hits
+    const rt60 = this.calculateRT60(rayHits);
+
+    // Generate more realistic decay curve using Schroeder integration
+    for (let i = 0; i < sampleCount; i++) {
+        const t = i / this.sampleRate;
+
+        // Early reflections (first 50ms)
+        if (t < 0.05) {
+            envelope[i] = Math.exp(-3 * t); // Faster initial decay
+        }
+        // Late reverberation
+        else {
+            // Use Schroeder decay curve instead of simple exponential
+            envelope[i] = Math.exp(-6.91 * t / rt60);
+        }
+    }
+
+    return envelope;
+  }
+
+  private normalizeAndApplyEnvelope(leftIR: Float32Array, rightIR: Float32Array, envelope: Float32Array): void {
+    // Find maximum amplitude
+    let maxAmplitude = 0;
+    for (let i = 0; i < leftIR.length; i++) {
+        maxAmplitude = Math.max(maxAmplitude, Math.abs(leftIR[i]), Math.abs(rightIR[i]));
+    }
+
+    // Normalize and apply envelope
+    if (maxAmplitude > 0) {
+        for (let i = 0; i < leftIR.length; i++) {
+            leftIR[i] = (leftIR[i] / maxAmplitude) * envelope[i];
+            rightIR[i] = (rightIR[i] / maxAmplitude) * envelope[i];
+        }
+    }
+  }
+
+  private calculateRoomModes(dimensions: { width: number, height: number, depth: number }): RoomMode[] {
+    const modes: RoomMode[] = [];
+    // Calculate axial, tangential, and oblique modes
+    // Add to array with frequencies and decay times
+    return modes;
+  }
+
+  private addRoomModes(leftIR: Float32Array, rightIR: Float32Array, modes: RoomMode[]): void {
+    // Add modal resonances to the impulse response
+    modes.forEach(mode => {
+        const freq = mode.frequency;
+        const decay = Math.exp(-3 * mode.decayTime / mode.rt60);
+
+        for (let t = 0; t < leftIR.length; t++) {
+            const sample = decay * Math.sin(2 * Math.PI * freq * t / this.sampleRate);
+            leftIR[t] += sample;
+            rightIR[t] += sample;
+        }
+    });
+  }
+
+  /**
+   * Plays the generated impulse response.
+   * If no impulse response has been generated, logs a warning.
+   */
+  playAudio(): void {
+    if (!this.impulseResponseBuffer) {
+      console.warn("AudioProcessor: No impulse response buffer available.  Process ray hits first.");
+      return;
+    }
+    const source = this.audioCtx.createBufferSource();
+    source.buffer = this.impulseResponseBuffer;
+
+    // Connect to destination (you might want to connect to an analyzer node first)
+    source.connect(this.audioCtx.destination);
+    source.start();
+    console.log("AudioProcessor: Playing impulse response audio.");
+  }
+
+  /**
+   * Convenience method to process ray hits and immediately play the resulting audio.
+   *
+   * @param rayHits - Array of ray hit data.
+   * @param camera - The camera object to use for spatial audio processing.
+   * @param maxTime - Maximum duration of the impulse response.
+   */
+  async generateAndPlay(rayHits: Array<{ time: number; energyLow: number; energyMid: number; energyHigh: number }>, camera: Camera, maxTime: number = 0.5): Promise<void> {
+    await this.processRayHits(rayHits, camera, maxTime);
+    this.playAudio();
+  }
+
+
+
+  /**
+   * Creates a short click sound and processes it with the impulse response
+   * using a Convolver Node.
+   *
+   * @param duration Duration of the input sound in seconds (default: 0.1 second).
+   */
+  async playSoundWithImpulseResponse(duration: number = 0.1): Promise<void> {
+    if (!this.impulseResponseBuffer) {
+        console.warn("AudioProcessor: No impulse response available for convolution.");
+        return;
+    }
+
+    try {
+        // Create a short click sound (exponentially decaying sine wave)
+        const sampleCount = Math.ceil(duration * this.sampleRate);
+        const clickBuffer = this.audioCtx.createBuffer(1, sampleCount, this.sampleRate);
+        const clickData = clickBuffer.getChannelData(0);
+
+        // Generate a decaying sine wave at 440Hz
+        const frequency = 440;
+        const decayRate = 10;
+
+        for (let i = 0; i < sampleCount; i++) {
+            const t = i / this.sampleRate;
+            clickData[i] = Math.sin(2 * Math.PI * frequency * t) *
+                          Math.exp(-decayRate * t);
+        }
+
+        // Create nodes
+        const clickSource = this.audioCtx.createBufferSource();
+        clickSource.buffer = clickBuffer;
+
+        const gainNode = this.audioCtx.createGain();
+        gainNode.gain.value = this.masterVolume * 0.6; // Scale for click sound
+
+        const convolver = this.audioCtx.createConvolver();
+        convolver.buffer = this.impulseResponseBuffer;
+
+        // Connect nodes
+        clickSource.connect(convolver);
+        convolver.connect(gainNode);
+        gainNode.connect(this.audioCtx.destination);
+
+        // Start playback
+        clickSource.start();
+        console.log("AudioProcessor: Playing convolved click sound");
+    } catch (error) {
+        console.error("Error playing convolved sound:", error);
+    }
+  }
+
+  /**
+   * Returns the last impulse response data as a Float32Array.
+   */
+  getImpulseResponseData(): Float32Array | null {
+    return this.lastImpulseData;
+  }
+
+  public async visualizeImpulseResponse(renderer: WaveformRenderer): Promise<void> {
+    if (this.lastImpulseData) {
+        await renderer.drawWaveformWithFFT(this.lastImpulseData);
+    }
+  }
+
+
+
+  /**
+   * Plays a test sound with white noise to better hear the room effect.
+   */
+  async playNoiseWithIR(): Promise<void> {
+    try {
+        if (!this.impulseResponseBuffer) {
+            console.warn("No impulse response available. Generate one first.");
+            return;
+        }
+
+        // Create white noise buffer
+        const noiseDuration = 1.0; // 1 second
+        const noiseBuffer = this.audioCtx.createBuffer(
+            1,
+            this.sampleRate * noiseDuration,
+            this.sampleRate
+        );
+        const noiseData = noiseBuffer.getChannelData(0);
+
+        // Generate white noise
+        for (let i = 0; i < noiseData.length; i++) {
+            noiseData[i] = Math.random() * 2 - 1;
+        }
+
+        // Create audio nodes
+        const sourceNode = this.audioCtx.createBufferSource();
+        sourceNode.buffer = noiseBuffer;
+
+        const convolverNode = this.audioCtx.createConvolver();
+        convolverNode.buffer = this.impulseResponseBuffer;
+
+        const gainNode = this.audioCtx.createGain();
+        gainNode.gain.value = this.masterVolume * 0.4; // Scale for noise (quieter)
+
+        // Connect nodes
+        sourceNode.connect(convolverNode);
+        convolverNode.connect(gainNode);
+        gainNode.connect(this.audioCtx.destination);
+
+        // Resume audio context if suspended
+        if (this.audioCtx.state === 'suspended') {
+            await this.audioCtx.resume();
+        }
+
+        // Start playback
+        sourceNode.start();
+        console.log("Playing noise with impulse response");
+
+    } catch (error) {
+        console.error("Error playing noise with IR:", error);
+    }
+  }
+
+  /**
+   * Sets up the impulse response buffer from the processed left and right channels.
+   */
+  private setupImpulseResponseBuffer(leftChannel: Float32Array, rightChannel: Float32Array): void {
+    try {
+        // Ensure we have valid data
+        if (!leftChannel || !rightChannel || leftChannel.length === 0 || rightChannel.length === 0) {
+            console.error('Invalid channel data provided to setupImpulseResponseBuffer');
+            return;
+        }
+
+        // Ensure both channels have the same length
+        if (leftChannel.length !== rightChannel.length) {
+            console.error('Channel length mismatch in setupImpulseResponseBuffer');
+            return;
+        }
+
+        // Ensure minimum buffer size (at least 1ms at current sample rate)
+        const minSamples = Math.max(Math.ceil(this.sampleRate / 1000), 1);
+        const numSamples = Math.max(leftChannel.length, minSamples);
+
+        // Create the buffer
+        this.impulseResponseBuffer = this.audioCtx.createBuffer(
+            2,                  // Number of channels (stereo)
+            numSamples,        // Buffer length
+            this.sampleRate    // Sample rate
+        );
+
+        // Copy the channel data
+        this.impulseResponseBuffer.copyToChannel(leftChannel, 0);
+        this.impulseResponseBuffer.copyToChannel(rightChannel, 1);
+
+        console.log(`Created impulse response buffer with ${numSamples} samples`);
+    } catch (error) {
+        console.error('Error setting up impulse response buffer:', error);
+        throw error;
+    }
+  }
+
+
+
+
+
+  /**
+   * Debug method to analyze impulse response characteristics
+   */
+  private debugImpulseResponse(leftIR: Float32Array, rightIR: Float32Array): void {
+    // Calculate basic statistics
+    const leftMax = Math.max(...leftIR);
+    const leftMin = Math.min(...leftIR);
+    const leftRMS = Math.sqrt(leftIR.reduce((sum, val) => sum + val * val, 0) / leftIR.length);
+
+    // Check for NaN or infinite values
+    const hasNaN = leftIR.some(val => !isFinite(val));
+
+    // Check for very high frequency content (potential noise)
+    let highFreqEnergy = 0;
+    for (let i = 1; i < leftIR.length; i++) {
+      const diff = Math.abs(leftIR[i] - leftIR[i-1]);
+      highFreqEnergy += diff;
+    }
+    highFreqEnergy /= leftIR.length;
+
+    console.log("=== Impulse Response Debug ===");
+    console.log(`Length: ${leftIR.length} samples (${(leftIR.length / this.sampleRate).toFixed(3)}s)`);
+    console.log(`Peak amplitude: ${leftMax.toFixed(6)}`);
+    console.log(`Min amplitude: ${leftMin.toFixed(6)}`);
+    console.log(`RMS level: ${leftRMS.toFixed(6)}`);
+    console.log(`Has NaN/Infinite: ${hasNaN}`);
+    console.log(`High freq energy: ${highFreqEnergy.toFixed(6)}`);
+    console.log(`Dynamic range: ${(20 * Math.log10(leftMax / Math.max(leftRMS, 1e-10))).toFixed(1)} dB`);
+
+    // Sample first few values
+    const firstSamples = Array.from(leftIR.slice(0, 10)).map(v => v.toFixed(4)).join(', ');
+    console.log(`First 10 samples: [${firstSamples}]`);
+  }
+
+
+
+  /**
+   * Set the master volume for all audio playback
+   * @param volume - Volume level from 0.0 (silent) to 1.0 (full volume)
+   */
+  public setMasterVolume(volume: number): void {
+    this.masterVolume = Math.max(0, Math.min(1, volume)); // Clamp between 0 and 1
+
+    // Update current playing sound if any
+    if (this.currentGainNode) {
+      this.currentGainNode.gain.value = this.masterVolume;
+    }
+  }
+
+  /**
+   * Get the current master volume
+   * @returns Current master volume (0.0 to 1.0)
+   */
+  public getMasterVolume(): number {
+    return this.masterVolume;
+  }
+
+  /**
+   * Loads an audio file from the given path and plays it convolved with the current impulse response.
+   *
+   * @param filePath - Path to the audio file to load
+   */
+  public async loadAndPlaySoundFile(filePath: string): Promise<void> {
+    try {
+        if (!this.impulseResponseBuffer) {
+            console.warn("No impulse response available. Generate one first.");
+            return;
+        }
+
+        // Stop any currently playing sound
+        this.stopCurrentSound();
+
+        // Fetch the audio file
+        const response = await fetch(filePath);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch audio file: ${response.statusText}`);
+        }
+
+        const arrayBuffer = await response.arrayBuffer();
+        const audioBuffer = await this.audioCtx.decodeAudioData(arrayBuffer);
+
+        // Create audio nodes
+        const sourceNode = this.audioCtx.createBufferSource();
+        sourceNode.buffer = audioBuffer;
+
+        const convolverNode = this.audioCtx.createConvolver();
+        convolverNode.buffer = this.impulseResponseBuffer;
+
+        const gainNode = this.audioCtx.createGain();
+        gainNode.gain.value = this.masterVolume; // Use master volume
+
+        // Connect nodes: Source → Convolver → Gain → Destination
+        sourceNode.connect(convolverNode);
+        convolverNode.connect(gainNode);
+        gainNode.connect(this.audioCtx.destination);
+
+        // Store references for stopping later
+        this.currentSoundSource = sourceNode;
+        this.currentGainNode = gainNode;
+
+        // Set up event listener for when sound ends
+        sourceNode.onended = () => {
+            this.currentSoundSource = null;
+            this.currentGainNode = null;
+        };
+
+        // Resume audio context if suspended
+        if (this.audioCtx.state === 'suspended') {
+            await this.audioCtx.resume();
+        }
+
+        // Start playback
+        sourceNode.start();
+        console.log(`Playing convolved sound file: ${filePath}`);
+
+    } catch (error) {
+        console.error("Error loading and playing sound file:", error);
+        throw error;
+    }
+  }
+
+  /**
+   * Stops the currently playing sound file.
+   */
+  public stopCurrentSound(): void {
+    try {
+        if (this.currentSoundSource) {
+            this.currentSoundSource.stop();
+            this.currentSoundSource = null;
+        }
+        if (this.currentGainNode) {
+            this.currentGainNode.disconnect();
+            this.currentGainNode = null;
+        }
+        console.log("Stopped current sound playback");
+    } catch (error) {
+        console.error("Error stopping current sound:", error);
+    }
+  }
+
+  /**
+   * Checks if a sound is currently playing.
+   */
+  public isPlaying(): boolean {
+    return this.currentSoundSource !== null;
+  }
+}
+</code>
+
+src\sound\hrtf-loader.ts:
+<code>
+export async function loadHRTFData(): Promise<Float32Array> {
+  const response = await fetch('/src/hrtf/RIEC_hrir_subject_080.sofa');
+  const arrayBuffer = await response.arrayBuffer();
+  return new Float32Array(arrayBuffer);
+}
+</code>
+
+src\sound\spatial-audio-processor.ts:
+<code>
+import { vec3 } from 'gl-matrix';
+import { Camera } from '../camera/camera';
+
+interface RoomAcoustics {
+    rt60Low: number;
+    rt60Mid: number;
+    rt60High: number;
+    airAbsorptionLow: number;
+    airAbsorptionMid: number;
+    airAbsorptionHigh: number;
+    earlyReflectionTime: number;
+    roomVolume: number;
+    totalSurfaceArea: number;
+}
+
+interface RayHit {
+    position: vec3;
+    time: number;
+    energyLow: number;
+    energyMid: number;
+    energyHigh: number;
+    bounces: number;
+    phase: number;        // Phase of the wave at hit point
+    frequency: number;    // Frequency of the ray
+    dopplerShift: number; // Doppler shift at this point
+}
+
+interface WaveProperties {
+    phase: number;
+    frequency: number;
+    dopplerShift: number;
+}
+
+export class SpatialAudioProcessor {
+    private device: GPUDevice;
+    private computePipeline!: GPUComputePipeline;
+    private bindGroup!: GPUBindGroup;
+    private listenerBuffer: GPUBuffer;
+    private rayHitsBuffer!: GPUBuffer;
+    private spatialIRBuffer!: GPUBuffer;
+    private paramsBuffer: GPUBuffer;
+    private acousticsBuffer: GPUBuffer;
+    private wavePropertiesBuffer: GPUBuffer;
+    private outputBuffer: GPUBuffer;
+    private sampleRate: number;
+    private readonly WORKGROUP_SIZE = 256;
+
+    constructor(device: GPUDevice, sampleRate: number = 44100) {
+        this.device = device;
+        this.sampleRate = sampleRate;
+
+        // Create uniform buffers with proper alignment and labels
+        this.listenerBuffer = device.createBuffer({
+            size: 64,  // 4 vec3f (16 bytes each)
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            label: 'Listener Data Buffer'
+        });
+
+        this.paramsBuffer = device.createBuffer({
+            size: 48,  // 12 floats * 4 bytes
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            label: 'Audio Params Buffer'
+        });
+
+        this.acousticsBuffer = device.createBuffer({
+            size: 128, // 32 floats * 4 bytes
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            label: 'Room Acoustics Buffer'
+        });
+
+        this.wavePropertiesBuffer = device.createBuffer({
+            size: 16, // 4 floats * 4 bytes per wave property
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            label: 'Wave Properties Buffer'
+        });
+
+        this.outputBuffer = device.createBuffer({
+            size: 16, // 4 floats * 4 bytes
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            label: 'Output Buffer'
+        });
+
+        // Initialize the pipeline and other buffers
+        this.initializeAsync();
+    }
+
+    private async initializeAsync(): Promise<void> {
+        await this.createPipeline();
+    }
+
+    private async createPipeline(): Promise<void> {
+        const shaderModule = this.device.createShaderModule({
+            code: await fetch('/src/raytracer/shaders/spatial_audio.wgsl').then(r => r.text()),
+            label: 'Spatial Audio Shader'
+        });
+
+        const bindGroupLayout = this.device.createBindGroupLayout({
+            entries: [
+                {
+                    binding: 0,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: 'uniform', minBindingSize: 64 }
+                },
+                {
+                    binding: 1,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: 'read-only-storage' }
+                },
+                {
+                    binding: 2,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: 'storage', minBindingSize: 96 } // Updated size for RayHit with wave properties
+                },
+                {
+                    binding: 3,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: 'uniform', minBindingSize: 48 }
+                },
+                {
+                    binding: 4,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: 'uniform', minBindingSize: 108 }
+                },
+                {
+                    binding: 5,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: 'read-only-storage', minBindingSize: 128 }
+                },
+                {
+                    binding: 6,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: 'storage', minBindingSize: 16 }
+                }
+            ],
+            label: 'Spatial Audio Bind Group Layout'
+        });
+
+        // Create pipeline layout and compute pipeline
+        const pipelineLayout = this.device.createPipelineLayout({
+            bindGroupLayouts: [bindGroupLayout],
+            label: 'Spatial Audio Pipeline Layout'
+        });
+
+        this.computePipeline = this.device.createComputePipeline({
+            layout: pipelineLayout,
+            compute: {
+                module: shaderModule,
+                entryPoint: 'main'
+            },
+            label: 'Spatial Audio Pipeline'
+        });
+    }
+
+    private createOrResizeBuffers(hitCount: number): void {
+        // Calculate buffer sizes with proper alignment
+        const rayHitSize = 80; // Size of RayHit struct in shader (20 floats * 4 bytes)
+        const rayHitsSize = Math.max(hitCount * rayHitSize, rayHitSize);
+        const wavePropsSize = Math.max(hitCount * 16, 16); // 4 floats * 4 bytes per wave property
+        const spatialIRSize = Math.max(hitCount * 16, 16); // vec4f per hit
+
+        // Create or resize ray hits buffer
+        if (!this.rayHitsBuffer || this.rayHitsBuffer.size < rayHitsSize) {
+            if (this.rayHitsBuffer) this.rayHitsBuffer.destroy();
+            this.rayHitsBuffer = this.device.createBuffer({
+                size: rayHitsSize,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+                label: 'Ray Hits Buffer'
+            });
+        }
+
+        // Create or resize wave properties buffer
+        if (!this.wavePropertiesBuffer || this.wavePropertiesBuffer.size < wavePropsSize) {
+            if (this.wavePropertiesBuffer) this.wavePropertiesBuffer.destroy();
+            this.wavePropertiesBuffer = this.device.createBuffer({
+                size: wavePropsSize,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+                label: 'Wave Properties Buffer'
+            });
+        }
+
+        // Create or resize spatial IR buffer
+        if (!this.spatialIRBuffer || this.spatialIRBuffer.size < spatialIRSize) {
+            if (this.spatialIRBuffer) this.spatialIRBuffer.destroy();
+            this.spatialIRBuffer = this.device.createBuffer({
+                size: spatialIRSize,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+                label: 'Spatial IR Buffer'
+            });
+
+            // Initialize spatialIR buffer with zeros
+            const zeros = new Float32Array(hitCount * 4); // vec4f per hit
+            this.device.queue.writeBuffer(this.spatialIRBuffer, 0, zeros);
+        }
+
+        this.updateBindGroup();
+    }
+
+    private updateBindGroup(): void {
+        this.bindGroup = this.device.createBindGroup({
+            layout: this.computePipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.listenerBuffer } },
+                { binding: 1, resource: { buffer: this.rayHitsBuffer } },
+                { binding: 2, resource: { buffer: this.spatialIRBuffer } },
+                { binding: 3, resource: { buffer: this.paramsBuffer } },
+                { binding: 4, resource: { buffer: this.acousticsBuffer } },
+                { binding: 5, resource: { buffer: this.wavePropertiesBuffer } },
+                { binding: 6, resource: { buffer: this.outputBuffer } }
+            ],
+            label: 'Spatial Audio Bind Group'
+        });
+    }
+
+    public async processSpatialAudio(
+        camera: Camera,
+        rayHits: Array<{
+            position: vec3;
+            time: number;
+            energyLow: number;
+            energyMid: number;
+            energyHigh: number;
+            phase: number;
+            frequency: number;
+            dopplerShift: number
+        }>,
+        params: any,
+        room: Room
+    ): Promise<[Float32Array, Float32Array]> {
+        if (rayHits.length === 0) {
+            console.warn('No ray hits to process');
+            return [new Float32Array(0), new Float32Array(0)];
+        }
+
+        // Verify ray hit data
+        console.log(`Processing ${rayHits.length} ray hits`);
+        console.log('Sample ray hit:', rayHits[0]);
+
+        // Ensure buffers are properly sized
+        this.createOrResizeBuffers(rayHits.length);
+
+        // Prepare ray hits data
+        const rayHitsData = new Float32Array(rayHits.length * 20);
+        const wavePropsData = new Float32Array(rayHits.length * 4);
+
+        // Fill ray hits and wave properties data with validation
+        rayHits.forEach((hit, i) => {
+            const baseIndex = i * 20;
+            
+            // Validate position
+            const position = hit.position || vec3.create();
+            rayHitsData[baseIndex] = position[0];
+            rayHitsData[baseIndex + 1] = position[1];
+            rayHitsData[baseIndex + 2] = position[2];
+            
+            // Validate time
+            rayHitsData[baseIndex + 3] = Math.max(hit.time || 0, 0);
+            
+            // Calculate and validate energy values
+            const maxEnergy = Math.max(
+                Math.max(hit.energyLow || 0, hit.energyMid || 0),
+                hit.energyHigh || 0
+            );
+            
+            if (maxEnergy === 0) {
+                console.warn(`Ray hit ${i} has zero energy`);
+            }
+
+            // Store energy values
+            rayHitsData[baseIndex + 7] = maxEnergy;
+            
+            // Store frequency bands with validation
+            rayHitsData[baseIndex + 8] = Math.max(hit.energyLow || 0, 0);
+            rayHitsData[baseIndex + 9] = Math.max(hit.energyLow * 0.8 + (hit.energyMid || 0) * 0.2, 0);
+            rayHitsData[baseIndex + 10] = Math.max(hit.energyLow * 0.7 + (hit.energyMid || 0) * 0.3, 0);
+            rayHitsData[baseIndex + 11] = Math.max(hit.energyMid || 0, 0);
+            rayHitsData[baseIndex + 12] = Math.max(hit.energyMid || 0, 0);
+            rayHitsData[baseIndex + 13] = Math.max((hit.energyMid || 0) * 0.3 + (hit.energyHigh || 0) * 0.7, 0);
+            rayHitsData[baseIndex + 14] = Math.max((hit.energyHigh || 0) * 0.8 + (hit.energyMid || 0) * 0.2, 0);
+            rayHitsData[baseIndex + 15] = Math.max(hit.energyHigh || 0, 0);
+
+            // Store wave properties with validation
+            rayHitsData[baseIndex + 16] = hit.phase || 0;
+            rayHitsData[baseIndex + 17] = Math.max(hit.frequency || 440, 20); // Minimum 20Hz
+            rayHitsData[baseIndex + 18] = Math.max(hit.dopplerShift || 1, 0.1); // Minimum 0.1
+            rayHitsData[baseIndex + 19] = 1.0;
+
+            // Store wave properties in separate buffer
+            const waveBaseIndex = i * 4;
+            wavePropsData[waveBaseIndex] = hit.phase || 0;
+            wavePropsData[waveBaseIndex + 1] = Math.max(hit.frequency || 440, 20);
+            wavePropsData[waveBaseIndex + 2] = Math.max(hit.dopplerShift || 1, 0.1);
+            wavePropsData[waveBaseIndex + 3] = 1.0;
+        });
+
+        // Write validated data to GPU buffers
+        this.device.queue.writeBuffer(this.rayHitsBuffer, 0, rayHitsData);
+        this.device.queue.writeBuffer(this.wavePropertiesBuffer, 0, wavePropsData);
+
+        // Update listener data
+        const front = camera.getFront();
+        const forward = new Float32Array([front[0], front[1], front[2]]);
+        const position = camera.getPosition();
+        const up = camera.getUp();
+        
+        // Calculate right vector as cross product of front and up
+        const right = vec3.create();
+        vec3.cross(right, front, up);
+        vec3.normalize(right, right);
+        
+        const listenerData = new Float32Array([
+            position[0], position[1], position[2],
+            0, // padding
+            forward[0], forward[1], forward[2],
+            0, // padding
+            up[0], up[1], up[2],
+            0, // padding
+            right[0], right[1], right[2],
+            0  // padding
+        ]);
+        this.device.queue.writeBuffer(this.listenerBuffer, 0, listenerData);
+
+        // Create command encoder and pass
+        const commandEncoder = this.device.createCommandEncoder();
+        const computePass = commandEncoder.beginComputePass();
+
+        computePass.setPipeline(this.computePipeline);
+        computePass.setBindGroup(0, this.bindGroup);
+
+        // Dispatch workgroups
+        const workgroupCount = Math.ceil(rayHits.length / this.WORKGROUP_SIZE);
+        computePass.dispatchWorkgroups(workgroupCount);
+        computePass.end();
+
+        // Create buffer for reading results
+        const readbackBuffer = this.device.createBuffer({
+            size: rayHits.length * 16, // vec4f per hit
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
+
+        // Copy results to readback buffer
+        commandEncoder.copyBufferToBuffer(
+            this.spatialIRBuffer,
+            0,
+            readbackBuffer,
+            0,
+            rayHits.length * 16
+        );
+
+        // Submit commands
+        this.device.queue.submit([commandEncoder.finish()]);
+
+        // Read results
+        await readbackBuffer.mapAsync(GPUMapMode.READ);
+        const results = new Float32Array(readbackBuffer.getMappedRange());
+
+        // Separate left and right channels
+        const leftChannel = new Float32Array(rayHits.length);
+        const rightChannel = new Float32Array(rayHits.length);
+        for (let i = 0; i < rayHits.length; i++) {
+            leftChannel[i] = results[i * 4];
+            rightChannel[i] = results[i * 4 + 1];
+        }
+
+        // Cleanup
+        readbackBuffer.unmap();
+        readbackBuffer.destroy();
+
+        return [leftChannel, rightChannel];
+    }
+}
+</code>
+
+src\visualization\waveform-renderer.ts:
+<code>
+/**
+ * WaveformRenderer
+ *
+ * This module draws a waveform on a given canvas element.
+ * It accepts a Float32Array representing the impulse response data
+ * (assumed to be in the range of ~[-1, 1]) and scales it to fill the canvas.
+ */
+
+// FFT helper class
+class FFT {
+    private size: number;
+    private real: Float32Array;
+    private imag: Float32Array;
+    private cosTable: Float32Array;
+    private sinTable: Float32Array;
+
+    constructor(size: number) {
+        this.size = size;
+        this.real = new Float32Array(size);
+        this.imag = new Float32Array(size);
+        this.cosTable = new Float32Array(size);
+        this.sinTable = new Float32Array(size);
+
+        // Precompute tables
+        for (let i = 0; i < size; i++) {
+            const angle = -2 * Math.PI * i / size;
+            this.cosTable[i] = Math.cos(angle);
+            this.sinTable[i] = Math.sin(angle);
+        }
+    }
+
+    transform(input: Float32Array): { magnitudes: Float32Array, phases: Float32Array } {
+        // Copy input to real array, clear imaginary
+        this.real.set(input);
+        this.imag.fill(0);
+
+        // Perform FFT
+        const n = this.size;
+        for (let i = 0; i < n; i++) {
+            if (i < this.reverseBits(i, n)) {
+                // Swap elements
+                [this.real[i], this.real[this.reverseBits(i, n)]] =
+                [this.real[this.reverseBits(i, n)], this.real[i]];
+            }
+        }
+
+        for (let blockSize = 2; blockSize <= n; blockSize *= 2) {
+            const halfBlock = blockSize / 2;
+
+            for (let blockStart = 0; blockStart < n; blockStart += blockSize) {
+                for (let i = 0; i < halfBlock; i++) {
+                    const angle = -2 * Math.PI * i / blockSize;
+                    const cos = Math.cos(angle);
+                    const sin = Math.sin(angle);
+
+                    const a = blockStart + i;
+                    const b = blockStart + i + halfBlock;
+
+                    const tr = this.real[b] * cos - this.imag[b] * sin;
+                    const ti = this.real[b] * sin + this.imag[b] * cos;
+
+                    this.real[b] = this.real[a] - tr;
+                    this.imag[b] = this.imag[a] - ti;
+                    this.real[a] = this.real[a] + tr;
+                    this.imag[a] = this.imag[a] + ti;
+                }
+            }
+        }
+
+        // Calculate magnitudes and phases
+        const magnitudes = new Float32Array(n / 2);
+        const phases = new Float32Array(n / 2);
+        for (let i = 0; i < n / 2; i++) {
+            magnitudes[i] = Math.sqrt(this.real[i] * this.real[i] + this.imag[i] * this.imag[i]);
+            phases[i] = Math.atan2(this.imag[i], this.real[i]);
+        }
+
+        return { magnitudes, phases };
+    }
+
+    private reverseBits(x: number, n: number): number {
+        let result = 0;
+        let power = Math.log2(n);
+
+        for (let i = 0; i < power; i++) {
+            result = (result << 1) + (x & 1);
+            x >>= 1;
+        }
+
+        return result;
+    }
+}
+
+export class WaveformRenderer {
+  private canvas: HTMLCanvasElement;
+  private ctx: CanvasRenderingContext2D;
+  private fftCanvas: HTMLCanvasElement;
+  private fftCtx: CanvasRenderingContext2D;
+  private analyser: AnalyserNode;
+  private audioCtx: AudioContext;
+
+  constructor(canvas: HTMLCanvasElement) {
+    this.canvas = canvas;
+    const context = canvas.getContext('2d');
+    if (!context) {
+      throw new Error('Unable to get 2D context from canvas.');
+    }
+    this.ctx = context;
+
+    // Create FFT canvas
+    this.fftCanvas = document.createElement('canvas');
+    this.fftCanvas.id = "fft-canvas";
+    this.fftCanvas.style.position = "fixed";
+    this.fftCanvas.style.bottom = "150px"; // Position above waveform
+    this.fftCanvas.style.left = "0";
+    this.fftCanvas.style.width = "100%";
+    this.fftCanvas.style.height = "150px";
+    this.fftCanvas.style.backgroundColor = "rgba(0, 0, 0, 0.5)";
+    document.body.appendChild(this.fftCanvas);
+
+    const fftContext = this.fftCanvas.getContext('2d');
+    if (!fftContext) {
+      throw new Error('Unable to get 2D context from FFT canvas.');
+    }
+    this.fftCtx = fftContext;
+
+    // Initialize Web Audio
+    this.audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    this.analyser = this.audioCtx.createAnalyser();
+    this.analyser.fftSize = 2048;
+    this.analyser.smoothingTimeConstant = 0.85;
+
+    window.addEventListener('resize', () => this.resize());
+    this.resize();
+  }
+
+  private resize(): void {
+    // Resize both canvases
+    this.canvas.width = this.canvas.clientWidth;
+    this.canvas.height = this.canvas.clientHeight;
+    this.fftCanvas.width = this.fftCanvas.clientWidth;
+    this.fftCanvas.height = this.fftCanvas.clientHeight;
+  }
+
+  public async drawWaveformWithFFT(data: Float32Array): Promise<void> {
+    this.drawWaveform(data);
+
+    const spectrogramWidth = this.fftCanvas.width;
+    const spectrogramHeight = this.fftCanvas.height;
+    const imageData = this.fftCtx.createImageData(spectrogramWidth, spectrogramHeight);
+
+    // FFT parameters
+    const windowSize = 1024;
+    const hopSize = windowSize / 8; // Smaller hop size for more overlap
+    const numWindows = Math.floor((data.length - windowSize) / hopSize);
+
+    // Create FFT processor
+    const fft = new FFT(windowSize);
+    const window = new Float32Array(windowSize);
+
+    // Hann window
+    for (let i = 0; i < windowSize; i++) {
+        window[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / windowSize));
+    }
+
+    // Process each time window
+    const spectrogramData = new Array(numWindows);
+    
+    // First pass: compute all FFTs
+    for (let windowIndex = 0; windowIndex < numWindows; windowIndex++) {
+        const startIndex = Math.floor(windowIndex * hopSize);
+        const segment = new Float32Array(windowSize);
+
+        // Apply window
+        for (let i = 0; i < windowSize; i++) {
+            segment[i] = data[startIndex + i] * window[i];
+        }
+
+        // Perform FFT
+        spectrogramData[windowIndex] = fft.transform(segment).magnitudes;
+    }
+
+    // Second pass: draw with interpolation
+    for (let x = 0; x < spectrogramWidth; x++) {
+        // Map x coordinate back to window index
+        const windowPos = (x / spectrogramWidth) * (numWindows - 1);
+        const windowIndex1 = Math.floor(windowPos);
+        const windowIndex2 = Math.min(windowIndex1 + 1, numWindows - 1);
+        const windowAlpha = windowPos - windowIndex1;
+
+        for (let y = 0; y < spectrogramHeight; y++) {
+            // Use logarithmic frequency mapping for better frequency resolution
+            const logFreq = Math.exp(Math.log(1 + windowSize/2) * (y / spectrogramHeight)) - 1;
+            const freqIndex = Math.floor(logFreq);
+
+            // Interpolate between frequency bins
+            const alpha = logFreq - freqIndex;
+            const nextFreqIndex = Math.min(freqIndex + 1, windowSize/2 - 1);
+
+            // Get magnitudes from both windows
+            const getMagnitude = (windowIndex: number) => {
+                const magnitudes = spectrogramData[windowIndex];
+                const mag1 = magnitudes[freqIndex] || 0;
+                const mag2 = magnitudes[nextFreqIndex] || 0;
+                return mag1 * (1 - alpha) + mag2 * alpha;
+            };
+
+            // Interpolate between windows
+            const magnitude1 = getMagnitude(windowIndex1);
+            const magnitude2 = getMagnitude(windowIndex2);
+            const magnitude = magnitude1 * (1 - windowAlpha) + magnitude2 * windowAlpha;
+
+            // Convert magnitude to dB and normalize with adjusted range
+            const db = 20 * Math.log10(magnitude + 1e-6);
+            const normalizedDb = (db + 120) / 120; // Wider dynamic range
+            const value = Math.max(0, Math.min(1, normalizedDb));
+
+            // Enhanced color gradient for better visibility
+            const r = Math.floor(value * 255);
+            const g = Math.floor((1 - Math.pow(1 - value, 2)) * 255);
+            const b = Math.floor((1 - value) * 255);
+
+            const pixelIndex = (y * spectrogramWidth + x) * 4;
+            imageData.data[pixelIndex] = r;
+            imageData.data[pixelIndex + 1] = g;
+            imageData.data[pixelIndex + 2] = b;
+            imageData.data[pixelIndex + 3] = 255;
+        }
+    }
+
+    // Draw the spectrogram
+    this.fftCtx.putImageData(imageData, 0, 0);
+
+    // Draw frequency axis (logarithmic scale)
+    this.fftCtx.fillStyle = '#ffffff';
+    this.fftCtx.font = '12px Arial';
+    this.fftCtx.textAlign = 'left';
+
+    const freqLabels = [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000];
+    freqLabels.forEach(freq => {
+        const logFreq = Math.log2(freq / 20) / Math.log2(20000 / 20);
+        const y = spectrogramHeight * (1 - Math.sqrt(logFreq));
+        this.fftCtx.fillText(`${freq >= 1000 ? (freq/1000) + 'k' : freq}Hz`, 5, y);
+    });
+
+    // Draw time axis
+    const timeScale = data.length / this.audioCtx.sampleRate;
+    const timeLabels = [0, timeScale/4, timeScale/2, timeScale*3/4, timeScale];
+    timeLabels.forEach(time => {
+        const x = (time / timeScale) * spectrogramWidth;
+        this.fftCtx.fillText(`${time.toFixed(3)}s`, x, spectrogramHeight - 5);
+    });
+  }
+
+  /**
+   * Draws the waveform using the provided impulse response data.
+   *
+   * @param data - The impulse response data as a Float32Array.
+   */
+  public drawWaveform(data: Float32Array): void {
+    if (!data || data.length === 0) {
+        console.warn('No data to draw waveform');
+        return;
+    }
+
+    // Calculate max value while filtering out NaN and Infinity
+    const validValues = Array.from(data).filter(x => !isNaN(x) && isFinite(x));
+    const maxValue = validValues.length > 0 ? Math.max(...validValues.map(Math.abs)) : 0;
+
+    console.log(`Drawing waveform with ${data.length} samples, max value: ${maxValue}`);
+
+    const { width, height } = this.canvas;
+    const ctx = this.ctx;
+
+    // Clear the canvas
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+    ctx.fillRect(0, 0, width, height);
+
+    // Use the validated max value for scaling
+    const scale = maxValue > 0 ? 1 / maxValue : 1;
+
+    // Draw grid
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+    ctx.lineWidth = 1;
+
+    // Vertical grid lines (time divisions)
+    for (let x = 0; x < width; x += width / 10) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, height);
+      ctx.stroke();
+    }
+
+    // Horizontal grid lines (amplitude divisions)
+    for (let y = 0; y < height; y += height / 8) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(width, y);
+      ctx.stroke();
+    }
+
+    // Draw zero line
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+    ctx.beginPath();
+    ctx.moveTo(0, height / 2);
+    ctx.lineTo(width, height / 2);
+    ctx.stroke();
+
+    // Draw waveform
+    ctx.beginPath();
+    ctx.strokeStyle = '#00ff00';
+    ctx.lineWidth = 2;
+
+    const step = Math.max(1, Math.floor(data.length / width));
+    let lastY = 0;
+
+    for (let x = 0; x < width; x++) {
+      const index = Math.min(x * step, data.length - 1);
+      const value = data[index] * scale;
+      const y = (0.5 - value * 0.4) * height; // Scale by 0.4 to leave some margin
+
+      if (x === 0) {
+        ctx.moveTo(x, y);
+      } else {
+        // Use quadratic curves for smoother rendering
+        const cpx = (x + (x - 1)) / 2;
+        ctx.quadraticCurveTo(cpx, lastY, x, y);
+      }
+      lastY = y;
+    }
+    ctx.stroke();
+
+    // Draw time markers
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '12px Arial';
+    ctx.textAlign = 'center';
+    for (let i = 0; i <= 10; i++) {
+      const x = (width * i) / 10;
+      const time = (i * data.length * 1000 / this.canvas.width).toFixed(0);
+      ctx.fillText(`${time}ms`, x, height - 5);
+    }
+  }
+}
+</code>
+
+src\main.ts:
+<code>
+import { Room, RoomConfig } from './room/room';
+import { Surface } from './room/types';
+import { Camera } from './camera/camera';
+import { vec3 } from 'gl-matrix';
+import * as dat from 'dat.gui';
+import { Sphere } from './objects/sphere';
+import { SphereRenderer } from './objects/sphere-renderer';
+import { RayTracer } from './raytracer/raytracer';
+import { AudioProcessor } from './sound/audio-processor';
+import { WaveformRenderer } from './visualization/waveform-renderer';
+
+export class Main {
+    private canvas: HTMLCanvasElement;
+    private device: GPUDevice;
+    private context: GPUCanvasContext;
+    private room: Room;
+    private camera: Camera;
+    private depthTexture!: GPUTexture;
+    private keys: { [key: string]: boolean } = {};
+    private roomConfig: RoomConfig;
+    private gui: dat.GUI;
+    private sphere: Sphere;
+    private sphereRenderer: SphereRenderer;
+    private sourceControllers: {
+        x: dat.GUIController;
+        y: dat.GUIController;
+        z: dat.GUIController;
+    };
+    private rayTracer: RayTracer;
+    private audioProcessor: AudioProcessor;
+    private waveformRenderer: WaveformRenderer;
+    private sourceParams = {
+        sourcePower: 0
+    };
+    private soundFileParams = {
+        selectedFile: 'loop.mp3',
+        isPlaying: false,
+        masterVolume: 0.5
+    };
+    private currentAudioSource: AudioBufferSourceNode | null = null;
+
+    constructor(canvas: HTMLCanvasElement, device: GPUDevice) {
+        this.canvas = canvas;
+        this.device = device;
+        this.context = canvas.getContext('webgpu') as GPUCanvasContext;
+
+        // Configure the canvas context
+        this.context.configure({
+            device: this.device,
+            format: navigator.gpu.getPreferredCanvasFormat(),
+            alphaMode: 'premultiplied',
+        });
+
+        // Initialize room config
+        this.roomConfig = {
+            dimensions: { width: 8, height: 3, depth: 5 },
+            materials: {
+                walls: {
+                    absorption: 0.1,
+                    absorptionLow: 0.15,
+                    absorptionMid: 0.1,
+                    absorptionHigh: 0.05,
+                    scattering: 0.1
+                },
+                ceiling: {
+                    absorption: 0.2,
+                    absorptionLow: 0.25,
+                    absorptionMid: 0.2,
+                    absorptionHigh: 0.15,
+                    scattering: 0.1
+                },
+                floor: {
+                    absorption: 0.1,
+                    absorptionLow: 0.15,
+                    absorptionMid: 0.1,
+                    absorptionHigh: 0.05,
+                    scattering: 0.2
+                }
+            }
+        };
+
+        // Initialize room
+        this.room = new Room(device, this.roomConfig);
+
+        // Initialize camera near the back wall of the room
+        this.camera = new Camera(
+            vec3.fromValues(0, 1.7, 3), // Start near back wall (Z=3 is inside Z=4 boundary)
+            -90,  // Looking toward the center
+            0     // Level view
+        );
+
+        // Initialize sphere in the middle of the room
+        this.sphere = new Sphere(
+            vec3.fromValues(0, 1.7, 0), // Center of room, eye level
+            0.2                         // Smaller radius for sound source
+        );
+
+        // Initialize sphere renderer
+        this.sphereRenderer = new SphereRenderer(device);
+
+        // Initialize ray tracer
+        this.rayTracer = new RayTracer(device, this.sphere, this.room);
+        this.audioProcessor = new AudioProcessor(device, this.room);
+
+        // Set initial master volume
+        this.audioProcessor.setMasterVolume(this.soundFileParams.masterVolume);
+
+        // Create waveform canvas element and style it to appear at the bottom of the screen.
+        const waveformCanvas = document.createElement('canvas');
+        waveformCanvas.id = "waveform-canvas";
+        waveformCanvas.style.position = "fixed";
+        waveformCanvas.style.bottom = "0";
+        waveformCanvas.style.left = "0";
+        waveformCanvas.style.width = "100%";
+        waveformCanvas.style.height = "150px";
+        waveformCanvas.style.backgroundColor = "rgba(0, 0, 0, 0.5)"; // Semi-transparent background
+        document.body.appendChild(waveformCanvas);
+
+        // Initialize waveform renderer
+        this.waveformRenderer = new WaveformRenderer(waveformCanvas);
+
+        // Setup debug UI
+        this.setupDebugUI();
+
+        // Setup input handlers
+        this.setupInputHandlers();
+
+        // Create depth texture
+        this.createDepthTexture();
+    }
+
+    private setupDebugUI(): void {
+        this.gui = new dat.GUI();
+
+        const roomFolder = this.gui.addFolder('Room Dimensions');
+        roomFolder.add(this.roomConfig.dimensions, 'width', 2, 20).onChange(() => this.updateRoom());
+        roomFolder.add(this.roomConfig.dimensions, 'height', 2, 10).onChange(() => this.updateRoom());
+        roomFolder.add(this.roomConfig.dimensions, 'depth', 2, 20).onChange(() => this.updateRoom());
+
+        const materialsFolder = this.gui.addFolder('Materials');
+        materialsFolder.add(this.roomConfig.materials.walls, 'absorption', 0, 1);
+        materialsFolder.add(this.roomConfig.materials.ceiling, 'absorption', 0, 1);
+        materialsFolder.add(this.roomConfig.materials.floor, 'absorption', 0, 1);
+
+        // Create a data object for the sound source position
+        const sourcePosition = {
+            x: 0,
+            y: 1.7,
+            z: 0
+        };
+
+        // Update sphere controls to allow movement
+        const sourceFolder = this.gui.addFolder('Sound Source');
+
+        // Store controller references for updating ranges
+        this.sourceControllers = {
+            x: sourceFolder.add(sourcePosition, 'x', -this.roomConfig.dimensions.width/2, this.roomConfig.dimensions.width/2)
+                .onChange((value: number) => {
+                    const pos = this.sphere.getPosition();
+                    pos[0] = value;
+                    this.sphere.setPosition(pos);
+                }),
+            y: sourceFolder.add(sourcePosition, 'y', 0, this.roomConfig.dimensions.height)
+                .onChange((value: number) => {
+                    const pos = this.sphere.getPosition();
+                    pos[1] = value;
+                    this.sphere.setPosition(pos);
+                }),
+            z: sourceFolder.add(sourcePosition, 'z', -this.roomConfig.dimensions.depth/2, this.roomConfig.dimensions.depth/2)
+                .onChange((value: number) => {
+                    const pos = this.sphere.getPosition();
+                    pos[2] = value;
+                    this.sphere.setPosition(pos);
+                })
+        };
+
+        // Add source power control
+        sourceFolder.add(this.sourceParams, 'sourcePower', -60, 20)
+            .name('Power (dB)')
+            .onChange((value: number) => {
+                this.sourceParams = {
+                    ...this.sourceParams,
+                    sourcePower: value
+                };
+                // Recalculate IR when power changes
+                this.calculateIR();
+            });
+
+        // Add ray tracing controls
+        const rayTracingFolder = this.gui.addFolder('Ray Tracing');
+        const rayTracingControls = {
+            calculateIR: async () => {
+                await this.calculateIR();
+            }
+        };
+        rayTracingFolder.add(rayTracingControls, 'calculateIR').name('Calculate IR');
+
+        // --- Audio Debug Controls ---
+        const audioFolder = this.gui.addFolder('Audio Debug');
+        const audioControls = {
+            playNoise: () => this.audioProcessor.playNoiseWithIR()
+        };
+
+        audioFolder.add(audioControls, 'playNoise').name('Play Noise with IR');
+        audioFolder.open();
+
+        // --- Sound File Controls ---
+        const soundFileFolder = this.gui.addFolder('Sound Files');
+
+        // ADD YOUR MP3 FILE HERE
+        soundFileFolder.add(this.soundFileParams, 'selectedFile', ['loop.mp3', 'snare.mp3', 'top_loop.mp3'])
+            .name('Select Sound')
+            .onChange((value: string) => {
+                this.soundFileParams.selectedFile = value;
+                // Stop current playback when changing files
+                this.stopSound();
+            });
+
+        // Master volume control
+        soundFileFolder.add(this.soundFileParams, 'masterVolume', 0, 1, 0.01)
+            .name('Master Volume')
+            .onChange((value: number) => {
+                this.audioProcessor.setMasterVolume(value);
+            });
+
+        const soundFileControls = {
+            playSound: () => this.playSelectedSound(),
+            stopSound: () => this.stopSound()
+        };
+
+        soundFileFolder.add(soundFileControls, 'playSound').name('Play Convolved');
+        soundFileFolder.add(soundFileControls, 'stopSound').name('Stop Sound');
+        soundFileFolder.open();
+        // -------------------------------
+
+        roomFolder.open();
+        sourceFolder.open();
+        rayTracingFolder.open();
+    }
+
+    private updateRoom(): void {
+        // Recreate room with new dimensions
+        this.room = new Room(this.device, this.roomConfig);
+
+        // Ensure camera stays within room bounds
+        this.constrainCamera();
+
+        // Update source position slider ranges
+        this.sourceControllers.x.min(-this.roomConfig.dimensions.width/2)
+            .max(this.roomConfig.dimensions.width/2);
+        this.sourceControllers.y.min(0).max(this.roomConfig.dimensions.height);
+        this.sourceControllers.z.min(-this.roomConfig.dimensions.depth/2)
+            .max(this.roomConfig.dimensions.depth/2);
+
+        // Keep sphere at current position unless it's outside new bounds
+        const currentPos = this.sphere.getPosition();
+        const validPos = this.room.getClosestValidPosition(currentPos);
+        this.sphere.setPosition(validPos);
+    }
+
+    private constrainCamera(): void {
+        const pos = this.camera.getPosition();
+        const { width, height, depth } = this.roomConfig.dimensions;
+        const halfWidth = width / 2;
+        const halfDepth = depth / 2;
+        const margin = 0.5; // Keep camera slightly away from walls
+
+        // Constrain position
+        const newPos = vec3.fromValues(
+            Math.max(-halfWidth + margin, Math.min(halfWidth - margin, pos[0])),
+            Math.max(margin, Math.min(height - margin, pos[1])),
+            Math.max(-halfDepth + margin, Math.min(halfDepth - margin, pos[2]))
+        );
+
+        this.camera.setPosition(newPos);
+    }
+
+    private setupInputHandlers(): void {
+        // Keyboard controls
+        window.addEventListener('keydown', (e) => this.keys[e.key.toLowerCase()] = true);
+        window.addEventListener('keyup', (e) => this.keys[e.key.toLowerCase()] = false);
+
+        // New keyboard rotation controls
+        window.addEventListener('keydown', (event) => {
+            switch (event.key) {
+                case 'ArrowLeft':
+                    this.camera.rotateWithKeyboard('left');
+                    break;
+                case 'ArrowRight':
+                    this.camera.rotateWithKeyboard('right');
+                    break;
+                case 'ArrowUp':
+                    this.camera.rotateWithKeyboard('up');
+                    break;
+                case 'ArrowDown':
+                    this.camera.rotateWithKeyboard('down');
+                    break;
+            }
+        });
+    }
+
+    private createDepthTexture(): void {
+        this.depthTexture = this.device.createTexture({
+            size: [this.canvas.width, this.canvas.height],
+            format: 'depth24plus',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+    }
+
+    private handleInput(deltaTime: number): void {
+        // Apply movement
+        if (this.keys['w']) this.camera.moveForward(deltaTime);
+        if (this.keys['s']) this.camera.moveForward(-deltaTime);
+        if (this.keys['a']) this.camera.moveRight(-deltaTime);
+        if (this.keys['d']) this.camera.moveRight(deltaTime);
+        if (this.keys[' ']) this.camera.moveUp(deltaTime);
+        if (this.keys['shift']) this.camera.moveUp(-deltaTime);
+    }
+
+    public render(deltaTime: number): void {
+        // Handle input
+        this.handleInput(deltaTime);
+
+        // Update room's view projection with camera
+        const aspect = this.canvas.width / this.canvas.height;
+        const viewProjection = this.camera.getViewProjection(aspect);
+        this.device.queue.writeBuffer(
+            this.room['uniformBuffer'], // Accessing private member, might need to add a public method
+            0,
+            viewProjection as Float32Array
+        );
+
+        // Begin render pass
+        const commandEncoder = this.device.createCommandEncoder();
+        const renderPass = commandEncoder.beginRenderPass({
+            colorAttachments: [{
+                view: this.context.getCurrentTexture().createView(),
+                clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+                loadOp: 'clear',
+                storeOp: 'store',
+            }],
+            depthStencilAttachment: {
+                view: this.depthTexture.createView(),
+                depthClearValue: 1.0,
+                depthLoadOp: 'clear',
+                depthStoreOp: 'store',
+            }
+        });
+
+        // Render room
+        this.room.render(renderPass);
+
+        // Render sphere
+        this.sphereRenderer.render(
+            renderPass,
+            viewProjection as Float32Array,
+            this.sphere.getPosition(),
+            this.sphere.getRadius()
+        );
+
+        // Render rays
+        this.rayTracer.render(renderPass, viewProjection as Float32Array);
+
+        // End render pass and submit
+        renderPass.end();
+        this.device.queue.submit([commandEncoder.finish()]);
+    }
+
+    public resize(): void {
+        if (this.canvas.width !== this.canvas.clientWidth ||
+            this.canvas.height !== this.canvas.clientHeight) {
+
+            this.canvas.width = this.canvas.clientWidth;
+            this.canvas.height = this.canvas.clientHeight;
+
+            // Recreate depth texture with new size
+            this.depthTexture.destroy();
+            this.createDepthTexture();
+        }
+    }
+
+    private async calculateIR(): Promise<void> {
+        await this.rayTracer.calculateRayPaths();
+        const hits = this.rayTracer.getRayHits();
+        await this.audioProcessor.processRayHits(
+            hits,
+            this.camera,
+            0.5,
+            {
+                speedOfSound: 343,
+                maxDistance: 20,
+                minDistance: 1,
+                temperature: 20,
+                humidity: 50,
+                sourcePower: this.sourceParams.sourcePower
+            }
+        );
+
+        // Visualize both waveform and FFT
+        await this.audioProcessor.visualizeImpulseResponse(this.waveformRenderer);
+    }
+
+    private async playSelectedSound(): Promise<void> {
+        try {
+            // Stop any currently playing sound
+            this.stopSound();
+
+            // Load and play the selected sound file
+            const soundPath = `src/soundfile/${this.soundFileParams.selectedFile}`;
+            await this.audioProcessor.loadAndPlaySoundFile(soundPath);
+
+            this.soundFileParams.isPlaying = true;
+            console.log(`Playing sound file: ${this.soundFileParams.selectedFile}`);
+        } catch (error) {
+            console.error('Error playing sound file:', error);
+        }
+    }
+
+    private stopSound(): void {
+        try {
+            this.audioProcessor.stopCurrentSound();
+            this.soundFileParams.isPlaying = false;
+            console.log('Stopped sound playback');
+        } catch (error) {
+            console.error('Error stopping sound:', error);
+        }
+    }
+
+
+}
+
+// Animation loop
+let lastTime = 0;
+function animate(main: Main, time: number) {
+    const deltaTime = (time - lastTime) / 1000; // Convert to seconds
+    lastTime = time;
+
+    main.resize();
+    main.render(deltaTime);
+    requestAnimationFrame((time) => animate(main, time));
+}
+
+// Initialize and start
+async function init() {
+    const canvas = document.querySelector('canvas');
+    if (!canvas) throw new Error('No canvas element found');
+
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) throw new Error('No GPU adapter found');
+
+    const device = await adapter.requestDevice();
+    const main = new Main(canvas, device);
+
+    // Start animation loop
+    requestAnimationFrame((time) => animate(main, time));
+}
+
+init().catch(console.error);
+</code>
+
+src\vite-env.d.ts:
+<code>
+/// <reference types="vite/client" />
+
+</code>
+
+src\webgpu.d.ts:
+<code>
+/// <reference types="@webgpu/types" />
+
+interface Navigator {
+    gpu: {
+        requestAdapter(): Promise<GPUAdapter>;
+        getPreferredCanvasFormat(): GPUTextureFormat;
+    };
+}
+
+declare const GPUTextureUsage: {
+    RENDER_ATTACHMENT: number;
+    TEXTURE_BINDING: number;
+    COPY_DST: number;
+    COPY_SRC: number;
+    STORAGE_BINDING: number;
+};
+
+interface HTMLCanvasElement extends HTMLElement {
+    getContext(contextId: 'webgpu'): GPUCanvasContext | null;
+}
+
+interface GPUCanvasContext {
+    configure(configuration: GPUCanvasConfiguration): void;
+    getCurrentTexture(): GPUTexture;
+    canvas: HTMLCanvasElement;
+}
+
+interface GPUCanvasConfiguration {
+    device: GPUDevice;
+    format: GPUTextureFormat;
+    alphaMode?: 'premultiplied' | 'opaque';
+    usage?: number;
+}
+
+interface GPUTexture {
+    createView(descriptor?: GPUTextureViewDescriptor): GPUTextureView;
+}
+
+interface GPUTextureViewDescriptor {
+    format?: GPUTextureFormat;
+    dimension?: GPUTextureViewDimension;
+    aspect?: GPUTextureAspect;
+    baseMipLevel?: number;
+    mipLevelCount?: number;
+    baseArrayLayer?: number;
+    arrayLayerCount?: number;
+}
+
+declare class GPUAdapter {
+    readonly name: string;
+    readonly features: GPUSupportedFeatures;
+    readonly limits: GPUSupportedLimits;
+    requestDevice(descriptor?: GPUDeviceDescriptor): Promise<GPUDevice>;
+}
+
+declare class GPUDevice {
+    readonly adapter: GPUAdapter;
+    readonly features: GPUSupportedFeatures;
+    readonly limits: GPUSupportedLimits;
+    queue: GPUQueue;
+
+    createBindGroup(descriptor: GPUBindGroupDescriptor): GPUBindGroup;
+    createBindGroupLayout(descriptor: GPUBindGroupLayoutDescriptor): GPUBindGroupLayout;
+    createBuffer(descriptor: GPUBufferDescriptor): GPUBuffer;
+    createCommandEncoder(descriptor?: GPUCommandEncoderDescriptor): GPUCommandEncoder;
+    createPipelineLayout(descriptor: GPUPipelineLayoutDescriptor): GPUPipelineLayout;
+    createRenderPipeline(descriptor: GPURenderPipelineDescriptor): GPURenderPipeline;
+    createShaderModule(descriptor: GPUShaderModuleDescriptor): GPUShaderModule;
+    createTexture(descriptor: GPUTextureDescriptor): GPUTexture;
+}
+
+declare class GPUQueue {
+    writeBuffer(buffer: GPUBuffer, offset: number, data: BufferSource): void;
+    submit(commandBuffers: Iterable<GPUCommandBuffer>): void;
+}
+
+declare class GPUBuffer {
+    readonly size: number;
+    readonly usage: number;
+    readonly mapState: "mapped" | "unmapped";
+    mapAsync(mode: number, offset?: number, size?: number): Promise<void>;
+    getMappedRange(offset?: number, size?: number): ArrayBuffer;
+    unmap(): void;
+    destroy(): void;
+}
+
+declare class GPURenderPassEncoder {
+    setPipeline(pipeline: GPURenderPipeline): void;
+    setBindGroup(index: number, bindGroup: GPUBindGroup, dynamicOffsets?: Iterable<number>): void;
+    setVertexBuffer(slot: number, buffer: GPUBuffer, offset?: number, size?: number): void;
+    setIndexBuffer(buffer: GPUBuffer, indexFormat: GPUIndexFormat, offset?: number, size?: number): void;
+    drawIndexed(indexCount: number, instanceCount?: number, firstIndex?: number, baseVertex?: number, firstInstance?: number): void;
+    end(): void;
+}
+
+declare class GPURenderPipeline {
+    getBindGroupLayout(index: number): GPUBindGroupLayout;
+}
+
+declare class GPUBindGroup {
+    readonly label: string | undefined;
+}
+
+declare const GPUBufferUsage: {
+    MAP_READ: number;
+    MAP_WRITE: number;
+    COPY_SRC: number;
+    COPY_DST: number;
+    INDEX: number;
+    VERTEX: number;
+    UNIFORM: number;
+    STORAGE: number;
+    INDIRECT: number;
+    QUERY_RESOLVE: number;
+};
+
+declare const GPUShaderStage: {
+    VERTEX: number;
+    FRAGMENT: number;
+    COMPUTE: number;
+};
+
+declare type GPUIndexFormat = "uint16" | "uint32";
+declare type GPUBindingResource = GPUSampler | GPUTextureView | GPUBufferBinding;
+
+declare interface GPUBufferBinding {
+    buffer: GPUBuffer;
+    offset?: number;
+    size?: number;
+}
+
+declare interface GPUPipelineLayoutDescriptor {
+    bindGroupLayouts: Iterable<GPUBindGroupLayout>;
+}
+
+declare interface GPUBindGroupLayoutEntry {
+    binding: number;
+    visibility: number;
+    buffer?: {
+        type: 'uniform' | 'storage' | 'read-only-storage';
+        hasDynamicOffset?: boolean;
+        minBindingSize?: number;
+    };
+    sampler?: {
+        type?: 'filtering' | 'non-filtering' | 'comparison';
+    };
+    texture?: {
+        sampleType?: 'float' | 'unfilterable-float' | 'depth' | 'sint' | 'uint';
+        viewDimension?: '1d' | '2d' | '2d-array' | 'cube' | 'cube-array' | '3d';
+        multisampled?: boolean;
+    };
+    storageTexture?: {
+        access: 'write-only';
+        format: GPUTextureFormat;
+        viewDimension?: '1d' | '2d' | '2d-array' | '3d';
+    };
+}
+
+declare interface GPUBindGroupLayoutDescriptor {
+    entries: Iterable<GPUBindGroupLayoutEntry>;
+}
+
+declare interface GPUBindGroupDescriptor {
+    layout: GPUBindGroupLayout;
+    entries: Iterable<GPUBindGroupEntry>;
+}
+
+declare interface GPUBindGroupEntry {
+    binding: number;
+    resource: GPUBindingResource;
+}
+
+declare interface GPURenderPipelineDescriptor {
+    layout: GPUPipelineLayout;
+    vertex: GPUVertexState;
+    fragment?: GPUFragmentState;
+    primitive?: GPUPrimitiveState;
+    depthStencil?: GPUDepthStencilState;
+    multisample?: GPUMultisampleState;
+}
+
+declare type GPUCompareFunction = 'never' | 'less' | 'equal' | 'less-equal' | 'greater' | 'not-equal' | 'greater-equal' | 'always';
+
+declare interface GPUDepthStencilState {
+    format: GPUTextureFormat;
+    depthWriteEnabled: boolean;
+    depthCompare: GPUCompareFunction;
+}
+
+declare type GPUTextureFormat = 'bgra8unorm' | 'depth24plus' | string;
+
+declare interface GPUVertexState extends GPUProgrammableStage {
+    buffers?: Iterable<GPUVertexBufferLayout | null>;
+}
+
+declare interface GPUProgrammableStage {
+    module: GPUShaderModule;
+    entryPoint: string;
+}
+
+declare interface GPUVertexBufferLayout {
+    arrayStride: number;
+    stepMode?: 'vertex' | 'instance';
+    attributes: Iterable<GPUVertexAttribute>;
+}
+
+declare interface GPUVertexAttribute {
+    format: GPUVertexFormat;
+    offset: number;
+    shaderLocation: number;
+}
+
+declare type GPUVertexFormat = 'float32' | 'float32x2' | 'float32x3' | 'float32x4' | string;
+
+declare interface GPUFragmentState extends GPUProgrammableStage {
+    targets: Iterable<GPUColorTargetState>;
+}
+
+declare interface GPUColorTargetState {
+    format: GPUTextureFormat;
+    blend?: GPUBlendState;
+    writeMask?: GPUColorWriteFlags;
+}
+
+declare interface GPUPrimitiveState {
+    topology?: 'point-list' | 'line-list' | 'line-strip' | 'triangle-list' | 'triangle-strip';
+    stripIndexFormat?: 'uint16' | 'uint32';
+    frontFace?: 'ccw' | 'cw';
+    cullMode?: 'none' | 'front' | 'back';
+}
+
+declare interface GPUBlendState {
+    color: GPUBlendComponent;
+    alpha: GPUBlendComponent;
+}
+
+declare interface GPUBlendComponent {
+    operation?: GPUBlendOperation;
+    srcFactor?: GPUBlendFactor;
+    dstFactor?: GPUBlendFactor;
+}
+
+declare type GPUBlendOperation = 'add' | 'subtract' | 'reverse-subtract' | 'min' | 'max';
+declare type GPUBlendFactor = 'zero' | 'one' | 'src' | 'one-minus-src' | 'dst' | 'one-minus-dst' | 'src-alpha' | 'one-minus-src-alpha' | 'dst-alpha' | 'one-minus-dst-alpha' | 'constant' | 'one-minus-constant';
+declare type GPUColorWriteFlags = number;
+
+declare interface GPUMultisampleState {
+    count?: number;
+    mask?: number;
+    alphaToCoverageEnabled?: boolean;
+}
+
+declare interface GPUSupportedFeatures {
+    has(feature: string): boolean;
+}
+
+declare interface GPUSupportedLimits {
+    get(limit: string): number;
+}
+
+declare interface GPUCommandEncoderDescriptor {
+    label?: string;
+}
+
+declare class GPUCommandEncoder {
+    beginRenderPass(descriptor: GPURenderPassDescriptor): GPURenderPassEncoder;
+    finish(): GPUCommandBuffer;
+}
+
+declare class GPUCommandBuffer {
+    label?: string;
+}
+
+declare interface GPUTextureDescriptor {
+    size: GPUExtent3D;
+    format: GPUTextureFormat;
+    usage: number;
+    dimension?: GPUTextureDimension;
+    mipLevelCount?: number;
+    sampleCount?: number;
+    viewFormats?: GPUTextureFormat[];
+}
+
+declare type GPUTextureDimension = "1d" | "2d" | "3d";
+
+declare interface GPUExtent3D {
+    width: number;
+    height: number;
+    depthOrArrayLayers?: number;
+}
+
+declare interface GPURenderPassDescriptor {
+    colorAttachments: GPURenderPassColorAttachment[];
+    depthStencilAttachment?: GPURenderPassDepthStencilAttachment;
+}
+
+declare interface GPURenderPassColorAttachment {
+    view: GPUTextureView;
+    resolveTarget?: GPUTextureView;
+    clearValue?: GPUColor;
+    loadOp: GPULoadOp;
+    storeOp: GPUStoreOp;
+}
+
+declare interface GPURenderPassDepthStencilAttachment {
+    view: GPUTextureView;
+    depthClearValue?: number;
+    depthLoadOp?: GPULoadOp;
+    depthStoreOp?: GPUStoreOp;
+    depthReadOnly?: boolean;
+    stencilClearValue?: number;
+    stencilLoadOp?: GPULoadOp;
+    stencilStoreOp?: GPUStoreOp;
+    stencilReadOnly?: boolean;
+}
+
+declare type GPULoadOp = 'load' | 'clear';
+declare type GPUStoreOp = 'store' | 'discard';
+
+declare interface GPUColor {
+    r: number;
+    g: number;
+    b: number;
+    a: number;
+}
+</code>
+

@@ -1,4 +1,5 @@
 import { Room, RoomConfig } from './room/room';
+import { ROOM_PRESETS, RoomPreset } from './room/room-presets';
 import { Surface } from './room/types';
 import { Camera } from './camera/camera';
 import { vec3 } from 'gl-matrix';
@@ -8,6 +9,7 @@ import { SphereRenderer } from './objects/sphere-renderer';
 import { RayTracer } from './raytracer/raytracer';
 import { AudioProcessor } from './sound/audio-processor';
 import { WaveformRenderer } from './visualization/waveform-renderer';
+import { DEFAULT_WALL_MATERIAL } from './room/room';
 
 export class Main {
     private canvas: HTMLCanvasElement;
@@ -21,6 +23,11 @@ export class Main {
     private gui: dat.GUI;
     private sphere: Sphere;
     private sphereRenderer: SphereRenderer;
+    private roomDimensionControllers: {
+        width: dat.GUIController;
+        height: dat.GUIController;
+        depth: dat.GUIController;
+    };
     private sourceControllers: {
         x: dat.GUIController;
         y: dat.GUIController;
@@ -132,15 +139,33 @@ export class Main {
     private setupDebugUI(): void {
         this.gui = new dat.GUI();
 
+        const roomPresetNames = Object.keys(ROOM_PRESETS);
+        const roomPresetParams = {
+            selectedPreset: 'RECORDING_STUDIO' // Default preset
+        };
+
+        const roomPresetsFolder = this.gui.addFolder('Room Presets');
+        roomPresetsFolder.add(roomPresetParams, 'selectedPreset', roomPresetNames)
+            .name('Select Preset')
+            .onChange((presetName: string) => {
+                const preset = ROOM_PRESETS[presetName];
+                if (preset) {
+                    this.applyRoomPreset(preset);
+                }
+            });
+        roomPresetsFolder.open();
+
         const roomFolder = this.gui.addFolder('Room Dimensions');
-        roomFolder.add(this.roomConfig.dimensions, 'width', 2, 20).onChange(() => this.updateRoom());
-        roomFolder.add(this.roomConfig.dimensions, 'height', 2, 10).onChange(() => this.updateRoom());
-        roomFolder.add(this.roomConfig.dimensions, 'depth', 2, 20).onChange(() => this.updateRoom());
+        this.roomDimensionControllers = {
+            width: roomFolder.add(this.roomConfig.dimensions, 'width', 2, 60).onChange(() => this.updateRoom()),
+            height: roomFolder.add(this.roomConfig.dimensions, 'height', 2, 60).onChange(() => this.updateRoom()),
+            depth: roomFolder.add(this.roomConfig.dimensions, 'depth', 2, 60).onChange(() => this.updateRoom())
+        };
 
         const materialsFolder = this.gui.addFolder('Materials');
-        materialsFolder.add(this.roomConfig.materials.walls, 'absorption', 0, 1);
-        materialsFolder.add(this.roomConfig.materials.ceiling, 'absorption', 0, 1);
-        materialsFolder.add(this.roomConfig.materials.floor, 'absorption', 0, 1);
+        materialsFolder.add(this.roomConfig.materials.walls, 'absorptionLow', 0, 1).name('Walls Absorption Low');
+        materialsFolder.add(this.roomConfig.materials.ceiling, 'absorptionLow', 0, 1).name('Ceiling Absorption Low');
+        materialsFolder.add(this.roomConfig.materials.floor, 'absorptionLow', 0, 1).name('Floor Absorption Low');
 
         // Create a data object for the sound source position
         const sourcePosition = {
@@ -256,6 +281,31 @@ export class Main {
         const currentPos = this.sphere.getPosition();
         const validPos = this.room.getClosestValidPosition(currentPos);
         this.sphere.setPosition(validPos);
+    }
+
+    private applyRoomPreset(preset: RoomPreset): void {
+        this.roomConfig.dimensions = { ...preset.dimensions };
+        this.roomConfig.materials.walls = { ...DEFAULT_WALL_MATERIAL, ...preset.materials.walls };
+        this.roomConfig.materials.ceiling = { ...DEFAULT_WALL_MATERIAL, ...preset.materials.ceiling };
+        this.roomConfig.materials.floor = { ...DEFAULT_WALL_MATERIAL, ...preset.materials.floor };
+        this.updateRoom();
+
+        // Update source position controller ranges based on new room dimensions
+        this.sourceControllers.x.min(-this.roomConfig.dimensions.width / 2);
+        this.sourceControllers.x.max(this.roomConfig.dimensions.width / 2);
+        this.sourceControllers.x.updateDisplay();
+
+        this.sourceControllers.y.max(this.roomConfig.dimensions.height);
+        this.sourceControllers.y.updateDisplay();
+
+        this.sourceControllers.z.min(-this.roomConfig.dimensions.depth / 2);
+        this.sourceControllers.z.max(this.roomConfig.dimensions.depth / 2);
+        this.sourceControllers.z.updateDisplay();
+
+        // Update room dimension controller ranges
+        this.roomDimensionControllers.width.min(2).max(preset.dimensions.width * 1.5).updateDisplay();
+        this.roomDimensionControllers.height.min(2).max(preset.dimensions.height * 1.5).updateDisplay();
+        this.roomDimensionControllers.depth.min(2).max(preset.dimensions.depth * 1.5).updateDisplay();
     }
 
     private constrainCamera(): void {

@@ -4,6 +4,23 @@ import { Room } from '../room/room';
 import { Sphere } from '../objects/sphere';
 import { RayRenderer } from './ray-renderer';
 import { WallMaterial } from '../room/room-materials';
+import { loadHRTFData } from '../sound/hrtf-loader';
+import { Camera } from '../camera/camera';
+
+// Type definitions for image source method
+interface ImageSource {
+    position: vec3;
+    imageOrder: number;
+    reflectionSequence: number[];
+}
+
+interface RayPath {
+    origin: vec3;
+    direction: vec3;
+    energy: number;
+    bounces: number[];
+    time: number;
+}
 
 export interface RayTracerConfig {
     numRays: number;
@@ -20,11 +37,15 @@ export interface RayHit {
     time: number;      // Arrival time
     phase: number;     // Phase at hit
     frequency: number; // Frequency of the ray
+    dopplerShift: number; // Doppler shift at this point
+    hrtfIndex?: number; // HRTF lookup index for spatial audio
+    incomingDirection: vec3; // Direction of the ray when it hit
 }
 
 export interface RayPathPoint extends RayHit {
-    bounceNumber: number;  // Which bounce this point represents
-    rayIndex: number;     // Which ray this point belongs to
+    bounceNumber: number;
+    rayIndex: number;
+    direction: vec3;      // Add direction to resolve TypeScript error
 }
 
 export interface ImpulseResponse {
@@ -46,6 +67,18 @@ export class RayTracer {
     private readonly VISIBILITY_THRESHOLD = 0.05; // Rays below 5% energy become invisible
     private readonly SPEED_OF_SOUND = 343.0; // Speed of sound in m/s at 20°C
     private readonly AIR_TEMPERATURE = 20.0;  // Air temperature in Celsius
+    private rayRenderer: RayRenderer;
+    private listenerBuffer!: GPUBuffer;
+    private rayHitsBuffer!: GPUBuffer;
+    private spatialIRBuffer!: GPUBuffer;
+    private paramsBuffer!: GPUBuffer;
+    private acousticsBuffer!: GPUBuffer;
+    private wavePropertiesBuffer!: GPUBuffer;
+    private roomMaterialsBuffer!: GPUBuffer;
+ 
+    
+    private computePipeline!: GPUComputePipeline;
+    private hrtfBuffer!: GPUBuffer; // Ensure only one declaration
 
     constructor(
         device: GPUDevice,
@@ -56,14 +89,15 @@ export class RayTracer {
             maxBounces: 50,
             minEnergy: 0.01
         }
-    ) {
+    )
+    {
         this.device = device;
         this.soundSource = soundSource;
         this.room = room;
         this.config = config;
         this.rayRenderer = new RayRenderer(device);
+        // Removed 'await' from constructor
     }
-
     private generateRays(): void {
         this.rays = [];
         const sourcePos = this.soundSource.getPosition();
@@ -106,7 +140,7 @@ export class RayTracer {
                point[2] >= -halfDepth && point[2] <= halfDepth;
     }
 
-    public async calculateRayPaths(): Promise<void> {
+    public async calculateRayPaths(camera?: Camera): Promise<void> {
         // Clear previous data
         this.hits = [];
         this.rays = [];
@@ -126,15 +160,15 @@ export class RayTracer {
         }
 
         // Calculate early reflections using image source method
-        await this.calculateEarlyReflections();
+        await this.calculateEarlyReflections(camera);
 
         // Calculate late reflections using stochastic ray tracing
-        await this.calculateLateReflections();
+        await this.calculateLateReflections(camera);
 
         console.log(`Completed ray tracing with early and late reflections`);
     }
 
-    private async calculateEarlyReflections(): Promise<void> {
+    private async calculateEarlyReflections(camera?: Camera): Promise<void> {
         const sourcePos = this.soundSource.getPosition();
         const maxOrder = 3; // Maximum reflection order for image sources
 
@@ -145,7 +179,7 @@ export class RayTracer {
         for (const imageSource of imageSources) {
             const path = this.validateImageSourcePath(imageSource);
             if (path) {
-                this.processImageSourcePath(path);
+                this.processImageSourcePath(path, camera);
             }
         }
     }
@@ -163,12 +197,13 @@ export class RayTracer {
         return null; // Placeholder
     }
 
-    private processImageSourcePath(path: RayPath): void {
+    private processImageSourcePath(path: RayPath, camera?: Camera): void {
         // Calculate energy and add to hits
         // Early reflections are more precise than stochastic rays
+        // For now, this is a placeholder - when implemented, it should also calculate HRTF indices
     }
 
-    private async calculateLateReflections(): Promise<void> {
+    private async calculateLateReflections(camera?: Camera): Promise<void> {
         const { width, height, depth } = this.room.config.dimensions;
         const halfWidth = width / 2;
         const halfDepth = depth / 2;
@@ -190,18 +225,41 @@ export class RayTracer {
             let bounces = 0;
             let currentTime = 0; // Track cumulative time for this ray
             
+            // Calculate HRTF index for initial point if camera is provided
+            let initialHrtfIndex: number | undefined;
+            if (camera) {
+                const listenerPos = camera.getPosition();
+                const toListener = vec3.subtract(vec3.create(), listenerPos, ray.getOrigin());
+                vec3.normalize(toListener, toListener);
+                
+                // Convert to spherical coordinates
+                const azimuth = Math.atan2(toListener[2], toListener[0]); // -π to π
+                const elevation = Math.asin(toListener[1]); // -π/2 to π/2
+                
+                // Map to HRTF indices (assuming 360° azimuth, 180° elevation)
+                const azimuthIndex = Math.floor(((azimuth + Math.PI) / (2 * Math.PI)) * 360) % 360;
+                const elevationIndex = Math.floor(((elevation + Math.PI/2) / Math.PI) * 180) % 180;
+                
+                initialHrtfIndex = elevationIndex * 360 + azimuthIndex;
+            }
+
             // Store initial point
             this.rayPathPoints.push({
+                // Initial ray position without hit data (no surface interaction yet)
                 position: ray.getOrigin(),
+                direction: ray.getDirection(), // Add missing direction property
                 energy: ray.getEnergy(),
                 energyLow: ray.getEnergyLow(),
                 energyMid: ray.getEnergyMid(),
                 energyHigh: ray.getEnergyHigh(),
-                time: currentTime,
+                time: 0,
                 phase: ray.getPhase(),
                 frequency: ray.getFrequency(),
-                bounceNumber: bounces,
-                rayIndex: rayIndex
+                dopplerShift: 1.0, // Default doppler shift (no shift)
+                bounceNumber: 0,
+                rayIndex: rayIndex,
+                incomingDirection: ray.getDirection(),
+                hrtfIndex: initialHrtfIndex
             });
 
             while (ray.isRayActive() && bounces < this.config.maxBounces && ray.getEnergy() > this.config.minEnergy) {
@@ -234,9 +292,28 @@ export class RayTracer {
                     const phaseChange = (2 * Math.PI * distanceTraveled) / wavelength;
                     const newPhase = (ray.getPhase() + phaseChange) % (2 * Math.PI);
 
-                    // Store the hit point before reflection
+                    // Calculate HRTF index for hit point if camera is provided
+                    let hitHrtfIndex: number | undefined;
+                    if (camera) {
+                        const listenerPos = camera.getPosition();
+                        const toListener = vec3.subtract(vec3.create(), listenerPos, hitPoint);
+                        vec3.normalize(toListener, toListener);
+                        
+                        // Convert to spherical coordinates
+                        const azimuth = Math.atan2(toListener[2], toListener[0]); // -π to π
+                        const elevation = Math.asin(toListener[1]); // -π/2 to π/2
+                        
+                        // Map to HRTF indices (assuming 360° azimuth, 180° elevation)
+                        const azimuthIndex = Math.floor(((azimuth + Math.PI) / (2 * Math.PI)) * 360) % 360;
+                        const elevationIndex = Math.floor(((elevation + Math.PI/2) / Math.PI) * 180) % 180;
+                        
+                        hitHrtfIndex = elevationIndex * 360 + azimuthIndex;
+                    }
+
+                    // Explicitly construct hit data instead of spreading undefined 'hit'
                     this.rayPathPoints.push({
                         position: vec3.clone(hitPoint),
+                        direction: direction, // Add direction property
                         energy: ray.getEnergy(),
                         energyLow: ray.getEnergyLow(),
                         energyMid: ray.getEnergyMid(),
@@ -244,8 +321,11 @@ export class RayTracer {
                         time: currentTime,
                         phase: newPhase,
                         frequency: ray.getFrequency(),
-                        bounceNumber: bounces,
-                        rayIndex: rayIndex
+                        dopplerShift: 1.0, // Default doppler shift (no shift)
+                        bounceNumber: bounces + 1, // Increment bounce count
+                        rayIndex: rayIndex,
+                        incomingDirection: direction, // Define incoming direction
+                        hrtfIndex: hitHrtfIndex
                     });
 
                     // Update ray properties with new time and phase
@@ -260,6 +340,9 @@ export class RayTracer {
 
                     // Apply scattering based on frequency-dependent coefficients
                     const material = closestPlane.material;
+                    
+                    
+                    
                     const avgScattering = (material.scatteringLow + material.scatteringMid + material.scatteringHigh) / 3;
 
                     if (avgScattering > 0) {
@@ -275,11 +358,31 @@ export class RayTracer {
                     const newOrigin = vec3.scaleAndAdd(vec3.create(), hitPoint, closestPlane.normal, 0.0001);
 
                     // Get material properties for frequency-dependent absorption
+                    // The energyLoss object is used in updateRay to apply material absorption
+                    // along with air absorption to the ray's energy values
                     const energyLoss = {
                         low: material.absorptionLow,
                         mid: material.absorptionMid,
                         high: material.absorptionHigh
                     };
+
+                    // Calculate HRTF index if camera is provided
+                    let hrtfIndex: number | undefined;
+                    if (camera) {
+                        const listenerPos = camera.getPosition();
+                        const toListener = vec3.subtract(vec3.create(), listenerPos, hitPoint);
+                        vec3.normalize(toListener, toListener);
+                        
+                        // Convert to spherical coordinates
+                        const azimuth = Math.atan2(toListener[2], toListener[0]); // -π to π
+                        const elevation = Math.asin(toListener[1]); // -π/2 to π/2
+                        
+                        // Map to HRTF indices (assuming 360° azimuth, 180° elevation)
+                        const azimuthIndex = Math.floor(((azimuth + Math.PI) / (2 * Math.PI)) * 360) % 360;
+                        const elevationIndex = Math.floor(((elevation + Math.PI/2) / Math.PI) * 180) % 180;
+                        
+                        hrtfIndex = elevationIndex * 360 + azimuthIndex;
+                    }
 
                     // Record hit with frequency-dependent energies
                     this.hits.push({
@@ -290,7 +393,10 @@ export class RayTracer {
                         energyMid: ray.getEnergyMid(),
                         energyHigh: ray.getEnergyHigh(),
                         phase: newPhase,
-                        frequency: ray.getFrequency()
+                        frequency: ray.getFrequency(),
+                        dopplerShift: 1.0, // Default doppler shift (no shift)
+                        hrtfIndex: hrtfIndex,
+                        incomingDirection: vec3.clone(direction)
                     });
 
                     // Update ray with environmental parameters
@@ -380,6 +486,16 @@ export class RayTracer {
 
     public getRayHits(): RayHit[] {
         return this.hits;
+    }
+
+    async initializeHRTF(): Promise<void> {
+        const hrtfData = await loadHRTFData();
+        this.hrtfBuffer = this.device.createBuffer({
+            size: hrtfData.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            label: 'HRTF Coefficients'
+        });
+        this.device.queue.writeBuffer(this.hrtfBuffer, 0, hrtfData as BufferSource);
     }
 
     private applyWindowFunction(t: number, windowSize: number): number {
@@ -503,5 +619,22 @@ export class RayTracer {
             this.rayPaths,
             this.room.config.dimensions
         );
+    }
+
+    // Add bind group entry setup for HRTF buffer
+    private setupComputeBindGroup(): GPUBindGroup {
+        return this.device.createBindGroup({
+            layout: this.computePipeline.getBindGroupLayout(0),
+            entries: [
+               { binding: 0, resource: { buffer: this.listenerBuffer } },
+               { binding: 1, resource: { buffer: this.rayHitsBuffer } },
+               { binding: 2, resource: { buffer: this.spatialIRBuffer } },
+               { binding: 3, resource: { buffer: this.paramsBuffer } },
+               { binding: 4, resource: { buffer: this.acousticsBuffer } },
+               { binding: 5, resource: { buffer: this.wavePropertiesBuffer } },
+               { binding: 6, resource: { buffer: this.roomMaterialsBuffer } },
+               { binding: 7, resource: { buffer: this.hrtfBuffer } },
+            ],
+        });
     }
 }

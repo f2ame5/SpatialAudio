@@ -1,4 +1,6 @@
 import { mat4, vec3 } from 'gl-matrix';
+import { WallMaterial } from './room-materials';
+import { ROOM_PRESETS, RoomPreset } from './room-presets';
 
 enum Surface {
     FLOOR = 0.0,
@@ -24,21 +26,17 @@ export interface RoomMaterials {
     floor: WallMaterial;
 }
 
-export interface WallMaterial {
-    absorption: number;
-    absorptionLow: number;
-    absorptionMid: number;
-    absorptionHigh: number;
-    scattering: number;
-}
-
 // Add default materials
-const DEFAULT_WALL_MATERIAL: WallMaterial = {
-    absorption: 0.2,
+export const DEFAULT_WALL_MATERIAL: WallMaterial = {
     absorptionLow: 0.3,
     absorptionMid: 0.2,
     absorptionHigh: 0.1,
-    scattering: 0.5,
+    scatteringLow: 0.5,
+    scatteringMid: 0.5,
+    scatteringHigh: 0.5,
+    roughness: 0.1,
+    phaseShift: 0.0,
+    phaseRandomization: 0.0
 };
 
 const DEFAULT_ROOM_MATERIALS: RoomMaterials = {
@@ -95,6 +93,50 @@ export class Room {
             }],
         });
     }
+
+    /**
+     * Apply a room preset to configure the room dimensions and materials
+     * @param preset The room preset to apply
+     */
+    public applyPreset(preset: RoomPreset): void {
+        // Update dimensions
+        this.config.dimensions = { ...preset.dimensions };
+        
+        // Update materials, merging preset values with defaults
+        this.config.materials = {
+            walls: { ...DEFAULT_WALL_MATERIAL, ...preset.materials.walls },
+            ceiling: { ...DEFAULT_WALL_MATERIAL, ...preset.materials.ceiling },
+            floor: { ...DEFAULT_WALL_MATERIAL, ...preset.materials.floor }
+        };
+
+        // Reinitialize geometry with new dimensions
+        this.initializeGeometry();
+        
+        // Update view-projection matrix to account for new dimensions
+        this.updateViewProjection(this.canvasAspect);
+        
+        console.log(`Applied room preset: ${preset.name}`);
+    }
+
+    /**
+     * Get available room presets
+     * @returns Array of available room presets
+     */
+    public getPresets(): { [key: string]: RoomPreset } {
+        return ROOM_PRESETS;
+    }
+
+    /**
+     * Get a specific room preset by name
+     * @param name The name of the preset to retrieve
+     * @returns The room preset or undefined if not found
+     */
+    public getPreset(name: string): RoomPreset | undefined {
+        return ROOM_PRESETS[name as keyof typeof ROOM_PRESETS];
+    }
+
+    // Store canvas aspect ratio for view projection updates
+    private canvasAspect: number = 1.0;
 
     private initializeGeometry(): void {
         const { width, height, depth } = this.config.dimensions;
@@ -323,6 +365,9 @@ export class Room {
     }
 
     public updateViewProjection(aspect: number): void {
+        // Store aspect ratio for future use
+        this.canvasAspect = aspect;
+        
         // Create perspective projection matrix
         const fov = Math.PI / 4; // 45 degrees FOV
         mat4.perspective(this.projectionMatrix, fov, aspect, 0.1, 100.0);
@@ -350,7 +395,12 @@ export class Room {
         mat4.multiply(viewProjection, this.projectionMatrix, this.viewMatrix);
 
         // Update uniform buffer with new matrix
-        this.device.queue.writeBuffer(this.uniformBuffer, 0, viewProjection as Float32Array);
+        // Create a standard Float32Array with compatible ArrayBuffer
+        const matrixValues = Array.isArray(viewProjection) ?
+            viewProjection :
+            Array.from(viewProjection);
+        const matrixArray = new Float32Array(matrixValues);
+        this.device.queue.writeBuffer(this.uniformBuffer, 0, matrixArray);
     }
 
     public isPointInside(point: vec3): boolean {
