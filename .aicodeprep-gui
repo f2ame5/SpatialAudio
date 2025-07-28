@@ -26,6 +26,7 @@ src\raytracer\shaders\raytracer.wgsl
 src\raytracer\shaders\spatial_audio.wgsl
 src\research\diffraction-models.md
 src\room\room-materials.ts
+src\room\room-presets.ts
 src\room\room.ts
 src\room\types.ts
 src\sound\audio-processor.ts

@@ -1,34 +1,47 @@
 import { vec3 } from 'gl-matrix';
 import { Camera } from '../camera/camera';
 
+// Define the 8 frequency bands explicitly for clarity and consistency
+export const FREQUENCY_BANDS_8 = [63, 125, 250, 500, 1000, 2000, 4000, 8000] as const;
+export type FrequencyBandType = typeof FREQUENCY_BANDS_8[number];
+
+// Updated RayHit interface to use 8 bands
+interface RayHit {
+    position: vec3;
+    time: number;
+    energy: Record<FrequencyBandType, number>; // Use Record for structured access
+    bounces: number;
+    phase: number;        // Phase of the wave at hit point
+    frequency: number;    // Frequency of the primary ray (Hz)
+    dopplerShift: number; // Doppler shift factor
+}
+
+// Updated RoomAcoustics interface for 8 bands
 interface RoomAcoustics {
-    rt60Low: number;
-    rt60Mid: number;
-    rt60High: number;
-    airAbsorptionLow: number;
-    airAbsorptionMid: number;
-    airAbsorptionHigh: number;
+    rt60_63: number;
+    rt60_125: number;
+    rt60_250: number;
+    rt60_500: number;
+    rt60_1k: number;
+    rt60_2k: number;
+    rt60_4k: number;
+    rt60_8k: number;
+    airAbsorption_63: number;
+    airAbsorption_125: number;
+    airAbsorption_250: number;
+    airAbsorption_500: number;
+    airAbsorption_1k: number;
+    airAbsorption_2k: number;
+    airAbsorption_4k: number;
+    airAbsorption_8k: number;
     earlyReflectionTime: number;
     roomVolume: number;
     totalSurfaceArea: number;
 }
 
-interface RayHit {
-    position: vec3;
-    time: number;
-    energyLow: number;
-    energyMid: number;
-    energyHigh: number;
-    bounces: number;
-    phase: number;        // Phase of the wave at hit point
-    frequency: number;    // Frequency of the ray
-    dopplerShift: number; // Doppler shift at this point
-}
-
-interface WaveProperties {
-    phase: number;
-    frequency: number;
-    dopplerShift: number;
+// Assumes the Room type is defined elsewhere in the project
+interface Room {
+    acoustics: RoomAcoustics;
 }
 
 export class SpatialAudioProcessor {
@@ -40,8 +53,6 @@ export class SpatialAudioProcessor {
     private spatialIRBuffer!: GPUBuffer;
     private paramsBuffer: GPUBuffer;
     private acousticsBuffer: GPUBuffer;
-    private wavePropertiesBuffer: GPUBuffer;
-    private outputBuffer: GPUBuffer;
     private sampleRate: number;
     private readonly WORKGROUP_SIZE = 256;
 
@@ -49,7 +60,6 @@ export class SpatialAudioProcessor {
         this.device = device;
         this.sampleRate = sampleRate;
 
-        // Create uniform buffers with proper alignment and labels
         this.listenerBuffer = device.createBuffer({
             size: 64,  // 4 vec3f (16 bytes each)
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -63,24 +73,12 @@ export class SpatialAudioProcessor {
         });
 
         this.acousticsBuffer = device.createBuffer({
-            size: 128, // 32 floats * 4 bytes
+            // 8 RT60s + 8 Air Absorptions + 3 others = 19 floats. Padded to 80 bytes.
+            size: 80,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-            label: 'Room Acoustics Buffer'
+            label: 'Room Acoustics Buffer (8-Band)'
         });
 
-        this.wavePropertiesBuffer = device.createBuffer({
-            size: 16, // 4 floats * 4 bytes per wave property
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-            label: 'Wave Properties Buffer'
-        });
-
-        this.outputBuffer = device.createBuffer({
-            size: 16, // 4 floats * 4 bytes
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-            label: 'Output Buffer'
-        });
-
-        // Initialize the pipeline and other buffers
         this.initializeAsync();
     }
 
@@ -89,6 +87,7 @@ export class SpatialAudioProcessor {
     }
 
     private async createPipeline(): Promise<void> {
+        // NOTE: The accompanying WGSL shader must be updated to match these changes.
         const shaderModule = this.device.createShaderModule({
             code: await fetch('/src/raytracer/shaders/spatial_audio.wgsl').then(r => r.text()),
             label: 'Spatial Audio Shader'
@@ -96,46 +95,35 @@ export class SpatialAudioProcessor {
 
         const bindGroupLayout = this.device.createBindGroupLayout({
             entries: [
-                {
+                { // Listener data (camera pos, orientation)
                     binding: 0,
                     visibility: GPUShaderStage.COMPUTE,
-                    buffer: { type: 'uniform', minBindingSize: 64 }
+                    buffer: { type: 'uniform' }
                 },
-                {
+                { // Input ray hits from the ray tracer
                     binding: 1,
                     visibility: GPUShaderStage.COMPUTE,
                     buffer: { type: 'read-only-storage' }
                 },
-                {
+                { // Output impulse response data
                     binding: 2,
                     visibility: GPUShaderStage.COMPUTE,
-                    buffer: { type: 'storage', minBindingSize: 96 } // Updated size for RayHit with wave properties
+                    buffer: { type: 'storage' }
                 },
-                {
+                { // General audio parameters
                     binding: 3,
                     visibility: GPUShaderStage.COMPUTE,
-                    buffer: { type: 'uniform', minBindingSize: 48 }
+                    buffer: { type: 'uniform' }
                 },
-                {
+                { // Room acoustic properties (8-band)
                     binding: 4,
                     visibility: GPUShaderStage.COMPUTE,
-                    buffer: { type: 'uniform', minBindingSize: 108 }
-                },
-                {
-                    binding: 5,
-                    visibility: GPUShaderStage.COMPUTE,
-                    buffer: { type: 'read-only-storage', minBindingSize: 128 }
-                },
-                {
-                    binding: 6,
-                    visibility: GPUShaderStage.COMPUTE,
-                    buffer: { type: 'storage', minBindingSize: 16 }
+                    buffer: { type: 'uniform' }
                 }
             ],
             label: 'Spatial Audio Bind Group Layout'
         });
 
-        // Create pipeline layout and compute pipeline
         const pipelineLayout = this.device.createPipelineLayout({
             bindGroupLayouts: [bindGroupLayout],
             label: 'Spatial Audio Pipeline Layout'
@@ -152,13 +140,11 @@ export class SpatialAudioProcessor {
     }
 
     private createOrResizeBuffers(hitCount: number): void {
-        // Calculate buffer sizes with proper alignment
-        const rayHitSize = 80; // Size of RayHit struct in shader (20 floats * 4 bytes)
-        const rayHitsSize = Math.max(hitCount * rayHitSize, rayHitSize);
-        const wavePropsSize = Math.max(hitCount * 16, 16); // 4 floats * 4 bytes per wave property
+        // Size of RayHit struct in shader: 16 floats * 4 bytes/float = 64 bytes
+        const rayHitStructSize = 64;
+        const rayHitsSize = Math.max(hitCount * rayHitStructSize, rayHitStructSize);
         const spatialIRSize = Math.max(hitCount * 16, 16); // vec4f per hit
 
-        // Create or resize ray hits buffer
         if (!this.rayHitsBuffer || this.rayHitsBuffer.size < rayHitsSize) {
             if (this.rayHitsBuffer) this.rayHitsBuffer.destroy();
             this.rayHitsBuffer = this.device.createBuffer({
@@ -168,17 +154,6 @@ export class SpatialAudioProcessor {
             });
         }
 
-        // Create or resize wave properties buffer
-        if (!this.wavePropertiesBuffer || this.wavePropertiesBuffer.size < wavePropsSize) {
-            if (this.wavePropertiesBuffer) this.wavePropertiesBuffer.destroy();
-            this.wavePropertiesBuffer = this.device.createBuffer({
-                size: wavePropsSize,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-                label: 'Wave Properties Buffer'
-            });
-        }
-
-        // Create or resize spatial IR buffer
         if (!this.spatialIRBuffer || this.spatialIRBuffer.size < spatialIRSize) {
             if (this.spatialIRBuffer) this.spatialIRBuffer.destroy();
             this.spatialIRBuffer = this.device.createBuffer({
@@ -187,8 +162,7 @@ export class SpatialAudioProcessor {
                 label: 'Spatial IR Buffer'
             });
 
-            // Initialize spatialIR buffer with zeros
-            const zeros = new Float32Array(hitCount * 4); // vec4f per hit
+            const zeros = new Float32Array(hitCount * 4);
             this.device.queue.writeBuffer(this.spatialIRBuffer, 0, zeros);
         }
 
@@ -204,8 +178,6 @@ export class SpatialAudioProcessor {
                 { binding: 2, resource: { buffer: this.spatialIRBuffer } },
                 { binding: 3, resource: { buffer: this.paramsBuffer } },
                 { binding: 4, resource: { buffer: this.acousticsBuffer } },
-                { binding: 5, resource: { buffer: this.wavePropertiesBuffer } },
-                { binding: 6, resource: { buffer: this.outputBuffer } }
             ],
             label: 'Spatial Audio Bind Group'
         });
@@ -213,155 +185,91 @@ export class SpatialAudioProcessor {
 
     public async processSpatialAudio(
         camera: Camera,
-        rayHits: Array<{
-            position: vec3;
-            time: number;
-            energyLow: number;
-            energyMid: number;
-            energyHigh: number;
-            phase: number;
-            frequency: number;
-            dopplerShift: number
-        }>,
+        rayHits: Array<RayHit>,
         params: any,
         room: Room
     ): Promise<[Float32Array, Float32Array]> {
-        if (rayHits.length === 0) {
+        if (!rayHits || rayHits.length === 0) {
             console.warn('No ray hits to process');
             return [new Float32Array(0), new Float32Array(0)];
         }
 
-        // Verify ray hit data
-        console.log(`Processing ${rayHits.length} ray hits`);
-        console.log('Sample ray hit:', rayHits[0]);
-
-        // Ensure buffers are properly sized
         this.createOrResizeBuffers(rayHits.length);
 
-        // Prepare ray hits data
-        const rayHitsData = new Float32Array(rayHits.length * 20);
-        const wavePropsData = new Float32Array(rayHits.length * 4);
+        // Prepare ray hits data for the GPU buffer (16 floats per hit)
+        const rayHitsData = new Float32Array(rayHits.length * 16);
 
-        // Fill ray hits and wave properties data with validation
         rayHits.forEach((hit, i) => {
-            const baseIndex = i * 20;
+            const baseIndex = i * 16;
             
-            // Validate position
             const position = hit.position || vec3.create();
             rayHitsData[baseIndex] = position[0];
             rayHitsData[baseIndex + 1] = position[1];
             rayHitsData[baseIndex + 2] = position[2];
             
-            // Validate time
             rayHitsData[baseIndex + 3] = Math.max(hit.time || 0, 0);
-            
-            // Calculate and validate energy values
-            const maxEnergy = Math.max(
-                Math.max(hit.energyLow || 0, hit.energyMid || 0),
-                hit.energyHigh || 0
-            );
-            
-            if (maxEnergy === 0) {
-                console.warn(`Ray hit ${i} has zero energy`);
-            }
 
-            // Store energy values
-            rayHitsData[baseIndex + 7] = maxEnergy;
-            
-            // Store frequency bands with validation
-            rayHitsData[baseIndex + 8] = Math.max(hit.energyLow || 0, 0);
-            rayHitsData[baseIndex + 9] = Math.max(hit.energyLow * 0.8 + (hit.energyMid || 0) * 0.2, 0);
-            rayHitsData[baseIndex + 10] = Math.max(hit.energyLow * 0.7 + (hit.energyMid || 0) * 0.3, 0);
-            rayHitsData[baseIndex + 11] = Math.max(hit.energyMid || 0, 0);
-            rayHitsData[baseIndex + 12] = Math.max(hit.energyMid || 0, 0);
-            rayHitsData[baseIndex + 13] = Math.max((hit.energyMid || 0) * 0.3 + (hit.energyHigh || 0) * 0.7, 0);
-            rayHitsData[baseIndex + 14] = Math.max((hit.energyHigh || 0) * 0.8 + (hit.energyMid || 0) * 0.2, 0);
-            rayHitsData[baseIndex + 15] = Math.max(hit.energyHigh || 0, 0);
+            // Pack 8 energy bands, ensuring order matches FREQUENCY_BANDS_8
+            FREQUENCY_BANDS_8.forEach((band, bandIndex) => {
+                rayHitsData[baseIndex + 4 + bandIndex] = Math.max(hit.energy?.[band] || 0, 0);
+            });
 
-            // Store wave properties with validation
-            rayHitsData[baseIndex + 16] = hit.phase || 0;
-            rayHitsData[baseIndex + 17] = Math.max(hit.frequency || 440, 20); // Minimum 20Hz
-            rayHitsData[baseIndex + 18] = Math.max(hit.dopplerShift || 1, 0.1); // Minimum 0.1
-            rayHitsData[baseIndex + 19] = 1.0;
-
-            // Store wave properties in separate buffer
-            const waveBaseIndex = i * 4;
-            wavePropsData[waveBaseIndex] = hit.phase || 0;
-            wavePropsData[waveBaseIndex + 1] = Math.max(hit.frequency || 440, 20);
-            wavePropsData[waveBaseIndex + 2] = Math.max(hit.dopplerShift || 1, 0.1);
-            wavePropsData[waveBaseIndex + 3] = 1.0;
+            rayHitsData[baseIndex + 12] = hit.bounces || 0;
+            rayHitsData[baseIndex + 13] = hit.phase || 0;
+            rayHitsData[baseIndex + 14] = Math.max(hit.frequency || 440, 20);
+            rayHitsData[baseIndex + 15] = Math.max(hit.dopplerShift || 1, 0.1);
         });
 
-        // Write validated data to GPU buffers
         this.device.queue.writeBuffer(this.rayHitsBuffer, 0, rayHitsData);
-        this.device.queue.writeBuffer(this.wavePropertiesBuffer, 0, wavePropsData);
 
-        // Update listener data
         const front = camera.getFront();
-        const forward = new Float32Array([front[0], front[1], front[2]]);
         const position = camera.getPosition();
         const up = camera.getUp();
         
-        // Calculate right vector as cross product of front and up
         const right = vec3.create();
         vec3.cross(right, front, up);
         vec3.normalize(right, right);
         
         const listenerData = new Float32Array([
-            position[0], position[1], position[2],
-            0, // padding
-            forward[0], forward[1], forward[2],
-            0, // padding
-            up[0], up[1], up[2],
-            0, // padding
-            right[0], right[1], right[2],
-            0  // padding
+            position[0], position[1], position[2], 0,
+            front[0],    front[1],    front[2],    0,
+            up[0],       up[1],       up[2],       0,
+            right[0],    right[1],    right[2],    0
         ]);
         this.device.queue.writeBuffer(this.listenerBuffer, 0, listenerData);
 
-        // Create command encoder and pass
         const commandEncoder = this.device.createCommandEncoder();
         const computePass = commandEncoder.beginComputePass();
-
         computePass.setPipeline(this.computePipeline);
         computePass.setBindGroup(0, this.bindGroup);
 
-        // Dispatch workgroups
         const workgroupCount = Math.ceil(rayHits.length / this.WORKGROUP_SIZE);
         computePass.dispatchWorkgroups(workgroupCount);
         computePass.end();
 
-        // Create buffer for reading results
         const readbackBuffer = this.device.createBuffer({
-            size: rayHits.length * 16, // vec4f per hit
+            size: this.spatialIRBuffer.size,
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
         });
 
-        // Copy results to readback buffer
         commandEncoder.copyBufferToBuffer(
-            this.spatialIRBuffer,
-            0,
-            readbackBuffer,
-            0,
-            rayHits.length * 16
+            this.spatialIRBuffer, 0,
+            readbackBuffer, 0,
+            this.spatialIRBuffer.size
         );
 
-        // Submit commands
         this.device.queue.submit([commandEncoder.finish()]);
 
-        // Read results
         await readbackBuffer.mapAsync(GPUMapMode.READ);
-        const results = new Float32Array(readbackBuffer.getMappedRange());
+        const resultsData = new Float32Array(readbackBuffer.getMappedRange());
 
-        // Separate left and right channels
         const leftChannel = new Float32Array(rayHits.length);
         const rightChannel = new Float32Array(rayHits.length);
         for (let i = 0; i < rayHits.length; i++) {
-            leftChannel[i] = results[i * 4];
-            rightChannel[i] = results[i * 4 + 1];
+            leftChannel[i] = resultsData[i * 4];
+            rightChannel[i] = resultsData[i * 4 + 1];
         }
 
-        // Cleanup
         readbackBuffer.unmap();
         readbackBuffer.destroy();
 

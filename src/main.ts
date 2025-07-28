@@ -6,7 +6,7 @@ import { vec3 } from 'gl-matrix';
 import * as dat from 'dat.gui';
 import { Sphere } from './objects/sphere';
 import { SphereRenderer } from './objects/sphere-renderer';
-import { RayTracer } from './raytracer/raytracer';
+import { RayTracer, RayHit } from './raytracer/raytracer';
 import { AudioProcessor } from './sound/audio-processor';
 import { WaveformRenderer } from './visualization/waveform-renderer';
 import { DEFAULT_WALL_MATERIAL } from './room/room';
@@ -37,7 +37,8 @@ export class Main {
     private audioProcessor: AudioProcessor;
     private waveformRenderer: WaveformRenderer;
     private sourceParams = {
-        sourcePower: 0
+        // Change sourcePower to a more realistic default, e.g., 90 dB SPL (a loud shout)
+        sourcePower: 90
     };
     private soundFileParams = {
         selectedFile: 'loop.mp3',
@@ -58,31 +59,14 @@ export class Main {
             alphaMode: 'premultiplied',
         });
 
-        // Initialize room config
+        // Initialize room config with a default preset
+        const defaultPreset = ROOM_PRESETS.RECORDING_STUDIO;
         this.roomConfig = {
-            dimensions: { width: 8, height: 3, depth: 5 },
+            dimensions: { ...defaultPreset.dimensions },
             materials: {
-                walls: {
-                    absorption: 0.1,
-                    absorptionLow: 0.15,
-                    absorptionMid: 0.1,
-                    absorptionHigh: 0.05,
-                    scattering: 0.1
-                },
-                ceiling: {
-                    absorption: 0.2,
-                    absorptionLow: 0.25,
-                    absorptionMid: 0.2,
-                    absorptionHigh: 0.15,
-                    scattering: 0.1
-                },
-                floor: {
-                    absorption: 0.1,
-                    absorptionLow: 0.15,
-                    absorptionMid: 0.1,
-                    absorptionHigh: 0.05,
-                    scattering: 0.2
-                }
+                walls: { ...DEFAULT_WALL_MATERIAL, ...defaultPreset.materials.walls },
+                ceiling: { ...DEFAULT_WALL_MATERIAL, ...defaultPreset.materials.ceiling },
+                floor: { ...DEFAULT_WALL_MATERIAL, ...defaultPreset.materials.floor }
             }
         };
 
@@ -163,10 +147,9 @@ export class Main {
         };
 
         const materialsFolder = this.gui.addFolder('Materials');
-        materialsFolder.add(this.roomConfig.materials.walls, 'absorptionLow', 0, 1).name('Walls Absorption Low');
-        materialsFolder.add(this.roomConfig.materials.ceiling, 'absorptionLow', 0, 1).name('Ceiling Absorption Low');
-        materialsFolder.add(this.roomConfig.materials.floor, 'absorptionLow', 0, 1).name('Floor Absorption Low');
-
+        materialsFolder.add(this.room.config.materials.walls, 'absorption1k', 0, 1, 0.01).name('Walls Abs (1k)').onChange(() => this.updateRoom());
+        materialsFolder.add(this.room.config.materials.walls, 'scattering1k', 0, 1, 0.01).name('Walls Scat (1k)').onChange(() => this.updateRoom());
+        
         // Create a data object for the sound source position
         const sourcePosition = {
             x: 0,
@@ -199,16 +182,12 @@ export class Main {
                 })
         };
 
-        // Add source power control
-        sourceFolder.add(this.sourceParams, 'sourcePower', -60, 20)
-            .name('Power (dB)')
-            .onChange((value: number) => {
-                this.sourceParams = {
-                    ...this.sourceParams,
-                    sourcePower: value
-                };
-                // Recalculate IR when power changes
-                this.calculateIR();
+        // Update the source power controller with a realistic range
+        sourceFolder.add(this.sourceParams, 'sourcePower', 60, 120) // 60dB (conversation) to 120dB (pain threshold)
+            .name('Power (dB SPL)')
+            .onChange(() => {
+                // No need to immediately recalculate, it will be used on the next "Calculate IR" press
+                console.log(`Source power set to: ${this.sourceParams.sourcePower} dB`);
             });
 
         // Add ray tracing controls
@@ -218,7 +197,7 @@ export class Main {
                 await this.calculateIR();
             }
         };
-        rayTracingFolder.add(rayTracingControls, 'calculateIR').name('Calculate IR');
+        rayTracingFolder.add(rayTracingControls, 'calculateIR').name('Calculate & Visualize IR');
 
         // --- Audio Debug Controls ---
         const audioFolder = this.gui.addFolder('Audio Debug');
@@ -233,7 +212,7 @@ export class Main {
         const soundFileFolder = this.gui.addFolder('Sound Files');
 
         // ADD YOUR MP3 FILE HERE
-        soundFileFolder.add(this.soundFileParams, 'selectedFile', ['loop.mp3', 'snare.mp3', 'top_loop.mp3'])
+        soundFileFolder.add(this.soundFileParams, 'selectedFile', ['loop.mp3', 'snare.mp3', 'top_loop.mp3','KoolTheGang-Summertime_MONO.mp3'])
             .name('Select Sound')
             .onChange((value: string) => {
                 this.soundFileParams.selectedFile = value;
@@ -264,18 +243,18 @@ export class Main {
     }
 
     private updateRoom(): void {
-        // Recreate room with new dimensions
+        // Recreate room with new dimensions and materials
         this.room = new Room(this.device, this.roomConfig);
 
         // Ensure camera stays within room bounds
         this.constrainCamera();
 
         // Update source position slider ranges
-        this.sourceControllers.x.min(-this.roomConfig.dimensions.width/2)
-            .max(this.roomConfig.dimensions.width/2);
-        this.sourceControllers.y.min(0).max(this.roomConfig.dimensions.height);
-        this.sourceControllers.z.min(-this.roomConfig.dimensions.depth/2)
-            .max(this.roomConfig.dimensions.depth/2);
+        this.sourceControllers.x.min(-this.roomConfig.dimensions.width/2 + 0.2)
+            .max(this.roomConfig.dimensions.width/2 - 0.2);
+        this.sourceControllers.y.min(0.2).max(this.roomConfig.dimensions.height - 0.2);
+        this.sourceControllers.z.min(-this.roomConfig.dimensions.depth/2 + 0.2)
+            .max(this.roomConfig.dimensions.depth/2 - 0.2);
 
         // Keep sphere at current position unless it's outside new bounds
         const currentPos = this.sphere.getPosition();
@@ -288,24 +267,14 @@ export class Main {
         this.roomConfig.materials.walls = { ...DEFAULT_WALL_MATERIAL, ...preset.materials.walls };
         this.roomConfig.materials.ceiling = { ...DEFAULT_WALL_MATERIAL, ...preset.materials.ceiling };
         this.roomConfig.materials.floor = { ...DEFAULT_WALL_MATERIAL, ...preset.materials.floor };
+        
+        // Update the GUI display to reflect the new preset values
+        for (const i in this.roomDimensionControllers) {
+            (this.roomDimensionControllers as any)[i].updateDisplay();
+        }
+        this.gui.updateDisplay(); // Update all controllers
+
         this.updateRoom();
-
-        // Update source position controller ranges based on new room dimensions
-        this.sourceControllers.x.min(-this.roomConfig.dimensions.width / 2);
-        this.sourceControllers.x.max(this.roomConfig.dimensions.width / 2);
-        this.sourceControllers.x.updateDisplay();
-
-        this.sourceControllers.y.max(this.roomConfig.dimensions.height);
-        this.sourceControllers.y.updateDisplay();
-
-        this.sourceControllers.z.min(-this.roomConfig.dimensions.depth / 2);
-        this.sourceControllers.z.max(this.roomConfig.dimensions.depth / 2);
-        this.sourceControllers.z.updateDisplay();
-
-        // Update room dimension controller ranges
-        this.roomDimensionControllers.width.min(2).max(preset.dimensions.width * 1.5).updateDisplay();
-        this.roomDimensionControllers.height.min(2).max(preset.dimensions.height * 1.5).updateDisplay();
-        this.roomDimensionControllers.depth.min(2).max(preset.dimensions.depth * 1.5).updateDisplay();
     }
 
     private constrainCamera(): void {
@@ -364,28 +333,24 @@ export class Main {
         if (this.keys['a']) this.camera.moveRight(-deltaTime);
         if (this.keys['d']) this.camera.moveRight(deltaTime);
         if (this.keys[' ']) this.camera.moveUp(deltaTime);
-        if (this.keys['shift']) this.camera.moveUp(-deltaTime);
+        if (this.keys['c']) this.camera.moveUp(-deltaTime); // Use C for down to avoid conflict with Shift
     }
 
     public render(deltaTime: number): void {
         // Handle input
         this.handleInput(deltaTime);
+        this.constrainCamera(); // Constrain camera after input handling
 
         // Update room's view projection with camera
         const aspect = this.canvas.width / this.canvas.height;
         const viewProjection = this.camera.getViewProjection(aspect);
-        this.device.queue.writeBuffer(
-            this.room['uniformBuffer'], // Accessing private member, might need to add a public method
-            0,
-            viewProjection as Float32Array
-        );
-
+        
         // Begin render pass
         const commandEncoder = this.device.createCommandEncoder();
         const renderPass = commandEncoder.beginRenderPass({
             colorAttachments: [{
                 view: this.context.getCurrentTexture().createView(),
-                clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+                clearValue: { r: 0.05, g: 0.05, b: 0.1, a: 1.0 },
                 loadOp: 'clear',
                 storeOp: 'store',
             }],
@@ -430,12 +395,13 @@ export class Main {
     }
 
     private async calculateIR(): Promise<void> {
-        await this.rayTracer.calculateRayPaths();
+        // This now correctly uses the camera's current position at the time of the button press.
+        await this.rayTracer.calculateRayPaths(this.camera);
         const hits = this.rayTracer.getRayHits();
         await this.audioProcessor.processRayHits(
             hits,
             this.camera,
-            0.5,
+            2.0, // IR duration
             {
                 speedOfSound: 343,
                 maxDistance: 20,
@@ -456,7 +422,7 @@ export class Main {
             this.stopSound();
 
             // Load and play the selected sound file
-            const soundPath = `src/soundfile/${this.soundFileParams.selectedFile}`;
+            const soundPath = `/soundfile/${this.soundFileParams.selectedFile}`;
             await this.audioProcessor.loadAndPlaySoundFile(soundPath);
 
             this.soundFileParams.isPlaying = true;
@@ -475,8 +441,6 @@ export class Main {
             console.error('Error stopping sound:', error);
         }
     }
-
-
 }
 
 // Animation loop

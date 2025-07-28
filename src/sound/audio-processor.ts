@@ -1,27 +1,37 @@
-/**
- * AudioProcessor
- *
- * This class integrates real-time audio processing using the Web Audio API.
- * It converts ray hit data (each with a time and energy value) into an impulse response
- * and plays that sound through the device's audio output.
- *
- * Methods:
- *   - processRayHits: Converts ray hit data into an impulse response.
- *   - playAudio: Plays the generated impulse response.
- *   - generateAndPlay: Convenience method combining the above two.
- *   - debugPlaySineWave: Plays a test sine wave for debug purposes.
- *   - playSoundWithImpulseResponse: Convolves a dry white noise signal with the impulse response and plays it.
- */
 import { Camera } from '../camera/camera';
 import { SpatialAudioProcessor } from './spatial-audio-processor';
 import { Room } from '../room/room';
 import { WaveformRenderer } from '../visualization/waveform-renderer';
-import { vec3 } from 'gl-matrix/vec3';
+import { vec3 } from 'gl-matrix';
+import { RayHit } from '../raytracer/raytracer';
+
+interface RoomMode {
+  frequency: number;
+  rt60: number;
+}
+
+const NUM_BANDS = 8;
+const BAND_CENTERS = [63, 125, 250, 500, 1000, 2000, 4000, 8000];
+
+// Helper to get total energy from a RayHit object
+const getTotalEnergy = (hit: RayHit): number => {
+    return (
+        (hit.energy63  || 0) + (hit.energy125 || 0) + (hit.energy250 || 0) +
+        (hit.energy500 || 0) + (hit.energy1k  || 0) + (hit.energy2k  || 0) +
+        (hit.energy4k  || 0) + (hit.energy8k  || 0)
+    );
+};
+
+// Helper to get average energy from a RayHit object
+const getAverageEnergy = (hit: RayHit): number => {
+    return getTotalEnergy(hit) / NUM_BANDS;
+};
 
 export class AudioProcessor {
   private audioCtx: AudioContext;
   private sampleRate: number;
   private impulseResponseBuffer: AudioBuffer | null;
+  private lastRayHits: RayHit[] | null = null;
   private lastImpulseData: Float32Array | null;
   private spatialProcessor: SpatialAudioProcessor;
   private room: Room;
@@ -48,18 +58,9 @@ export class AudioProcessor {
    * @param params - Additional parameters for spatial audio processing.
    */
   async processRayHits(
-    rayHits: Array<{
-        position: vec3,
-        energyLow: number,
-        energyMid: number,
-        energyHigh: number,
-        time: number,
-        phase: number,
-        frequency: number,
-        dopplerShift: number
-    }>,
+    rayHits: RayHit[],
     camera: Camera,
-    maxTime: number = 0.5,
+    maxTime: number = 2.0, // Increased default IR time for more reverb
     params = {
         speedOfSound: 343,
         maxDistance: 20,
@@ -70,24 +71,35 @@ export class AudioProcessor {
     }
   ): Promise<void> {
     try {
+        if (!rayHits || rayHits.length === 0) {
+            console.warn("No ray hits to process, skipping IR generation.");
+            return;
+        }
+        this.lastRayHits = rayHits;
+
         const sortedHits = [...rayHits].sort((a, b) => a.time - b.time);
+        const irDuration = Math.min(maxTime, (sortedHits[sortedHits.length - 1]?.time || 0) + 0.5);
+        const sampleCount = Math.ceil(irDuration * this.sampleRate);
 
-        const [leftIR, rightIR] = this.createImpulseResponseFromHits(sortedHits, maxTime);
+        // STEP 1: Generate ONE spectrally-rich broadband impulse response from reflections.
+        const [reflectionL, reflectionR] = this.createReflectionImpulse(sortedHits, sampleCount, camera);
 
-        // The rest of the function remains the same...
-        const sampleCount = leftIR.length;
+        // STEP 2: Generate a SEPARATE signal for the room modes.
+        const [modesL, modesR] = this.createRoomModesImpulse(this.room.config.dimensions, sampleCount);
+
+        // Apply a global decay envelope to the reflections. Modes handle their own decay.
         const envelope = this.generateEnvelope(sampleCount, sortedHits);
+        this.applyEnvelope(reflectionL, reflectionR, envelope);
 
-        // (Optional) You can still add room modes if you wish
-        const roomModes = this.calculateRoomModes(this.room.config.dimensions);
-        this.addRoomModes(leftIR, rightIR, roomModes);
+        // STEP 3 & 4: Synthesize the final IR by mixing the parts and normalizing.
+        this.impulseResponseBuffer = this._synthesizeFinalIR(
+            reflectionL, reflectionR, modesL, modesR
+        );
 
-        this.normalizeAndApplyEnvelope(leftIR, rightIR, envelope);
-        this.setupImpulseResponseBuffer(leftIR, rightIR);
-        this.lastImpulseData = leftIR;
-
-        // Debug: Log impulse response characteristics
-        this.debugImpulseResponse(leftIR, rightIR);
+        if (this.impulseResponseBuffer) {
+            this.lastImpulseData = this.impulseResponseBuffer.getChannelData(0);
+            this.debugImpulseResponse(this.impulseResponseBuffer.getChannelData(0), this.impulseResponseBuffer.getChannelData(1));
+        }
 
         console.log("Impulse response processed successfully.");
     } catch (error) {
@@ -95,37 +107,124 @@ export class AudioProcessor {
         throw error;
     }
   }
-
-  // Add this new function to the AudioProcessor class
-  private createImpulseResponseFromHits(
-      rayHits: any[],
-      maxTime: number
-  ): [Float32Array, Float32Array] {
-    const sampleCount = Math.ceil(maxTime * this.sampleRate);
+  
+  private createReflectionImpulse(rayHits: RayHit[], sampleCount: number, camera: Camera): [Float32Array, Float32Array] {
     const leftIR = new Float32Array(sampleCount).fill(0);
     const rightIR = new Float32Array(sampleCount).fill(0);
 
+    const sinc = (x: number) => x === 0 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x);
+    const impulseWidth = 8;
+    const impulse = new Float32Array(impulseWidth * 2 + 1);
+    for (let i = -impulseWidth; i <= impulseWidth; i++) {
+        impulse[i + impulseWidth] = sinc(i / 2) * (0.54 - 0.46 * Math.cos(2 * Math.PI * (i + impulseWidth) / (impulseWidth * 2))); // Sinc with Hamming
+    }
+
     for (const hit of rayHits) {
-        const time = Math.max(hit.time || 0, 0);
-        if (time < maxTime) {
-            const sampleIndex = Math.floor(time * this.sampleRate);
+        const time = hit.time || 0;
+        const sampleIndex = Math.floor(time * this.sampleRate);
+        if (sampleIndex >= sampleCount - impulseWidth) continue;
 
-            const energy = ( (hit.energyLow || 0) + (hit.energyMid || 0) + (hit.energyHigh || 0) ) / 3;
-            const amplitude = Math.sqrt(Math.max(energy, 0));
+        // FIX: Use the helper function to correctly calculate total energy from the 8 bands
+        const totalEnergy = getTotalEnergy(hit);
+        
+        const amplitude = Math.sqrt(Math.max(totalEnergy, 0));
+        if (!isFinite(amplitude) || amplitude === 0) continue;
 
-            const [leftGain, rightGain] = this.calculateSpatialGains(hit.position || [0, 0, 0]);
+        const [leftGain, rightGain] = this.calculateSpatialGains(hit.position || vec3.fromValues(0, 0, 0), camera);
 
-            if (sampleIndex < sampleCount && isFinite(amplitude)) {
-                leftIR[sampleIndex] += amplitude * leftGain;
-                rightIR[sampleIndex] += amplitude * rightGain;
+        // Create a simple filter based on energy distribution to add spectral color
+        const lowEnergy = (hit.energy63 + hit.energy125 + hit.energy250) / totalEnergy;
+        const midEnergy = (hit.energy500 + hit.energy1k + hit.energy2k) / totalEnergy;
+        const highEnergy = (hit.energy4k + hit.energy8k) / totalEnergy;
+        
+        // Color the impulse - this is a simplification but better than nothing
+        const coloredAmplitude = amplitude * (lowEnergy * 0.5 + midEnergy * 1.0 + highEnergy * 1.2);
+
+        for (let i = 0; i < impulse.length; i++) {
+            const idx = sampleIndex + i - impulseWidth;
+            if (idx >= 0 && idx < sampleCount) {
+                const impulseValue = impulse[i] * coloredAmplitude;
+                leftIR[idx] += impulseValue * leftGain;
+                rightIR[idx] += impulseValue * rightGain;
             }
         }
     }
-
     return [leftIR, rightIR];
   }
 
-  private applyWaveInterference(leftIR: Float32Array, rightIR: Float32Array, rayHits: any[]): void {
+  private createRoomModesImpulse(dimensions: { width: number; height: number; depth: number; }, sampleCount: number): [Float32Array, Float32Array] {
+    const modesL = new Float32Array(sampleCount).fill(0);
+    const modesR = new Float32Array(sampleCount).fill(0);
+    const modes = this.calculateRoomModes(dimensions);
+
+    modes.forEach(mode => {
+        const freq = mode.frequency;
+        const amplitude = 0.05; // Modes have a small, fixed amplitude.
+        const k = 6.907 / mode.rt60;
+        const phase = Math.random() * 2 * Math.PI;
+
+        for (let i = 0; i < sampleCount; i++) {
+            const t = i / this.sampleRate;
+            if (t > mode.rt60 * 1.5) break;
+
+            const decay = Math.exp(-k * t);
+            const sample = amplitude * decay * Math.sin(2 * Math.PI * freq * t + phase);
+            modesL[i] += sample;
+            modesR[i] += sample;
+        }
+    });
+    return [modesL, modesR];
+  }
+
+  private _synthesizeFinalIR(
+    reflectionL: Float32Array, reflectionR: Float32Array,
+    modesL: Float32Array, modesR: Float32Array
+  ): AudioBuffer | null {
+    const sampleCount = reflectionL.length;
+    if (sampleCount === 0) return null;
+
+    // --- MANUAL MIXING (Replaces OfflineAudioContext) ---
+    // This synchronous mixing is significantly faster than using an OfflineAudioContext,
+    // which introduces latency by scheduling the rendering asynchronously.
+    const finalL = new Float32Array(sampleCount);
+    const finalR = new Float32Array(sampleCount);
+
+    for (let i = 0; i < sampleCount; i++) {
+        finalL[i] = reflectionL[i] + modesL[i];
+        finalR[i] = reflectionR[i] + modesR[i];
+    }
+
+    // --- MASTER NORMALIZATION ---
+    let max = 0.0001; // Avoid division by zero
+    for (let i = 0; i < sampleCount; i++) {
+        max = Math.max(max, Math.abs(finalL[i]), Math.abs(finalR[i]));
+    }
+
+    const gain = 0.98 / max;
+    if (gain < 1.0) { // Only apply gain if it's clipping
+        for (let i = 0; i < sampleCount; i++) {
+            finalL[i] *= gain;
+            finalR[i] *= gain;
+        }
+    }
+
+    // --- CREATE FINAL AUDIOBUFFER ---
+    const finalBuffer = this.audioCtx.createBuffer(2, sampleCount, this.sampleRate);
+    finalBuffer.copyToChannel(finalL, 0);
+    finalBuffer.copyToChannel(finalR, 1);
+
+    return finalBuffer;
+  }
+
+  // Simplified envelope application
+  private applyEnvelope(leftIR: Float32Array, rightIR: Float32Array, envelope: Float32Array): void {
+      for (let i = 0; i < leftIR.length; i++) {
+          leftIR[i] *= envelope[i];
+          rightIR[i] *= envelope[i];
+      }
+  }
+
+  private applyWaveInterference(leftIR: Float32Array, rightIR: Float32Array, rayHits: RayHit[], camera: Camera): void {
     const timeStep = 1 / this.sampleRate;
     
     // Process each sample
@@ -138,27 +237,25 @@ export class AudioProcessor {
         for (const hit of rayHits) {
             if (hit.time <= currentTime) {
                 // Validate inputs to prevent NaN
-                const frequency = Math.max(hit.frequency || 440, 20); // Minimum 20Hz
-                const dopplerShift = Math.max(hit.dopplerShift || 1, 0.1); // Minimum 0.1
-                const phase = hit.phase || 0;
+                const frequency = 440; // Simplified
+                const dopplerShift = Math.max(hit.dopplerShift || 1, 0.1);
+                const phase = (hit.phase63 || 0); // Simplified
                 
                 // Calculate phase at current time
                 const timeSinceArrival = Math.max(currentTime - hit.time, 0);
                 const instantPhase = phase + 
                     2 * Math.PI * frequency * (1 + dopplerShift) * timeSinceArrival;
 
-                // Calculate amplitude with validation
-                const energyLow = Math.max(hit.energyLow || 0, 0);
-                const energyMid = Math.max(hit.energyMid || 0, 0);
-                const energyHigh = Math.max(hit.energyHigh || 0, 0);
-                const amplitude = Math.sqrt((energyLow + energyMid + energyHigh) / 3);
+                // FIX: Use helper function to get average energy
+                const avgEnergy = getAverageEnergy(hit);
+                const amplitude = Math.sqrt(avgEnergy);
 
                 // Add wave contribution with proper phase
                 const contribution = amplitude * Math.sin(instantPhase);
                 
                 // Validate position for spatial gains
-                const position = hit.position || [0, 0, 0];
-                const [leftGain, rightGain] = this.calculateSpatialGains(position);
+                const position = hit.position || vec3.fromValues(0, 0, 0);
+                const [leftGain, rightGain] = this.calculateSpatialGains(position, camera);
                 
                 // Add validated contributions
                 if (!isNaN(contribution) && isFinite(contribution)) {
@@ -174,86 +271,102 @@ export class AudioProcessor {
     }
   }
 
-  private calculateSpatialGains(position: vec3): [number, number] {
-    // Simple stereo panning based on x-position
-    // Could be enhanced with HRTF in the future
-    const x = position[0];
-    const maxPan = 0.8; // Maximum panning amount (0.8 = 80% to either side)
-    const pan = Math.max(-maxPan, Math.min(maxPan, x / 5)); // Normalize position to pan range
-        
-    // Convert pan to gains using constant power panning
-    const leftGain = Math.cos((pan + 1) * Math.PI / 4);
-    const rightGain = Math.sin((pan + 1) * Math.PI / 4);
-        
+  // --- FIX: Corrected spatialization logic ---
+  private calculateSpatialGains(hitPosition: vec3, camera: Camera): [number, number] {
+    const listenerPos = camera.getPosition();
+    const listenerFwd = camera.getFront();
+    const listenerUp = camera.getUp();
+
+    // Calculate the listener's right-hand vector
+    const listenerRight = vec3.cross(vec3.create(), listenerFwd, listenerUp);
+    vec3.normalize(listenerRight, listenerRight);
+
+    // --- THE FIX IS HERE ---
+    // Calculate the direction vector FROM the listener TOWARDS the sound hit.
+    // This is the correct vector to determine if something is to the left or right.
+    const fromListenerToHitDir = vec3.subtract(vec3.create(), hitPosition, listenerPos);
+    vec3.normalize(fromListenerToHitDir, fromListenerToHitDir);
+
+    // Project the direction to the sound onto the listener's right vector.
+    // This gives a value from -1 (fully to the listener's left) to +1 (fully to the right).
+    const pan = vec3.dot(fromListenerToHitDir, listenerRight);
+
+    // Use a constant power panning law to calculate gain for left and right channels.
+    // Angle ranges from 0 (fully left) to PI/2 (fully right).
+    const angle = (pan + 1.0) * Math.PI / 4.0; // Map pan range [-1, 1] to angle [0, PI/2]
+    const leftGain = Math.cos(angle);
+    const rightGain = Math.sin(angle);
+
     return [leftGain, rightGain];
   }
 
-  private calculateRT60(rayHits: Array<{ time: number, energyLow: number, energyMid: number, energyHigh: number }>): number {
-    if (rayHits.length === 0) {
-        return 1.0; // Default RT60 if no hits
-    }
-
+  private calculateRT60(rayHits: RayHit[]): number {
+    if (rayHits.length === 0) return 1.0;
     // Sort hits by time
     const sortedHits = [...rayHits].sort((a, b) => a.time - b.time);
 
-    // Calculate energy decay curve
-    const times: number[] = [];
-    const energies: number[] = [];
-    let totalEnergy = 0;
-
-    sortedHits.forEach(hit => {
-        times.push(hit.time);
-        // Average energy across frequency bands
-        const avgEnergy = (hit.energyLow + hit.energyMid + hit.energyHigh) / 3;
-        totalEnergy += avgEnergy;
-        energies.push(totalEnergy);
-    });
-
-    // Normalize energies
-    const maxEnergy = Math.max(...energies);
-    const normalizedEnergies = energies.map(e => e / maxEnergy);
-
-    // Find -60dB point (energy = 0.001)
-    let rt60Time = times[times.length - 1]; // Default to last time
-    for (let i = 0; i < normalizedEnergies.length; i++) {
-        if (normalizedEnergies[i] <= 0.001) { // -60dB
-            rt60Time = times[i];
-            break;
-        }
+    // Schröder integration method for a more robust RT60 calculation from impulse data
+    const energyCurve = new Float32Array(sortedHits.length);
+    let totalEnergySum = 0;
+    for (let i = sortedHits.length - 1; i >= 0; i--) {
+        totalEnergySum += getTotalEnergy(sortedHits[i]);
+        energyCurve[i] = totalEnergySum;
     }
+    
+    if (totalEnergySum === 0) return 1.0; // No energy, can't calculate
 
-    // Apply Sabine's formula correction based on room volume and surface area
-    const volume = this.room.getVolume();
-    const surfaceArea = this.room.getSurfaceArea();
+    // Normalize to dB
+    const energyDB = energyCurve.map(e => 10 * Math.log10(e / totalEnergySum));
+    
+    // Find T20 or T30 using linear regression, which is more robust than finding a single point
+    const startIndex = energyDB.findIndex(db => db < -5);
+    const endIndex = energyDB.findIndex(db => db < -25);
+    
+    if (startIndex === -1 || endIndex === -1 || startIndex >= endIndex) return sortedHits[sortedHits.length - 1].time;
 
-    // Get average absorption coefficient
-    const avgAbsorption = this.calculateAverageAbsorption();
+    const times: number[] = sortedHits.slice(startIndex, endIndex).map(hit => hit.time);
+    const dbs: number[] = energyDB.slice(startIndex, endIndex);
 
-    // Sabine's formula: RT60 = 0.161 * V / (A * S)
-    // where V is volume, A is average absorption, S is surface area
-    const sabineRT60 = 0.161 * volume / (avgAbsorption * surfaceArea);
+    // Simple linear regression to find the slope
+    let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+    for (let i = 0; i < times.length; i++) {
+        sumX += times[i];
+        sumY += dbs[i];
+        sumXY += times[i] * dbs[i];
+        sumX2 += times[i] * times[i];
+    }
+    const n = times.length;
+    const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+    
+    if (slope >= 0) return sortedHits[sortedHits.length - 1].time; // No decay
 
-    // Blend measured and theoretical RT60
-    return (rt60Time + sabineRT60) / 2;
+    const rt60 = -60 / slope;
+    
+    return isFinite(rt60) ? rt60 : 2.0;
   }
 
   private calculateAverageAbsorption(): number {
     const materials = this.room.config.materials;
+    const { walls, ceiling, floor } = materials;
     let totalAbsorption = 0;
-    let count = 0;
+    const numBands = 8;
 
-    // Calculate average absorption across all surfaces and frequency bands
-    Object.values(materials).forEach(material => {
-        totalAbsorption += material.absorptionLow;
-        totalAbsorption += material.absorptionMid;
-        totalAbsorption += material.absorptionHigh;
-        count += 3; // Three frequency bands
-    });
+    const getAvg = (mat: any) => {
+        let sum = 0;
+        for (let i = 0; i < numBands; i++) {
+            sum += mat[`absorption${BAND_CENTERS[i]}`] || 0;
+        }
+        return sum / numBands;
+    };
+    
+    totalAbsorption += getAvg(walls);
+    totalAbsorption += getAvg(ceiling);
+    totalAbsorption += getAvg(floor);
 
-    return totalAbsorption / count;
+    return totalAbsorption / 3;
   }
 
-  private generateEnvelope(sampleCount: number, rayHits: any[]): Float32Array {
+  private generateEnvelope(sampleCount: number, rayHits: RayHit[]): Float32Array {
     const envelope = new Float32Array(sampleCount);
 
     // Calculate RT60 from ray hits
@@ -270,48 +383,76 @@ export class AudioProcessor {
         // Late reverberation
         else {
             // Use Schroeder decay curve instead of simple exponential
-            envelope[i] = Math.exp(-6.91 * t / rt60);
+            const decay = Math.exp(-6.91 * t / rt60);
+            // Blend from early to late
+            const blendFactor = Math.min(1.0, (t - 0.05) / 0.1);
+            envelope[i] = (1 - blendFactor) * Math.exp(-3 * t) + blendFactor * decay;
         }
     }
 
     return envelope;
   }
 
-  private normalizeAndApplyEnvelope(leftIR: Float32Array, rightIR: Float32Array, envelope: Float32Array): void {
-    // Find maximum amplitude
-    let maxAmplitude = 0;
-    for (let i = 0; i < leftIR.length; i++) {
-        maxAmplitude = Math.max(maxAmplitude, Math.abs(leftIR[i]), Math.abs(rightIR[i]));
-    }
+  private _calculateFrequencyDependentRT60(frequency: number): number {
+      const { materials, dimensions } = this.room.config;
+      const volume = dimensions.width * dimensions.height * dimensions.depth;
+      const surfaceArea = 2 * (dimensions.width * dimensions.height + dimensions.height * dimensions.depth + dimensions.width * dimensions.depth);
 
-    // Normalize and apply envelope
-    if (maxAmplitude > 0) {
-        for (let i = 0; i < leftIR.length; i++) {
-            leftIR[i] = (leftIR[i] / maxAmplitude) * envelope[i];
-            rightIR[i] = (rightIR[i] / maxAmplitude) * envelope[i];
-        }
-    }
+      if (surfaceArea === 0) return 1.0; // Avoid division by zero
+
+      const getAbsorptionForFreq = (mat: any, freq: number) => {
+          // Logarithmic interpolation between bands
+          const log_f = Math.log(freq);
+          const logCenters = BAND_CENTERS.map(f => Math.log(f));
+          const absorptions = BAND_CENTERS.map(band => mat[`absorption${band}`] || 0);
+
+          if (log_f <= logCenters[0]) return absorptions[0];
+          if (log_f >= logCenters[NUM_BANDS - 1]) return absorptions[NUM_BANDS - 1];
+          for (let i = 1; i < NUM_BANDS; i++) {
+              if (log_f < logCenters[i]) {
+                  const ratio = (log_f - logCenters[i - 1]) / (logCenters[i] - logCenters[i - 1]);
+                  return absorptions[i - 1] + ratio * (absorptions[i] - absorptions[i - 1]);
+              }
+          }
+          return absorptions[NUM_BANDS-1];
+      }
+
+      const avgAlpha = (
+          getAbsorptionForFreq(materials.walls, frequency) +
+          getAbsorptionForFreq(materials.ceiling, frequency) +
+          getAbsorptionForFreq(materials.floor, frequency)
+      ) / 3;
+
+      return (avgAlpha > 0) ? (0.161 * volume) / (surfaceArea * avgAlpha) : 10.0;
   }
 
   private calculateRoomModes(dimensions: { width: number, height: number, depth: number }): RoomMode[] {
     const modes: RoomMode[] = [];
-    // Calculate axial, tangential, and oblique modes
-    // Add to array with frequencies and decay times
-    return modes;
-  }
+    const speedOfSound = 343;
+    const { width, height, depth } = dimensions;
 
-  private addRoomModes(leftIR: Float32Array, rightIR: Float32Array, modes: RoomMode[]): void {
-    // Add modal resonances to the impulse response
-    modes.forEach(mode => {
-        const freq = mode.frequency;
-        const decay = Math.exp(-3 * mode.decayTime / mode.rt60);
+    if (width <= 0 || height <= 0 || depth <= 0) return []; // Prevent division by zero
 
-        for (let t = 0; t < leftIR.length; t++) {
-            const sample = decay * Math.sin(2 * Math.PI * freq * t / this.sampleRate);
-            leftIR[t] += sample;
-            rightIR[t] += sample;
+    const maxN = 5; // Check modes up to this index
+    for (let nx = 0; nx <= maxN; nx++) {
+        for (let ny = 0; ny <= maxN; ny++) {
+            for (let nz = 0; nz <= maxN; nz++) {
+                if (nx === 0 && ny === 0 && nz === 0) continue;
+
+                const freq = (speedOfSound / 2) * Math.sqrt(
+                    (nx / width) ** 2 + (ny / height) ** 2 + (nz / depth) ** 2
+                );
+
+                if (freq < 300 && freq > 20) { // Only consider dominant, audible low-frequency modes
+                    modes.push({ 
+                        frequency: freq, 
+                        rt60: this._calculateFrequencyDependentRT60(freq) 
+                    });
+                }
+            }
         }
-    });
+    }
+    return modes;
   }
 
   /**
@@ -339,8 +480,12 @@ export class AudioProcessor {
    * @param camera - The camera object to use for spatial audio processing.
    * @param maxTime - Maximum duration of the impulse response.
    */
-  async generateAndPlay(rayHits: Array<{ time: number; energyLow: number; energyMid: number; energyHigh: number }>, camera: Camera, maxTime: number = 0.5): Promise<void> {
-    await this.processRayHits(rayHits, camera, maxTime);
+  async generateAndPlay(rayHits: RayHit[], camera: Camera, maxTime: number = 2.0): Promise<void> {
+    await this.processRayHits(
+        rayHits,
+        camera, 
+        maxTime
+    );
     this.playAudio();
   }
 
@@ -354,7 +499,7 @@ export class AudioProcessor {
    */
   async playSoundWithImpulseResponse(duration: number = 0.1): Promise<void> {
     if (!this.impulseResponseBuffer) {
-        console.warn("AudioProcessor: No impulse response available for convolution.");
+        console.warn("AudioProcessor: No impulse response available forconvolution.");
         return;
     }
 
@@ -512,6 +657,10 @@ export class AudioProcessor {
    * Debug method to analyze impulse response characteristics
    */
   private debugImpulseResponse(leftIR: Float32Array, rightIR: Float32Array): void {
+    if (!leftIR || leftIR.length === 0) {
+        console.log("=== Impulse Response Debug: No data to analyze. ===");
+        return;
+    }
     // Calculate basic statistics
     const leftMax = Math.max(...leftIR);
     const leftMin = Math.min(...leftIR);

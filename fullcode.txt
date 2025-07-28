@@ -366,30 +366,95 @@ export class Sphere {
 
 src\raytracer\shaders\raytracer.wgsl:
 <code>
+// Assuming these constants based on spatial_audio.wgsl
+const BAND_63 = 0;
+const BAND_125 = 1;
+const BAND_250 = 2;
+const BAND_500 = 3;
+const BAND_1K = 4;
+const BAND_2K = 5;
+const BAND_4K = 6;
+const BAND_8K = 7;
+const NUM_BANDS = 8;
+
 struct Ray {
     origin: vec3f,
     direction: vec3f,
-    energy: f32,
+    // Energy for each frequency band
+    energy63: f32,
+    energy125: f32,
+    energy250: f32,
+    energy500: f32,
+    energy1k: f32,
+    energy2k: f32,
+    energy4k: f32,
+    energy8k: f32,
     pathLength: f32,
     bounces: u32,
     isActive: u32,
-    frequency: f32,    // Frequency of the wave in Hz
-    phase: f32,        // Current phase of the wave
-    time: f32         // Time elapsed for this ray
+    // Phase for each frequency band
+    phase63: f32,
+    phase125: f32,
+    phase250: f32,
+    phase500: f32,
+    phase1k: f32,
+    phase2k: f32,
+    phase4k: f32,
+    phase8k: f32,
+    // Time is common for all bands
+    time: f32
 };
 
 struct Surface {
     normal: vec3f,
     position: vec3f,
-    absorption: f32
+    // Absorption for each frequency band
+    absorption63: f32,
+    absorption125: f32,
+    absorption250: f32,
+    absorption500: f32,
+    absorption1k: f32,
+    absorption2k: f32,
+    absorption4k: f32,
+    absorption8k: f32,
+    // Scattering for each frequency band
+    scattering63: f32,
+    scattering125: f32,
+    scattering250: f32,
+    scattering500: f32,
+    scattering1k: f32,
+    scattering2k: f32,
+    scattering4k: f32,
+    scattering8k: f32
 };
 
 struct RayHit {
     position: vec3f,
-    energy: f32,
     time: f32,
-    phase: f32,       // Phase at hit point
-    frequency: f32    // Frequency of the wave at hit point
+    normal: vec3f,
+    // Energy for each frequency band (matching spatial_audio.wgsl)
+    energy63: f32,
+    energy125: f32,
+    energy250: f32,
+    energy500: f32,
+    energy1k: f32,
+    energy2k: f32,
+    energy4k: f32,
+    energy8k: f32,
+    incomingDirection: vec3f, // Added to match spatial_audio.wgsl
+    // Phase for each frequency band
+    phase63: f32,
+    phase125: f32,
+    phase250: f32,
+    phase500: f32,
+    phase1k: f32,
+    phase2k: f32,
+    phase4k: f32,
+    phase8k: f32,
+    // Frequency is implied by the band
+    // Add HRTF index as in spatial_audio.wgsl
+    hrtfIndex: u32,
+    _padding: f32 // Maintain alignment
 };
 
 struct RayIntersection {
@@ -399,6 +464,33 @@ struct RayIntersection {
     normal: vec3f,
     surfaceIndex: u32
 };
+
+// Add RNG helper (simple Wang hash or similar)
+fn rand(seed: u32) -> f32 {
+    var s = seed ^ 2747636419u;
+    s = (s * 2654435769u) ^ (s >> 16u);
+    return f32(s) / 4294967295.0;
+}
+
+fn random_in_hemisphere(normal: vec3f, seed: u32) -> vec3f {
+    let r1 = rand(seed);
+    let r2 = rand(seed + 1u);
+    let r3 = rand(seed + 2u);
+    let dir = vec3f(r1 * 2.0 - 1.0, r2 * 2.0 - 1.0, r3 * 2.0 - 1.0);
+    let in_unit_sphere = normalize(dir);
+    if (dot(in_unit_sphere, normal) > 0.0) {
+        return in_unit_sphere;
+    } else {
+        return -in_unit_sphere;
+    }
+}
+
+// Updated reflect function with hybrid specular-diffuse reflection for a specific band
+fn reflect_band(incident: vec3f, normal: vec3f, scattering: f32, seed: u32) -> vec3f {
+    let specular_dir = incident - 2.0 * dot(incident, normal) * normal;
+    let diffuse_dir = normal + random_in_hemisphere(normal, seed);
+    return normalize(mix(specular_dir, diffuse_dir, scattering));
+}
 
 // Helper function to find closest intersection
 fn findClosestIntersection(ray: Ray) -> RayIntersection {
@@ -426,11 +518,6 @@ fn findClosestIntersection(ray: Ray) -> RayIntersection {
     return closest;
 }
 
-// Calculate reflected direction
-fn reflect(incident: vec3f, normal: vec3f) -> vec3f {
-    return incident - 2.0 * dot(incident, normal) * normal;
-}
-
 @group(0) @binding(0) var<storage, read_write> rays: array<Ray>;
 @group(0) @binding(1) var<storage, read> surfaces: array<Surface>;
 @group(0) @binding(2) var<storage, read_write> hits: array<RayHit>;
@@ -443,7 +530,11 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
     }
 
     var ray = rays[ray_index];
-    if (ray.isActive == 0u || ray.bounces >= 50u || ray.energy < 0.01) {
+    // Check if any band has significant energy
+    let total_energy = ray.energy63 + ray.energy125 + ray.energy250 + ray.energy500 +
+                       ray.energy1k + ray.energy2k + ray.energy4k + ray.energy8k;
+    
+    if (ray.isActive == 0u || ray.bounces >= 50u || total_energy < 0.01) {
         return;
     }
 
@@ -453,31 +544,95 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
         let speed_of_sound = 343.0;  // Speed of sound in m/s
         let travel_time = distance / speed_of_sound;
         
-        // Calculate phase change over distance
+        // Calculate phase change over distance for each band
         // Phase = 2π * frequency * time
-        let phase_change = 2.0 * 3.14159 * ray.frequency * travel_time;
-        let new_phase = ray.phase + phase_change;
+        // Using approximate center frequencies for each band
+        let phase_change_63 = 2.0 * 3.14159 * 63.0 * travel_time;
+        let phase_change_125 = 2.0 * 3.14159 * 125.0 * travel_time;
+        let phase_change_250 = 2.0 * 3.14159 * 250.0 * travel_time;
+        let phase_change_500 = 2.0 * 3.14159 * 500.0 * travel_time;
+        let phase_change_1k = 2.0 * 3.14159 * 1000.0 * travel_time;
+        let phase_change_2k = 2.0 * 3.14159 * 2000.0 * travel_time;
+        let phase_change_4k = 2.0 * 3.14159 * 4000.0 * travel_time;
+        let phase_change_8k = 2.0 * 3.14159 * 8000.0 * travel_time;
+        
+        let new_phase_63 = ray.phase63 + phase_change_63;
+        let new_phase_125 = ray.phase125 + phase_change_125;
+        let new_phase_250 = ray.phase250 + phase_change_250;
+        let new_phase_500 = ray.phase500 + phase_change_500;
+        let new_phase_1k = ray.phase1k + phase_change_1k;
+        let new_phase_2k = ray.phase2k + phase_change_2k;
+        let new_phase_4k = ray.phase4k + phase_change_4k;
+        let new_phase_8k = ray.phase8k + phase_change_8k;
 
-        // Record hit with wave properties
+        // Record hit with wave properties for all bands
         hits[ray_index] = RayHit(
             intersection.position,
-            ray.energy,
             ray.time + travel_time,
-            new_phase,
-            ray.frequency
+            intersection.normal,
+            ray.energy63,
+            ray.energy125,
+            ray.energy250,
+            ray.energy500,
+            ray.energy1k,
+            ray.energy2k,
+            ray.energy4k,
+            ray.energy8k,
+            ray.direction, // incomingDirection
+            new_phase_63,
+            new_phase_125,
+            new_phase_250,
+            new_phase_500,
+            new_phase_1k,
+            new_phase_2k,
+            new_phase_4k,
+            new_phase_8k,
+            0u, // hrtfIndex - will be set elsewhere or defaulted
+            0.0 // padding
         );
 
-        // Update ray for next bounce
+        // Update ray for next bounce for each band
         let surface = surfaces[intersection.surfaceIndex];
-        let reflected = reflect(ray.direction, intersection.normal);
+        let seed = u32(ray_index * ray.bounces + global_id.x); // Simple seed
+        
+        // Reflect for each band using its specific scattering coefficient
+        let reflected_63 = reflect_band(ray.direction, intersection.normal, surface.scattering63, seed);
+        let reflected_125 = reflect_band(ray.direction, intersection.normal, surface.scattering125, seed + 1u);
+        let reflected_250 = reflect_band(ray.direction, intersection.normal, surface.scattering250, seed + 2u);
+        let reflected_500 = reflect_band(ray.direction, intersection.normal, surface.scattering500, seed + 3u);
+        let reflected_1k = reflect_band(ray.direction, intersection.normal, surface.scattering1k, seed + 4u);
+        let reflected_2k = reflect_band(ray.direction, intersection.normal, surface.scattering2k, seed + 5u);
+        let reflected_4k = reflect_band(ray.direction, intersection.normal, surface.scattering4k, seed + 6u);
+        let reflected_8k = reflect_band(ray.direction, intersection.normal, surface.scattering8k, seed + 7u);
 
+        // Use one of the reflected directions (e.g., the one for 1kHz) for the main ray direction
+        // In a more advanced implementation, you might want to handle this differently
         ray.origin = intersection.position;
-        ray.direction = reflected;
-        ray.energy *= (1.0 - surface.absorption);
+        ray.direction = reflected_1k; // Using 1kHz band direction for main ray
+        
+        // Apply absorption for each band
+        ray.energy63 *= (1.0 - surface.absorption63);
+        ray.energy125 *= (1.0 - surface.absorption125);
+        ray.energy250 *= (1.0 - surface.absorption250);
+        ray.energy500 *= (1.0 - surface.absorption500);
+        ray.energy1k *= (1.0 - surface.absorption1k);
+        ray.energy2k *= (1.0 - surface.absorption2k);
+        ray.energy4k *= (1.0 - surface.absorption4k);
+        ray.energy8k *= (1.0 - surface.absorption8k);
+        
         ray.pathLength += distance;
         ray.bounces += 1u;
         ray.time += travel_time;
-        ray.phase = new_phase;
+        
+        // Update phases
+        ray.phase63 = new_phase_63;
+        ray.phase125 = new_phase_125;
+        ray.phase250 = new_phase_250;
+        ray.phase500 = new_phase_500;
+        ray.phase1k = new_phase_1k;
+        ray.phase2k = new_phase_2k;
+        ray.phase4k = new_phase_4k;
+        ray.phase8k = new_phase_8k;
 
         rays[ray_index] = ray;
     } else {
@@ -494,34 +649,15 @@ struct ListenerData {
     forward: vec3f,
     up: vec3f,
     right: vec3f,
-}
-
-// Add directional absorption struct
-struct DirectionalAbsorption {
-    front: vec3f, // [low, mid, high]
-    side: vec3f,
-    back: vec3f,
 };
 
-struct WallMaterial {
-    directional: DirectionalAbsorption,
-    scatteringLow: f32,
-    scatteringMid: f32,
-    scatteringHigh: f32,
-    roughness: f32,
-    phaseShift: f32,
-    phaseRandomization: f32
-}
-
+// This struct MUST MATCH the one in raytracer.wgsl
 struct RayHit {
     position: vec3f,
     time: f32,
     normal: vec3f,
-    energy: f32,
-    incomingDirection: vec3f,
-    // Eight frequency bands
+    // Energy for each frequency band
     energy63: f32,
-    hrtfIndex: u32,
     energy125: f32,
     energy250: f32,
     energy500: f32,
@@ -529,29 +665,20 @@ struct RayHit {
     energy2k: f32,
     energy4k: f32,
     energy8k: f32,
-    // Wave properties
-    phase: f32,
-    frequency: f32,
-    dopplerShift: f32,
-    _padding: f32  // Maintain alignment
-}
+    incomingDirection: vec3f,
+    // Phase for each frequency band
+    phase63: f32,
+    phase125: f32,
+    phase250: f32,
+    phase500: f32,
+    phase1k: f32,
+    phase2k: f32,
+    phase4k: f32,
+    phase8k: f32,
+    hrtfIndex: u32,
+    _padding: f32 // Maintain alignment
+};
 
-struct RoomMaterials {
-    walls: WallMaterial,
-    ceiling: WallMaterial,
-    floor: WallMaterial
-}
-
-struct FrequencyBands {
-    band63: f32,    // Sub-bass
-    band125: f32,   // Bass
-    band250: f32,   // Low-mids
-    band500: f32,   // Mids
-    band1k: f32,    // Upper-mids
-    band2k: f32,    // Presence
-    band4k: f32,    // Brilliance
-    band8k: f32     // Air
-}
 
 struct RoomAcoustics {
     // RT60 for each frequency band
@@ -588,7 +715,7 @@ struct RoomAcoustics {
     earlyReflectionTime: f32,
     roomVolume: f32,
     totalSurfaceArea: f32,
-}
+};
 
 struct SpatialAudioParams {
     speedOfSound: f32,
@@ -599,205 +726,38 @@ struct SpatialAudioParams {
     sourcePower: f32,    // Source power in dB
     _padding1: f32,
     _padding2: f32,
-    _padding3: f32,
-    _padding4: f32,
-    _padding5: f32      // Total size: 48 bytes (12 floats)
-}
-
-struct WaveProperties {
-    phase: f32,
-    frequency: f32,
-    dopplerShift: f32,
-    _padding: f32
-}
+};
 
 @group(0) @binding(0) var<uniform> listener: ListenerData;
 @group(0) @binding(1) var<storage, read> rayHits: array<RayHit>;
 @group(0) @binding(2) var<storage, read_write> spatialIR: array<vec4f>;
 @group(0) @binding(3) var<uniform> params: SpatialAudioParams;
 @group(0) @binding(4) var<uniform> acoustics: RoomAcoustics;
-@group(0) @binding(5) var<storage, read> waveProperties: array<WaveProperties>;
-@group(0) @binding(6) var<uniform> roomMaterials: RoomMaterials;
 @group(0) @binding(7) var<storage, read> hrtfCoefficients: array<f32>;
 
-// Update the constants and helper functions
-const SPEED_OF_SOUND = 343.0;
-const AIR_DENSITY = 1.225;  // kg/m³ at room temperature
-const REFERENCE_PRESSURE = 2e-5;  // 20 micropascals (threshold of hearing)
-
-// Helper function to calculate directional attenuation
-// Added directional absorption logic
-fn getAbsorptionDirection(dotValue: f32) -> Direction {
-    let angle = acos(dotValue);
-    if (angle < 0.25 * PI) { return Front; }
-    if (angle < 0.75 * PI) { return Side; }
-    return Back;
-}
-
-fn applyDirectionalAbsorption(hit: RayHit, material: WallMaterial) -> vec3f {
-    let dot = dot(hit.incomingDirection, hit.normal);
-    let direction = getAbsorptionDirection(dot);
-        direction == Front ? material.directional.front :
-        direction == Side  ? material.directional.side  :
-        material.directional.back;
-    // or alternatively using ternary:
-    // return direction == Front ? material.directional.front :
-    //        direction == Side ? material.directional.side :
-    //        material.directional.back;
-}
-// Removed misplaced code
-//     let forward = normalize(listenerForward);
-    let cosAngle = dot(dir, forward);
-    return clamp((cosAngle + 1.0) * 0.5, 0.0, 1.0);
-}
-
-// HRTF approximation (simplified)
-// Replace entire calculateHRTF function with new getHRTFCoefficient
+// Simplified HRTF lookup
 fn getHRTFCoefficient(index: u32) -> vec2f {
+    let safeIndex = min(index, arrayLength(&hrtfCoefficients) / 2u - 1u);
     return vec2f(
-        hrtfCoefficients[index * 2],
-        hrtfCoefficients[index * 2 + 1]
+        hrtfCoefficients[safeIndex * 2u],
+        hrtfCoefficients[safeIndex * 2u + 1u]
     );
 }
 
-// Calculate frequency-dependent scattering based on acoustic research
-fn calculateScattering(direction: vec3f, normal: vec3f) -> FrequencyBands {
-    let incidentAngle = acos(dot(normalize(direction), normalize(normal)));
-
-    // Scattering increases with frequency according to acoustic theory
-    // Based on surface roughness relative to wavelength
-    return FrequencyBands(
-        mix(0.9, cos(incidentAngle), acoustics.scattering_63),   // More diffuse at low freq
-        mix(0.8, cos(incidentAngle), acoustics.scattering_125),
-        mix(0.7, cos(incidentAngle), acoustics.scattering_250),
-        mix(0.6, cos(incidentAngle), acoustics.scattering_500),
-        mix(0.5, cos(incidentAngle), acoustics.scattering_1k),
-        mix(0.4, cos(incidentAngle), acoustics.scattering_2k),
-        mix(0.3, cos(incidentAngle), acoustics.scattering_4k),
-        mix(0.2, cos(incidentAngle), acoustics.scattering_8k)    // More specular at high freq
-    );
+// Simplified air absorption for path from hit to listener
+fn calculateAirAbsorption(distance: f32) -> array<f32, 8> {
+    var absorption: array<f32, 8>;
+    absorption[0] = exp(-acoustics.absorption_63 * distance);
+    absorption[1] = exp(-acoustics.absorption_125 * distance);
+    absorption[2] = exp(-acoustics.absorption_250 * distance);
+    absorption[3] = exp(-acoustics.absorption_500 * distance);
+    absorption[4] = exp(-acoustics.absorption_1k * distance);
+    absorption[5] = exp(-acoustics.absorption_2k * distance);
+    absorption[6] = exp(-acoustics.absorption_4k * distance);
+    absorption[7] = exp(-acoustics.absorption_8k * distance);
+    return absorption;
 }
 
-// Calculate air absorption based on ISO 9613-1
-fn calculateAirAbsorption(distance: f32) -> FrequencyBands {
-    let d = max(distance, 0.001);
-    return FrequencyBands(
-        exp(-acoustics.absorption_63 * d),
-        exp(-acoustics.absorption_125 * d),
-        exp(-acoustics.absorption_250 * d),
-        exp(-acoustics.absorption_500 * d),
-        exp(-acoustics.absorption_1k * d),
-        exp(-acoustics.absorption_2k * d),
-        exp(-acoustics.absorption_4k * d),
-        exp(-acoustics.absorption_8k * d)
-    );
-}
-
-// Calculate energy decay with Sabine's formula for each band
-fn calculateEnergyDecay(time: f32, distance: f32, direction: vec3f, normal: vec3f) -> FrequencyBands {
-    let t = max(time, 0.0);
-
-    // Basic decay based on RT60
-    let timeDecay = FrequencyBands(
-        exp(-3.0 * t / acoustics.rt60_63),
-        exp(-3.0 * t / acoustics.rt60_125),
-        exp(-3.0 * t / acoustics.rt60_250),
-        exp(-3.0 * t / acoustics.rt60_500),
-        exp(-3.0 * t / acoustics.rt60_1k),
-        exp(-3.0 * t / acoustics.rt60_2k),
-        exp(-3.0 * t / acoustics.rt60_4k),
-        exp(-3.0 * t / acoustics.rt60_8k)
-    );
-
-    // Combine with scattering
-    let scattering = calculateScattering(direction, normal);
-
-    return FrequencyBands(
-        timeDecay.band63 * scattering.band63,
-        timeDecay.band125 * scattering.band125,
-        timeDecay.band250 * scattering.band250,
-        timeDecay.band500 * scattering.band500,
-        timeDecay.band1k * scattering.band1k,
-        timeDecay.band2k * scattering.band2k,
-        timeDecay.band4k * scattering.band4k,
-        timeDecay.band8k * scattering.band8k
-    );
-}
-
-// Improved early reflection detection
-fn isEarlyReflection(time: f32, distance: f32) -> bool {
-    // Consider both time and order of reflection
-    let directSound = distance / SPEED_OF_SOUND;
-    let normalizedTime = (time - directSound) / acoustics.earlyReflectionTime;
-    return normalizedTime < 1.0;
-}
-
-// Add helper function for dB to linear conversion
-fn dbToLinear(db: f32) -> f32 {
-    return pow(10.0, db / 20.0);
-}
-
-// Helper function to calculate Doppler shift
-fn calculateDopplerShift(rayVelocity: vec3f, rayDirection: vec3f, speedOfSound: f32) -> f32 {
-    let relativeVelocity = dot(rayVelocity, rayDirection);
-    return speedOfSound / (speedOfSound - relativeVelocity);
-}
-
-// Helper function to calculate wave contribution
-fn calculateWaveContribution(
-    time: f32,
-    phase: f32,
-    frequency: f32,
-    dopplerShift: f32,
-    amplitude: f32,
-    distance: f32
-) -> f32 {
-    // Validate inputs
-    let validFreq = max(frequency, 20.0);  // Ensure frequency is at least 20Hz
-    let validAmplitude = max(amplitude, 0.0);  // Ensure non-negative amplitude
-    let validDistance = max(distance, 0.001);  // Prevent division by zero
-    
-    let shiftedFreq = validFreq * max(dopplerShift, 0.1);  // Limit minimum doppler shift
-    let wavelength = SPEED_OF_SOUND / shiftedFreq;
-    let distancePhase = 2.0 * 3.14159 * validDistance / wavelength;
-    let totalPhase = phase + distancePhase;
-    
-    // Apply window function (Hann window)
-    let windowPos = clamp(time / (validDistance / SPEED_OF_SOUND), 0.0, 1.0);
-    let window = 0.5 * (1.0 - cos(2.0 * 3.14159 * windowPos));
-    
-    return validAmplitude * window * sin(totalPhase);
-}
-
-// Function to apply material absorption based on surface type
-fn applyMaterialAbsorption(hit: RayHit, distance: f32, materials: RoomMaterials) -> f32 {
-    // Determine which surface was hit based on normal direction
-    // This is a simplified approach - in a real implementation, you might pass the surface type directly
-    let upNormal = vec3f(0.0, 1.0, 0.0);
-    let downNormal = vec3f(0.0, -1.0, 0.0);
-    let floorCeilingThreshold = 0.9; // Threshold for determining floor/ceiling
-    
-    var material: WallMaterial;
-    
-    // Determine if hit is on floor or ceiling
-    if (dot(hit.normal, upNormal) > floorCeilingThreshold) {
-        // Hit on floor
-        material = materials.floor;
-    } else if (dot(hit.normal, downNormal) > floorCeilingThreshold) {
-        // Hit on ceiling
-        material = materials.ceiling;
-    } else {
-        // Hit on wall
-        material = materials.walls;
-    }
-    
-    // Calculate combined absorption factor
-    // This is a simplified model - you might want to use frequency-specific absorption
-    let absorptionFactor = (material.absorptionLow + material.absorptionMid + material.absorptionHigh) / 1.0;
-    
-    // Return the transmission factor (1 - absorption)
-    return 1.0 - absorptionFactor;
-}
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_id: vec3u) {
@@ -807,51 +767,54 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
     }
 
     let hit = rayHits[hitIndex];
-    let toListener = normalize(listener.position - hit.position);
     
-    // Calculate basic spatial properties
+    // Vector from the hit point to the listener
+    let toListenerDir = normalize(listener.position - hit.position);
     let distance = length(listener.position - hit.position);
-    let dirAttenuation = calculateDirectionalAttenuation(toListener, listener.forward);
-    let hrtfCoeffs = getHRTFCoefficient(hit.hrtfIndex);
-    let hrtf = hrtfCoeffs;
 
-    // Calculate wave properties
-    let waveProps = waveProperties[hitIndex];
-    let amplitude = sqrt(max(hit.energy, 0.0));  // Ensure non-negative energy
+    // Calculate total energy from all bands at the hit point
+    let totalEnergy = hit.energy63 + hit.energy125 + hit.energy250 + hit.energy500 +
+                      hit.energy1k + hit.energy2k + hit.energy4k + hit.energy8k;
+
+    if (totalEnergy <= 0.0) {
+        spatialIR[hitIndex] = vec4f(0.0);
+        return;
+    }
+
+    // 1. Distance Attenuation (Inverse Square Law)
+    let distAttenuation = 1.0 / (1.0 + distance * distance);
     
-    // Calculate frequency-dependent properties
+    // 2. Air Absorption from hit to listener
     let airAbsorption = calculateAirAbsorption(distance);
-    let energyDecay = calculateEnergyDecay(hit.time, distance, toListener, hit.normal);
-    
-    // Apply material absorption
-    // Calculate directional absorption
-    let directionalAbsorption = applyDirectionalAbsorption(hit, roomMaterials.walls.directional);
-    amplitude *= directionalAbsorption.x; // Low frequency absorption
-    amplitude *= directionalAbsorption.y; // Mid frequency absorption
-    amplitude *= directionalAbsorption.z; // High frequency absorption
-    amplitude = amplitude * materialTransmission;
-    
-    // Calculate wave contribution with interference
-    let contribution = calculateWaveContribution(
-        hit.time,
-        waveProps.phase,
-        waveProps.frequency,
-        waveProps.dopplerShift,
-        amplitude,
-        distance
-    );
 
-    // Apply spatial and frequency-dependent effects
-    // Ensure we have non-zero contributions
-    let leftContribution = max(contribution * hrtf.x * dirAttenuation * 0.5, 0.0001);
-    let rightContribution = max(contribution * hrtf.y * dirAttenuation * 0.5, 0.0001);
+    // 3. HRTF for spatialization
+    let hrtf = getHRTFCoefficient(hit.hrtfIndex);
 
-    // Store result with frequency band information
+    // 4. Combine effects for each band and sum them up for a final amplitude
+    var totalAmplitude = 0.0;
+    let energies = array<f32, 8>(hit.energy63, hit.energy125, hit.energy250, hit.energy500, hit.energy1k, hit.energy2k, hit.energy4k, hit.energy8k);
+    
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        // Amplitude is sqrt of energy
+        let bandAmplitude = sqrt(max(0.0, energies[i]));
+        // Apply air absorption for this band
+        let absorbedAmplitude = bandAmplitude * airAbsorption[i];
+        totalAmplitude = totalAmplitude + absorbedAmplitude;
+    }
+
+    // Apply distance attenuation to the summed amplitude
+    totalAmplitude = totalAmplitude * distAttenuation;
+    
+    // Final contribution for left and right channels
+    let leftContribution = totalAmplitude * hrtf.x;
+    let rightContribution = totalAmplitude * hrtf.y;
+
+    // Store result: Left, Right, Frequency (placeholder), Time
     spatialIR[hitIndex] = vec4f(
         leftContribution,
         rightContribution,
-        waveProps.frequency,  // Store frequency for later processing
-        hit.time             // Store time for sorting
+        1000.0, // Frequency is now a mix, 1k is a placeholder
+        hit.time
     );
 }
 </code>
@@ -1082,28 +1045,67 @@ import { vec3 } from 'gl-matrix';
 export class Ray {
     private origin: vec3;
     private direction: vec3;
-    private energyLow: number;
-    private energyMid: number;
-    private energyHigh: number;
+    // Energy for each of the 8 frequency bands
+    private energy63: number;
+    private energy125: number;
+    private energy250: number;
+    private energy500: number;
+    private energy1k: number;
+    private energy2k: number;
+    private energy4k: number;
+    private energy8k: number;
     private pathLength: number;
     private bounces: number;
     private isActive: boolean;
     private time: number;
-    private phase: number;
-    private frequency: number;
+    // Phase for each of the 8 frequency bands
+    private phase63: number;
+    private phase125: number;
+    private phase250: number;
+    private phase500: number;
+    private phase1k: number;
+    private phase2k: number;
+    private phase4k: number;
+    private phase8k: number;
+    // Frequency is now implicit in the band
 
-    constructor(origin: vec3, direction: vec3, initialEnergy: number = 1.0, frequency: number = 1000) {
+    // Define the 8 frequency bands
+    private static readonly FREQUENCY_BANDS = {
+        63: 63,
+        125: 125,
+        250: 250,
+        500: 500,
+        1000: 1000,
+        2000: 2000,
+        4000: 4000,
+        8000: 8000
+    };
+
+    constructor(origin: vec3, direction: vec3, initialEnergy: number = 1.0) {
         this.origin = vec3.clone(origin);
         this.direction = vec3.normalize(vec3.create(), direction);
-        this.energyLow = initialEnergy;
-        this.energyMid = initialEnergy;
-        this.energyHigh = initialEnergy;
+        // Initialize energy for all bands
+        this.energy63 = initialEnergy;
+        this.energy125 = initialEnergy;
+        this.energy250 = initialEnergy;
+        this.energy500 = initialEnergy;
+        this.energy1k = initialEnergy;
+        this.energy2k = initialEnergy;
+        this.energy4k = initialEnergy;
+        this.energy8k = initialEnergy;
         this.pathLength = 0;
         this.bounces = 0;
         this.isActive = true;
         this.time = 0;
-        this.phase = 0;
-        this.frequency = frequency;
+        // Initialize phase for all bands
+        this.phase63 = 0;
+        this.phase125 = 0;
+        this.phase250 = 0;
+        this.phase500 = 0;
+        this.phase1k = 0;
+        this.phase2k = 0;
+        this.phase4k = 0;
+        this.phase8k = 0;
     }
 
     public getOrigin(): vec3 {
@@ -1114,20 +1116,43 @@ export class Ray {
         return vec3.clone(this.direction);
     }
 
+    // Get average energy across all bands
     public getEnergy(): number {
-        return (this.energyLow + this.energyMid + this.energyHigh) / 3;
+        return (this.energy63 + this.energy125 + this.energy250 + this.energy500 +
+                this.energy1k + this.energy2k + this.energy4k + this.energy8k) / 8;
     }
 
-    public getEnergyLow(): number {
-        return this.energyLow;
+    // Get energy for specific bands
+    public getEnergy63(): number {
+        return this.energy63;
     }
 
-    public getEnergyMid(): number {
-        return this.energyMid;
+    public getEnergy125(): number {
+        return this.energy125;
     }
 
-    public getEnergyHigh(): number {
-        return this.energyHigh;
+    public getEnergy250(): number {
+        return this.energy250;
+    }
+
+    public getEnergy500(): number {
+        return this.energy500;
+    }
+
+    public getEnergy1k(): number {
+        return this.energy1k;
+    }
+
+    public getEnergy2k(): number {
+        return this.energy2k;
+    }
+
+    public getEnergy4k(): number {
+        return this.energy4k;
+    }
+
+    public getEnergy8k(): number {
+        return this.energy8k;
     }
 
     public getBounces(): number {
@@ -1142,26 +1167,77 @@ export class Ray {
         return this.time;
     }
 
-    public getPhase(): number {
-        return this.phase;
+    // Get phase for specific bands
+    public getPhase63(): number {
+        return this.phase63;
     }
 
-    public getFrequency(): number {
-        return this.frequency;
+    public getPhase125(): number {
+        return this.phase125;
+    }
+
+    public getPhase250(): number {
+        return this.phase250;
+    }
+
+    public getPhase500(): number {
+        return this.phase500;
+    }
+
+    public getPhase1k(): number {
+        return this.phase1k;
+    }
+
+    public getPhase2k(): number {
+        return this.phase2k;
+    }
+
+    public getPhase4k(): number {
+        return this.phase4k;
+    }
+
+    public getPhase8k(): number {
+        return this.phase8k;
     }
 
     public updateTime(newTime: number): void {
         this.time = newTime;
     }
 
-    public updatePhase(newPhase: number): void {
-        this.phase = newPhase;
+    // Update phase for all bands
+    public updatePhase(
+        phase63: number,
+        phase125: number,
+        phase250: number,
+        phase500: number,
+        phase1k: number,
+        phase2k: number,
+        phase4k: number,
+        phase8k: number
+    ): void {
+        this.phase63 = phase63;
+        this.phase125 = phase125;
+        this.phase250 = phase250;
+        this.phase500 = phase500;
+        this.phase1k = phase1k;
+        this.phase2k = phase2k;
+        this.phase4k = phase4k;
+        this.phase8k = phase8k;
     }
 
     public updateRay(
         newOrigin: vec3,
         newDirection: vec3,
-        energyLoss: {low: number, mid: number, high: number},
+        energyLoss: {
+            band63: number,
+            band125: number,
+            band250: number,
+            band500: number,
+            band1k: number,
+            band2k: number,
+            band4k: number,
+            band8k: number
+        },
         distance: number,
         temperature: number = 20,
         humidity: number = 50
@@ -1169,13 +1245,18 @@ export class Ray {
         vec3.copy(this.origin, newOrigin);
         vec3.normalize(this.direction, newDirection);
 
-        // Apply frequency-dependent air absorption
+        // Apply frequency-dependent air absorption based on the ISO 9613-1 standard.
         const airAbsorption = this.calculateAirAbsorption(distance, temperature, humidity);
 
-        // Update energy levels with both material absorption and air absorption
-        this.energyLow *= (1 - energyLoss.low) * airAbsorption.low;
-        this.energyMid *= (1 - energyLoss.mid) * airAbsorption.mid;
-        this.energyHigh *= (1 - energyLoss.high) * airAbsorption.high;
+        // Update energy levels with both material absorption and air absorption.
+        this.energy63  *= (1.0 - energyLoss.band63)  * airAbsorption.band63;
+        this.energy125 *= (1.0 - energyLoss.band125) * airAbsorption.band125;
+        this.energy250 *= (1.0 - energyLoss.band250) * airAbsorption.band250;
+        this.energy500 *= (1.0 - energyLoss.band500) * airAbsorption.band500;
+        this.energy1k  *= (1.0 - energyLoss.band1k)  * airAbsorption.band1k;
+        this.energy2k  *= (1.0 - energyLoss.band2k)  * airAbsorption.band2k;
+        this.energy4k  *= (1.0 - energyLoss.band4k)  * airAbsorption.band4k;
+        this.energy8k  *= (1.0 - energyLoss.band8k)  * airAbsorption.band8k;
 
         this.pathLength += distance;
         this.bounces++;
@@ -1187,37 +1268,75 @@ export class Ray {
         const travelTime = distance / speedOfSound;
         this.time += travelTime;
 
-        // Update phase (2π * frequency * time)
-        const phaseChange = 2 * Math.PI * this.frequency * travelTime;
-        this.phase = (this.phase + phaseChange) % (2 * Math.PI); // Keep phase between 0 and 2π
+        // Update phase for each band (2π * frequency * time)
+        const phaseChange63 = 2 * Math.PI * Ray.FREQUENCY_BANDS[63] * travelTime;
+        const phaseChange125 = 2 * Math.PI * Ray.FREQUENCY_BANDS[125] * travelTime;
+        const phaseChange250 = 2 * Math.PI * Ray.FREQUENCY_BANDS[250] * travelTime;
+        const phaseChange500 = 2 * Math.PI * Ray.FREQUENCY_BANDS[500] * travelTime;
+        const phaseChange1k = 2 * Math.PI * Ray.FREQUENCY_BANDS[1000] * travelTime;
+        const phaseChange2k = 2 * Math.PI * Ray.FREQUENCY_BANDS[2000] * travelTime;
+        const phaseChange4k = 2 * Math.PI * Ray.FREQUENCY_BANDS[4000] * travelTime;
+        const phaseChange8k = 2 * Math.PI * Ray.FREQUENCY_BANDS[8000] * travelTime;
+
+        this.phase63 = (this.phase63 + phaseChange63) % (2 * Math.PI);
+        this.phase125 = (this.phase125 + phaseChange125) % (2 * Math.PI);
+        this.phase250 = (this.phase250 + phaseChange250) % (2 * Math.PI);
+        this.phase500 = (this.phase500 + phaseChange500) % (2 * Math.PI);
+        this.phase1k = (this.phase1k + phaseChange1k) % (2 * Math.PI);
+        this.phase2k = (this.phase2k + phaseChange2k) % (2 * Math.PI);
+        this.phase4k = (this.phase4k + phaseChange4k) % (2 * Math.PI);
+        this.phase8k = (this.phase8k + phaseChange8k) % (2 * Math.PI);
     }
 
+    /**
+     * Calculates frequency-dependent air absorption based on the ISO 9613-1 standard.
+     * Returns the transmission coefficient (0-1) for each frequency band.
+     */
     private calculateAirAbsorption(distance: number, temperature: number, humidity: number): {
-        low: number,
-        mid: number,
-        high: number
+        band63: number,
+        band125: number,
+        band250: number,
+        band500: number,
+        band1k: number,
+        band2k: number,
+        band4k: number,
+        band8k: number
     } {
-        // ISO 9613-1 standard air absorption calculation
-        const T = temperature + 273.15;
-        const T0 = 293.15;
-        const T01 = T / T0;
-
-        const hr = humidity * Math.pow(T01, -4.17);
-
+        // Simplified ISO 9613-1 model for atmospheric absorption.
+        const T_celsius = temperature;
+        const T_kelvin = T_celsius + 273.15;
+        const T_ref = 293.15; // 20°C in Kelvin
+ 
         // Calculate absorption for each frequency band
         const calculateBandAbsorption = (freq: number): number => {
-            const fr = freq * T01;
-            const alpha = 1.84e-11 * (1 / T01) * Math.sqrt(T01) +
-                Math.pow(fr, 2.5) * (0.10680 * Math.exp(-3352 / T) * 1 / (fr + 3352 / T)) +
-                Math.pow(fr, 2.5) * (0.01278 * Math.exp(-2239.1 / T) * 1 / (fr + 2239.1 / T));
+            // Relaxation frequency for oxygen and nitrogen (simplified)
+            const f_r_O = 24 + 4.04e4 * humidity * (0.02 + humidity) / (0.391 + humidity);
+            const f_r_N = (T_kelvin / T_ref)**(-0.5) * (9 + 280 * humidity * Math.exp(-4.17 * ((T_kelvin / T_ref)**(-1/3) - 1)));
 
-            return Math.exp(-alpha * distance);
+            // Absorption coefficient in dB/m
+            const alpha_dB_per_m = freq**2 * (
+                1.84e-11 * (T_kelvin / T_ref)**0.5 +
+                (T_kelvin / T_ref)**(-2.5) * (
+                    0.1068 * Math.exp(-3352 / T_kelvin) / (f_r_N + freq**2 / f_r_N) + 
+                    0.01278 * Math.exp(-2239.1 / T_kelvin) / (f_r_O + freq**2 / f_r_O)
+                )
+            );
+
+            // Total attenuation in dB
+            const total_attenuation_dB = alpha_dB_per_m * distance;
+            // Convert dB attenuation to a linear transmission factor (0 to 1)
+            return Math.pow(10, -total_attenuation_dB / 20);
         };
 
         return {
-            low: calculateBandAbsorption(250),   // Center frequency for low band
-            mid: calculateBandAbsorption(1000),  // Center frequency for mid band
-            high: calculateBandAbsorption(4000)  // Center frequency for high band
+            band63: calculateBandAbsorption(Ray.FREQUENCY_BANDS[63]),
+            band125: calculateBandAbsorption(Ray.FREQUENCY_BANDS[125]),
+            band250: calculateBandAbsorption(Ray.FREQUENCY_BANDS[250]),
+            band500: calculateBandAbsorption(Ray.FREQUENCY_BANDS[500]),
+            band1k: calculateBandAbsorption(Ray.FREQUENCY_BANDS[1000]),
+            band2k: calculateBandAbsorption(Ray.FREQUENCY_BANDS[2000]),
+            band4k: calculateBandAbsorption(Ray.FREQUENCY_BANDS[4000]),
+            band8k: calculateBandAbsorption(Ray.FREQUENCY_BANDS[8000])
         };
     }
 
@@ -1237,6 +1356,11 @@ import { RayRenderer } from './ray-renderer';
 import { WallMaterial } from '../room/room-materials';
 import { loadHRTFData } from '../sound/hrtf-loader';
 import { Camera } from '../camera/camera';
+
+// Helper interface for ISM generation
+interface ImageSourceInternal extends ImageSource {
+    lastReflectionIndex: number;
+}
 
 // Type definitions for image source method
 interface ImageSource {
@@ -1259,20 +1383,36 @@ export interface RayTracerConfig {
     minEnergy: number;
 }
 
+// Updated RayHit interface for 8 bands
 export interface RayHit {
     position: vec3;
-    energy: number;
-    energyLow: number;
-    energyMid: number;
-    energyHigh: number;
+    energy: number; // Average energy
+    // Energy for each of the 8 frequency bands
+    energy63: number;
+    energy125: number;
+    energy250: number;
+    energy500: number;
+    energy1k: number;
+    energy2k: number;
+    energy4k: number;
+    energy8k: number;
     time: number;      // Arrival time
-    phase: number;     // Phase at hit
-    frequency: number; // Frequency of the ray
+    // Phase for each of the 8 frequency bands
+    phase63: number;
+    phase125: number;
+    phase250: number;
+    phase500: number;
+    phase1k: number;
+    phase2k: number;
+    phase4k: number;
+    phase8k: number;
+    // Frequency is now implicit in the band
+    dopplerShift: number; // Doppler shift at this point
     hrtfIndex?: number; // HRTF lookup index for spatial audio
-    incomingDirection: vec3; // Added with semicolon
- 
+    incomingDirection: vec3; // Direction of the ray when it hit
 }
 
+// Updated RayPathPoint interface for 8 bands
 export interface RayPathPoint extends RayHit {
     bounceNumber: number;
     rayIndex: number;
@@ -1306,10 +1446,11 @@ export class RayTracer {
     private acousticsBuffer!: GPUBuffer;
     private wavePropertiesBuffer!: GPUBuffer;
     private roomMaterialsBuffer!: GPUBuffer;
- 
-    
     private computePipeline!: GPUComputePipeline;
     private hrtfBuffer!: GPUBuffer; // Ensure only one declaration
+    
+    // Define the 8 frequency bands
+    private static readonly FREQUENCY_BANDS = [63, 125, 250, 500, 1000, 2000, 4000, 8000];
 
     constructor(
         device: GPUDevice,
@@ -1320,8 +1461,7 @@ export class RayTracer {
             maxBounces: 50,
             minEnergy: 0.01
         }
-    )
-    {
+    ) {
         this.device = device;
         this.soundSource = soundSource;
         this.room = room;
@@ -1329,35 +1469,31 @@ export class RayTracer {
         this.rayRenderer = new RayRenderer(device);
         // Removed 'await' from constructor
     }
+
     private generateRays(): void {
         this.rays = [];
         const sourcePos = this.soundSource.getPosition();
         const sphereRadius = this.soundSource.getRadius();
-
-        // Define frequency bands for analysis
-        const frequencies = [250, 500, 1000, 2000, 4000]; // Hz
-
+        
         for (let i = 0; i < this.config.numRays; i++) {
             // Generate random direction using spherical coordinates
             const theta = 2 * Math.PI * Math.random();
             const phi = Math.acos(2 * Math.random() - 1);
-
             const direction = vec3.fromValues(
                 Math.sin(phi) * Math.cos(theta),
                 Math.sin(phi) * Math.sin(theta),
                 Math.cos(phi)
             );
-
+            
             // Calculate the ray origin on the sphere's surface
             const rayOrigin = vec3.create();
             vec3.scale(rayOrigin, direction, sphereRadius);
             vec3.add(rayOrigin, rayOrigin, sourcePos);
-
-            // Distribute rays across frequency bands
-            const frequency = frequencies[i % frequencies.length];
             
-            // Create ray starting from the sphere's surface
-            this.rays.push(new Ray(rayOrigin, direction, 1.0, frequency));
+            // Distribute rays across frequency bands
+            // In a more advanced implementation, you might want to create separate rays for each band
+            // For now, we'll use one ray and handle all bands in the Ray class
+            this.rays.push(new Ray(rayOrigin, direction, 1.0));
         }
     }
 
@@ -1365,7 +1501,6 @@ export class RayTracer {
         const { width, height, depth } = this.room.config.dimensions;
         const halfWidth = width / 2;
         const halfDepth = depth / 2;
-
         return point[0] >= -halfWidth && point[0] <= halfWidth &&
                point[1] >= 0 && point[1] <= height &&
                point[2] >= -halfDepth && point[2] <= halfDepth;
@@ -1377,10 +1512,10 @@ export class RayTracer {
         this.rays = [];
         this.rayPaths = [];
         this.rayPathPoints = [];
-
+        
         // Generate initial rays
         this.generateRays();
-
+        
         // Store initial ray paths
         for (const ray of this.rays) {
             this.rayPaths.push({
@@ -1389,56 +1524,173 @@ export class RayTracer {
                 energy: ray.getEnergy()
             });
         }
-
+        
         // Calculate early reflections using image source method
-        await this.calculateEarlyReflections(camera);
-
+        this.calculateEarlyReflections(camera);
+        
         // Calculate late reflections using stochastic ray tracing
-        await this.calculateLateReflections(camera);
-
-        console.log(`Completed ray tracing with early and late reflections`);
+        this.calculateLateReflections(camera);
+        
+        console.log(`Completed ray tracing with ${this.hits.length} total hits.`);
     }
 
-    private async calculateEarlyReflections(camera?: Camera): Promise<void> {
+    private calculateEarlyReflections(camera?: Camera): void {
+        if (!camera) return;
         const sourcePos = this.soundSource.getPosition();
-        const maxOrder = 3; // Maximum reflection order for image sources
-
+        const listenerPos = camera.getPosition();
+        const maxOrder = 4; // Maximum reflection order for image sources
+        const { width, height, depth } = this.room.config.dimensions;
+        const halfWidth = width / 2;
+        const halfDepth = depth / 2;
+        const planes = [
+            { normal: vec3.fromValues(1, 0, 0), point: vec3.fromValues(-halfWidth, 0, 0), material: this.room.config.materials.walls },   // 0: Left
+            { normal: vec3.fromValues(-1, 0, 0), point: vec3.fromValues(halfWidth, 0, 0), material: this.room.config.materials.walls },  // 1: Right
+            { normal: vec3.fromValues(0, 1, 0), point: vec3.fromValues(0, 0, 0), material: this.room.config.materials.floor },   // 2: Floor
+            { normal: vec3.fromValues(0, -1, 0), point: vec3.fromValues(0, height, 0), material: this.room.config.materials.ceiling }, // 3: Ceiling
+            { normal: vec3.fromValues(0, 0, 1), point: vec3.fromValues(0, 0, -halfDepth), material: this.room.config.materials.walls },   // 4: Back
+            { normal: vec3.fromValues(0, 0, -1), point: vec3.fromValues(0, 0, halfDepth), material: this.room.config.materials.walls },  // 5: Front
+        ];
+        
         // Generate image sources up to maxOrder
         const imageSources = this.generateImageSources(sourcePos, maxOrder);
-
+        
         // Process each image source
         for (const imageSource of imageSources) {
-            const path = this.validateImageSourcePath(imageSource);
-            if (path) {
-                this.processImageSourcePath(path, camera);
+            // Path from listener to virtual source
+            const dirToSource = vec3.subtract(vec3.create(), imageSource.position, listenerPos);
+            const totalDist = vec3.length(dirToSource);
+            vec3.normalize(dirToSource, dirToSource);
+            
+            // Basic visibility check: is there a wall between listener and image source?
+            // This is a simple but effective occlusion check for convex rooms.
+            let isOccluded = false;
+            for (const plane of planes) {
+                const denom = vec3.dot(dirToSource, plane.normal);
+                if (Math.abs(denom) > 1e-6) {
+                    const t = (vec3.dot(plane.point, plane.normal) - vec3.dot(listenerPos, plane.normal)) / denom;
+                    // If intersection is between listener and virtual source
+                    if (t > 1e-6 && t < totalDist - 1e-6) {
+                        isOccluded = true;
+                        break;
+                    }
+                }
             }
+            if (isOccluded) continue;
+            
+            // If visible, calculate properties
+            const travelTime = totalDist / this.SPEED_OF_SOUND;
+            
+            // Phase 3: Apply frequency-dependent absorption from materials
+            // Initialize energy for all bands
+            let energy63 = 1.0, energy125 = 1.0, energy250 = 1.0, energy500 = 1.0;
+            let energy1k = 1.0, energy2k = 1.0, energy4k = 1.0, energy8k = 1.0;
+            
+            for (const planeIndex of imageSource.reflectionSequence) {
+                const material = planes[planeIndex].material;
+                energy63  *= (1.0 - (material.absorption63 ?? 0));
+                energy125 *= (1.0 - (material.absorption125 ?? 0));
+                energy250 *= (1.0 - (material.absorption250 ?? 0));
+                energy500 *= (1.0 - (material.absorption500 ?? 0));
+                energy1k  *= (1.0 - (material.absorption1k ?? 0));
+                energy2k  *= (1.0 - (material.absorption2k ?? 0));
+                energy4k  *= (1.0 - (material.absorption4k ?? 0));
+                energy8k  *= (1.0 - (material.absorption8k ?? 0));
+            }
+            
+            const distAtten = 1.0 / (1.0 + totalDist * totalDist);
+            energy63  *= distAtten;
+            energy125 *= distAtten;
+            energy250 *= distAtten;
+            energy500 *= distAtten;
+            energy1k  *= distAtten;
+            energy2k  *= distAtten;
+            energy4k  *= distAtten;
+            energy8k  *= distAtten;
+            
+            // Calculate average energy
+            const averageEnergy = (energy63 + energy125 + energy250 + energy500 +
+                                 energy1k + energy2k + energy4k + energy8k) / 8;
+            
+            this.hits.push({
+                position: listenerPos, // For ISM, the "hit" is at the listener
+                energy: averageEnergy,
+                energy63: energy63,
+                energy125: energy125,
+                energy250: energy250,
+                energy500: energy500,
+                energy1k: energy1k,
+                energy2k: energy2k,
+                energy4k: energy4k,
+                energy8k: energy8k,
+                time: travelTime,
+                // Initialize phase for all bands (random for ISM)
+                phase63: Math.random() * 2 * Math.PI,
+                phase125: Math.random() * 2 * Math.PI,
+                phase250: Math.random() * 2 * Math.PI,
+                phase500: Math.random() * 2 * Math.PI,
+                phase1k: Math.random() * 2 * Math.PI,
+                phase2k: Math.random() * 2 * Math.PI,
+                phase4k: Math.random() * 2 * Math.PI,
+                phase8k: Math.random() * 2 * Math.PI,
+                dopplerShift: 1.0,
+                incomingDirection: dirToSource,
+                // hrtfIndex can be calculated here based on dirToSource
+            });
         }
     }
 
     private generateImageSources(sourcePos: vec3, maxOrder: number): ImageSource[] {
-        const imageSources: ImageSource[] = [];
-        // Implementation of image source generation
-        // This is a recursive process that mirrors the source across room surfaces
-        return imageSources;
+        const { width, height, depth } = this.room.config.dimensions;
+        const reflectionPlanes = [
+            { point: vec3.fromValues(-width / 2, 0, 0), normal: vec3.fromValues(1, 0, 0) }, // 0: Left
+            { point: vec3.fromValues(width / 2, 0, 0), normal: vec3.fromValues(-1, 0, 0) }, // 1: Right
+            { point: vec3.fromValues(0, 0, 0), normal: vec3.fromValues(0, 1, 0) }, // 2: Floor
+            { point: vec3.fromValues(0, height, 0), normal: vec3.fromValues(0, -1, 0) }, // 3: Ceiling
+            { point: vec3.fromValues(0, 0, -depth / 2), normal: vec3.fromValues(0, 0, 1) }, // 4: Back
+            { point: vec3.fromValues(0, 0, depth / 2), normal: vec3.fromValues(0, 0, -1) }, // 5: Front
+        ];
+        
+        let currentSources: ImageSourceInternal[] = [{
+            position: sourcePos,
+            imageOrder: 0,
+            reflectionSequence: [],
+            lastReflectionIndex: -1
+        }];
+        
+        const allImageSources: ImageSource[] = [];
+        let sourcesToProcess = currentSources;
+        
+        for (let order = 1; order <= maxOrder; order++) {
+            const nextSources: ImageSourceInternal[] = [];
+            for (const source of sourcesToProcess) {
+                for (let i = 0; i < reflectionPlanes.length; i++) {
+                    if (i === source.lastReflectionIndex) continue;
+                    const plane = reflectionPlanes[i];
+                    const reflectedPos = vec3.create();
+                    const v = vec3.subtract(vec3.create(), source.position, plane.point);
+                    const dot_v_n = vec3.dot(v, plane.normal);
+                    vec3.scaleAndAdd(reflectedPos, source.position, plane.normal, -2 * dot_v_n);
+                    const newSource = {
+                        position: reflectedPos,
+                        imageOrder: order,
+                        reflectionSequence: [...source.reflectionSequence, i],
+                        lastReflectionIndex: i,
+                    };
+                    nextSources.push(newSource);
+                }
+            }
+            allImageSources.push(...nextSources);
+            sourcesToProcess = nextSources;
+        }
+        
+        return allImageSources;
     }
 
-    private validateImageSourcePath(imageSource: ImageSource): RayPath | null {
-        // Validate visibility and calculate reflection path
-        // Returns null if path is invalid (blocked)
-        return null; // Placeholder
-    }
-
-    private processImageSourcePath(path: RayPath, camera?: Camera): void {
-        // Calculate energy and add to hits
-        // Early reflections are more precise than stochastic rays
-        // For now, this is a placeholder - when implemented, it should also calculate HRTF indices
-    }
-
-    private async calculateLateReflections(camera?: Camera): Promise<void> {
+    private calculateLateReflections(camera?: Camera): void {
         const { width, height, depth } = this.room.config.dimensions;
         const halfWidth = width / 2;
         const halfDepth = depth / 2;
-
+        
         // Define room planes (normal points inward)
         const planes = [
             // Use walls material for all wall surfaces
@@ -1449,7 +1701,7 @@ export class RayTracer {
             { normal: vec3.fromValues(0, 0, 1), d: halfDepth, material: this.room.config.materials.walls },   // Back wall
             { normal: vec3.fromValues(0, 0, -1), d: halfDepth, material: this.room.config.materials.walls },  // Front wall
         ];
-
+        
         // Process each ray
         for (let rayIndex = 0; rayIndex < this.rays.length; rayIndex++) {
             const ray = this.rays[rayIndex];
@@ -1462,42 +1714,52 @@ export class RayTracer {
                 const listenerPos = camera.getPosition();
                 const toListener = vec3.subtract(vec3.create(), listenerPos, ray.getOrigin());
                 vec3.normalize(toListener, toListener);
-                
                 // Convert to spherical coordinates
                 const azimuth = Math.atan2(toListener[2], toListener[0]); // -π to π
                 const elevation = Math.asin(toListener[1]); // -π/2 to π/2
-                
                 // Map to HRTF indices (assuming 360° azimuth, 180° elevation)
                 const azimuthIndex = Math.floor(((azimuth + Math.PI) / (2 * Math.PI)) * 360) % 360;
                 const elevationIndex = Math.floor(((elevation + Math.PI/2) / Math.PI) * 180) % 180;
-                
                 initialHrtfIndex = elevationIndex * 360 + azimuthIndex;
             }
-
+            
             // Store initial point
             this.rayPathPoints.push({
                 // Initial ray position without hit data (no surface interaction yet)
                 position: ray.getOrigin(),
                 direction: ray.getDirection(), // Add missing direction property
                 energy: ray.getEnergy(),
-                energyLow: ray.getEnergyLow(),
-                energyMid: ray.getEnergyMid(),
-                energyHigh: ray.getEnergyHigh(),
+                energy63: ray.getEnergy63(),
+                energy125: ray.getEnergy125(),
+                energy250: ray.getEnergy250(),
+                energy500: ray.getEnergy500(),
+                energy1k: ray.getEnergy1k(),
+                energy2k: ray.getEnergy2k(),
+                energy4k: ray.getEnergy4k(),
+                energy8k: ray.getEnergy8k(),
                 time: 0,
-                phase: ray.getPhase(),
-                frequency: ray.getFrequency(),
+                // Store phase for all bands
+                phase63: ray.getPhase63(),
+                phase125: ray.getPhase125(),
+                phase250: ray.getPhase250(),
+                phase500: ray.getPhase500(),
+                phase1k: ray.getPhase1k(),
+                phase2k: ray.getPhase2k(),
+                phase4k: ray.getPhase4k(),
+                phase8k: ray.getPhase8k(),
+                dopplerShift: 1.0, // Default doppler shift (no shift)
                 bounceNumber: 0,
                 rayIndex: rayIndex,
                 incomingDirection: ray.getDirection(),
                 hrtfIndex: initialHrtfIndex
             });
-
+            
             while (ray.isRayActive() && bounces < this.config.maxBounces && ray.getEnergy() > this.config.minEnergy) {
                 let closestT = Infinity;
                 let closestPlane = null;
                 const origin = ray.getOrigin();
                 const direction = ray.getDirection();
-
+                
                 for (const plane of planes) {
                     const denom = vec3.dot(direction, plane.normal);
                     if (Math.abs(denom) > 0.0001) { // Avoid parallel rays
@@ -1508,7 +1770,7 @@ export class RayTracer {
                         }
                     }
                 }
-
+                
                 if (closestPlane && closestPlane.material) {
                     const hitPoint = vec3.scaleAndAdd(vec3.create(), origin, direction, closestT - 0.0001);
                     
@@ -1516,118 +1778,158 @@ export class RayTracer {
                     const distanceTraveled = vec3.distance(origin, hitPoint);
                     const travelTime = this.calculateTravelTime(distanceTraveled);
                     currentTime += travelTime;
-
-                    // Calculate phase change based on distance and frequency
-                    const wavelength = this.calculateSpeedOfSound() / ray.getFrequency();
-                    const phaseChange = (2 * Math.PI * distanceTraveled) / wavelength;
-                    const newPhase = (ray.getPhase() + phaseChange) % (2 * Math.PI);
-
+                    
+                    // Calculate phase change based on distance and frequency for each band
+                    const phaseChange63 = (2 * Math.PI * RayTracer.FREQUENCY_BANDS[0] * distanceTraveled) / this.calculateSpeedOfSound();
+                    const phaseChange125 = (2 * Math.PI * RayTracer.FREQUENCY_BANDS[1] * distanceTraveled) / this.calculateSpeedOfSound();
+                    const phaseChange250 = (2 * Math.PI * RayTracer.FREQUENCY_BANDS[2] * distanceTraveled) / this.calculateSpeedOfSound();
+                    const phaseChange500 = (2 * Math.PI * RayTracer.FREQUENCY_BANDS[3] * distanceTraveled) / this.calculateSpeedOfSound();
+                    const phaseChange1k = (2 * Math.PI * RayTracer.FREQUENCY_BANDS[4] * distanceTraveled) / this.calculateSpeedOfSound();
+                    const phaseChange2k = (2 * Math.PI * RayTracer.FREQUENCY_BANDS[5] * distanceTraveled) / this.calculateSpeedOfSound();
+                    const phaseChange4k = (2 * Math.PI * RayTracer.FREQUENCY_BANDS[6] * distanceTraveled) / this.calculateSpeedOfSound();
+                    const phaseChange8k = (2 * Math.PI * RayTracer.FREQUENCY_BANDS[7] * distanceTraveled) / this.calculateSpeedOfSound();
+                    
+                    const newPhase63 = (ray.getPhase63() + phaseChange63) % (2 * Math.PI);
+                    const newPhase125 = (ray.getPhase125() + phaseChange125) % (2 * Math.PI);
+                    const newPhase250 = (ray.getPhase250() + phaseChange250) % (2 * Math.PI);
+                    const newPhase500 = (ray.getPhase500() + phaseChange500) % (2 * Math.PI);
+                    const newPhase1k = (ray.getPhase1k() + phaseChange1k) % (2 * Math.PI);
+                    const newPhase2k = (ray.getPhase2k() + phaseChange2k) % (2 * Math.PI);
+                    const newPhase4k = (ray.getPhase4k() + phaseChange4k) % (2 * Math.PI);
+                    const newPhase8k = (ray.getPhase8k() + phaseChange8k) % (2 * Math.PI);
+                    
                     // Calculate HRTF index for hit point if camera is provided
                     let hitHrtfIndex: number | undefined;
                     if (camera) {
                         const listenerPos = camera.getPosition();
                         const toListener = vec3.subtract(vec3.create(), listenerPos, hitPoint);
                         vec3.normalize(toListener, toListener);
-                        
                         // Convert to spherical coordinates
                         const azimuth = Math.atan2(toListener[2], toListener[0]); // -π to π
                         const elevation = Math.asin(toListener[1]); // -π/2 to π/2
-                        
                         // Map to HRTF indices (assuming 360° azimuth, 180° elevation)
                         const azimuthIndex = Math.floor(((azimuth + Math.PI) / (2 * Math.PI)) * 360) % 360;
                         const elevationIndex = Math.floor(((elevation + Math.PI/2) / Math.PI) * 180) % 180;
-                        
                         hitHrtfIndex = elevationIndex * 360 + azimuthIndex;
                     }
-
+                    
                     // Explicitly construct hit data instead of spreading undefined 'hit'
                     this.rayPathPoints.push({
                         position: vec3.clone(hitPoint),
                         direction: direction, // Add direction property
                         energy: ray.getEnergy(),
-                        energyLow: ray.getEnergyLow(),
-                        energyMid: ray.getEnergyMid(),
-                        energyHigh: ray.getEnergyHigh(),
+                        energy63: ray.getEnergy63(),
+                        energy125: ray.getEnergy125(),
+                        energy250: ray.getEnergy250(),
+                        energy500: ray.getEnergy500(),
+                        energy1k: ray.getEnergy1k(),
+                        energy2k: ray.getEnergy2k(),
+                        energy4k: ray.getEnergy4k(),
+                        energy8k: ray.getEnergy8k(),
                         time: currentTime,
-                        phase: newPhase,
-                        frequency: ray.getFrequency(),
+                        // Store phase for all bands
+                        phase63: newPhase63,
+                        phase125: newPhase125,
+                        phase250: newPhase250,
+                        phase500: newPhase500,
+                        phase1k: newPhase1k,
+                        phase2k: newPhase2k,
+                        phase4k: newPhase4k,
+                        phase8k: newPhase8k,
+                        dopplerShift: 1.0, // Default doppler shift (no shift)
                         bounceNumber: bounces + 1, // Increment bounce count
                         rayIndex: rayIndex,
                         incomingDirection: direction, // Define incoming direction
                         hrtfIndex: hitHrtfIndex
                     });
-
+                    
                     // Update ray properties with new time and phase
                     ray.updateTime(currentTime);
-                    ray.updatePhase(newPhase);
-
+                    ray.updatePhase(
+                        newPhase63, newPhase125, newPhase250, newPhase500,
+                        newPhase1k, newPhase2k, newPhase4k, newPhase8k
+                    );
+                    
                     // Calculate reflection
                     const reflected = vec3.create();
                     const dot = vec3.dot(direction, closestPlane.normal);
                     vec3.scale(reflected, closestPlane.normal, -2 * dot);
                     vec3.add(reflected, direction, reflected);
-
+                    
                     // Apply scattering based on frequency-dependent coefficients
                     const material = closestPlane.material;
+                    // Use average scattering for direction calculation
+                    const avgScattering = ( (material.scattering63 ?? 0) + (material.scattering125 ?? 0) + (material.scattering250 ?? 0) +
+                                         (material.scattering500 ?? 0) + (material.scattering1k ?? 0) + (material.scattering2k ?? 0) +
+                                         (material.scattering4k ?? 0) + (material.scattering8k ?? 0)) / 8;
                     
-                    
-                    
-                    const avgScattering = (material.scatteringLow + material.scatteringMid + material.scatteringHigh) / 3;
-
                     if (avgScattering > 0) {
                         // Generate random vector for scattering
                         const randomDir = this.generateRandomDirection(closestPlane.normal, material.roughness);
-
                         // Blend reflected direction with random direction based on scattering coefficient
                         vec3.lerp(reflected, reflected, randomDir, avgScattering);
                         vec3.normalize(reflected, reflected);
                     }
-
+                    
                     // Move new origin slightly away from the surface
                     const newOrigin = vec3.scaleAndAdd(vec3.create(), hitPoint, closestPlane.normal, 0.0001);
-
+                    
                     // Get material properties for frequency-dependent absorption
                     // The energyLoss object is used in updateRay to apply material absorption
                     // along with air absorption to the ray's energy values
                     const energyLoss = {
-                        low: material.absorptionLow,
-                        mid: material.absorptionMid,
-                        high: material.absorptionHigh
+                        band63: material.absorption63 ?? 0,
+                        band125: material.absorption125 ?? 0,
+                        band250: material.absorption250 ?? 0,
+                        band500: material.absorption500 ?? 0,
+                        band1k: material.absorption1k ?? 0,
+                        band2k: material.absorption2k ?? 0,
+                        band4k: material.absorption4k ?? 0,
+                        band8k: material.absorption8k ?? 0
                     };
-
+                    
                     // Calculate HRTF index if camera is provided
                     let hrtfIndex: number | undefined;
                     if (camera) {
                         const listenerPos = camera.getPosition();
                         const toListener = vec3.subtract(vec3.create(), listenerPos, hitPoint);
                         vec3.normalize(toListener, toListener);
-                        
                         // Convert to spherical coordinates
                         const azimuth = Math.atan2(toListener[2], toListener[0]); // -π to π
                         const elevation = Math.asin(toListener[1]); // -π/2 to π/2
-                        
                         // Map to HRTF indices (assuming 360° azimuth, 180° elevation)
                         const azimuthIndex = Math.floor(((azimuth + Math.PI) / (2 * Math.PI)) * 360) % 360;
                         const elevationIndex = Math.floor(((elevation + Math.PI/2) / Math.PI) * 180) % 180;
-                        
                         hrtfIndex = elevationIndex * 360 + azimuthIndex;
                     }
-
+                    
                     // Record hit with frequency-dependent energies
                     this.hits.push({
                         position: hitPoint,
                         energy: ray.getEnergy(),
                         time: currentTime,
-                        energyLow: ray.getEnergyLow(),
-                        energyMid: ray.getEnergyMid(),
-                        energyHigh: ray.getEnergyHigh(),
-                        phase: newPhase,
-                        frequency: ray.getFrequency(),
+                        energy63: ray.getEnergy63(),
+                        energy125: ray.getEnergy125(),
+                        energy250: ray.getEnergy250(),
+                        energy500: ray.getEnergy500(),
+                        energy1k: ray.getEnergy1k(),
+                        energy2k: ray.getEnergy2k(),
+                        energy4k: ray.getEnergy4k(),
+                        energy8k: ray.getEnergy8k(),
+                        // Store phase for all bands
+                        phase63: newPhase63,
+                        phase125: newPhase125,
+                        phase250: newPhase250,
+                        phase500: newPhase500,
+                        phase1k: newPhase1k,
+                        phase2k: newPhase2k,
+                        phase4k: newPhase4k,
+                        phase8k: newPhase8k,
+                        dopplerShift: 1.0, // Default doppler shift (no shift)
                         hrtfIndex: hrtfIndex,
                         incomingDirection: vec3.clone(direction)
-                        
                     });
-
+                    
                     // Update ray with environmental parameters
                     ray.updateRay(
                         newOrigin,
@@ -1637,7 +1939,7 @@ export class RayTracer {
                         this.room.getTemperature(),
                         this.room.getHumidity()
                     );
-
+                    
                     // Store ray segment if energy is above visibility threshold
                     if (ray.getEnergy() > this.VISIBILITY_THRESHOLD) {
                         this.rayPaths.push({
@@ -1646,7 +1948,7 @@ export class RayTracer {
                             energy: ray.getEnergy()
                         });
                     }
-
+                    
                     bounces++;
                 } else {
                     // No intersection or no material, deactivate ray
@@ -1654,6 +1956,7 @@ export class RayTracer {
                 }
             }
         }
+        
         console.log(`Completed late reflections`);
     }
 
@@ -1671,33 +1974,27 @@ export class RayTracer {
     private generateRandomDirection(normal: vec3, roughness: number): vec3 {
         // Create orthonormal basis with normal
         const basis = this.createOrthonormalBasis(normal);
-
         // Generate random direction with roughness-based perturbation
         const phi = 2 * Math.PI * Math.random();
         const r = roughness * Math.sqrt(-Math.log(Math.random()));
-
         const x = r * Math.cos(phi);
         const y = r * Math.sin(phi);
         const z = Math.sqrt(Math.max(0.0, 1 - x*x - y*y));
-
         // Transform direction from local space to world space
         const result = vec3.create();
         vec3.scale(result, basis[0], x);
         vec3.scaleAndAdd(result, result, basis[1], y);
         vec3.scaleAndAdd(result, result, basis[2], z);
-
         return vec3.normalize(vec3.create(), result);
     }
 
     private createOrthonormalBasis(normal: vec3): vec3[] {
         const tangent = vec3.create();
         const bitangent = vec3.create();
-
         // Find least dominant axis of normal
         const absX = Math.abs(normal[0]);
         const absY = Math.abs(normal[1]);
         const absZ = Math.abs(normal[2]);
-
         if (absX <= absY && absX <= absZ) {
             vec3.set(tangent, 0, -normal[2], normal[1]);
         } else if (absY <= absX && absY <= absZ) {
@@ -1705,11 +2002,9 @@ export class RayTracer {
         } else {
             vec3.set(tangent, -normal[1], normal[0], 0);
         }
-
         vec3.normalize(tangent, tangent);
         vec3.cross(bitangent, normal, tangent);
         vec3.normalize(bitangent, bitangent);
-
         return [tangent, bitangent, normal];
     }
 
@@ -1733,87 +2028,85 @@ export class RayTracer {
     }
 
     private calculateDopplerFrequency(point: RayPathPoint, nextPoint: RayPathPoint | null): number {
-        if (!nextPoint) return point.frequency;
-
+        if (!nextPoint) return 1000; // Return a default frequency if no next point
         const speedOfSound = this.calculateSpeedOfSound();
-        
         // Calculate ray velocity between points
         const distance = vec3.distance(point.position, nextPoint.position);
         const timeDiff = nextPoint.time - point.time;
         const rayVelocity = distance / timeDiff;
-
         // Calculate direction vector between points
         const direction = vec3.create();
         vec3.subtract(direction, nextPoint.position, point.position);
         vec3.normalize(direction, direction);
-
         // Project ray velocity onto direction to receiver
         // For simplicity, assume receiver is at (0,0,0)
         const toReceiver = vec3.create();
         vec3.negate(toReceiver, point.position);
         vec3.normalize(toReceiver, toReceiver);
-        
         const relativeVelocity = rayVelocity * vec3.dot(direction, toReceiver);
-
         // Doppler equation: f' = f * (c / (c ± v))
         // where c is speed of sound, v is relative velocity
-        return point.frequency * (speedOfSound / (speedOfSound - relativeVelocity));
+        // Use average frequency for Doppler calculation
+        const avgFrequency = (point.energy63 * 63 + point.energy125 * 125 + point.energy250 * 250 +
+                            point.energy500 * 500 + point.energy1k * 1000 + point.energy2k * 2000 +
+                            point.energy4k * 4000 + point.energy8k * 8000) /
+                           (point.energy63 + point.energy125 + point.energy250 + point.energy500 +
+                            point.energy1k + point.energy2k + point.energy4k + point.energy8k || 1);
+        return avgFrequency * (speedOfSound / (speedOfSound - relativeVelocity));
     }
 
     public generateImpulseResponse(sampleRate: number = 44100): ImpulseResponse {
         if (this.rayPathPoints.length === 0) {
             throw new Error("No ray path points available. Run calculateRayPaths first.");
         }
-
+        
         // Sort ray path points by time
         const sortedPoints = [...this.rayPathPoints].sort((a, b) => a.time - b.time);
-
+        
         // Find the maximum time to determine the length of the impulse response
         const maxTime = sortedPoints[sortedPoints.length - 1].time;
         const numSamples = Math.ceil(maxTime * sampleRate);
-
+        
         // Create arrays for the impulse response
         const timeArray = new Float32Array(numSamples);
         const amplitudeArray = new Float32Array(numSamples);
         const frequencyArray = new Float32Array(numSamples);
-
+        
         // Fill time array
         for (let i = 0; i < numSamples; i++) {
             timeArray[i] = i / sampleRate;
         }
-
+        
         // Process each path point and add its contribution to the impulse response
         for (let i = 0; i < sortedPoints.length; i++) {
             const point = sortedPoints[i];
             const nextPoint = i < sortedPoints.length - 1 ? sortedPoints[i + 1] : null;
-            
             const startSample = Math.floor(point.time * sampleRate);
-            const amplitude = Math.sqrt(point.energy); // Convert energy to amplitude
-
+            // Convert energy to amplitude (using average energy)
+            const averageEnergy = (point.energy63 + point.energy125 + point.energy250 + point.energy500 +
+                                 point.energy1k + point.energy2k + point.energy4k + point.energy8k) / 8;
+            const amplitude = Math.sqrt(Math.max(averageEnergy, 0)); // Convert energy to amplitude
+            
             // Calculate Doppler-shifted frequency
             const dopplerFrequency = this.calculateDopplerFrequency(point, nextPoint);
-
-            // Add the contribution of this point to nearby samples
-            const windowSize = Math.ceil(sampleRate / dopplerFrequency);
             
+            // Add the contribution of this point to nearby samples
+            const windowSize = Math.ceil(sampleRate / Math.max(dopplerFrequency, 1));
             for (let j = 0; j < windowSize && (startSample + j) < numSamples; j++) {
                 const t = timeArray[startSample + j];
-                
                 // Apply window function to avoid discontinuities
                 const windowValue = this.applyWindowFunction(j, windowSize);
-                
                 // Calculate phase with Doppler-shifted frequency
-                const phase = point.phase + 2 * Math.PI * dopplerFrequency * (t - point.time);
-                
+                // Use average phase for simplicity
+                const avgPhase = (point.phase63 + point.phase125 + point.phase250 + point.phase500 +
+                                point.phase1k + point.phase2k + point.phase4k + point.phase8k) / 8;
+                const phase = avgPhase + 2 * Math.PI * dopplerFrequency * (t - point.time);
                 // Apply frequency-dependent absorption based on distance and material
                 const distanceAttenuation = Math.exp(-0.1 * dopplerFrequency * point.time); // Simple frequency-dependent air absorption
-                
                 // Combine all factors for final amplitude
                 const contribution = amplitude * windowValue * distanceAttenuation * Math.sin(phase);
-                
                 // Add to impulse response
                 amplitudeArray[startSample + j] += contribution;
-                
                 // Store frequency information (weighted average based on energy)
                 const currentFreq = frequencyArray[startSample + j];
                 const currentEnergy = Math.pow(amplitudeArray[startSample + j], 2);
@@ -1823,7 +2116,7 @@ export class RayTracer {
                     (currentEnergy + newEnergy || 1);
             }
         }
-
+        
         // Normalize the impulse response
         const maxAmplitude = Math.max(...Array.from(amplitudeArray).map(Math.abs));
         if (maxAmplitude > 0) {
@@ -1831,7 +2124,7 @@ export class RayTracer {
                 amplitudeArray[i] /= maxAmplitude;
             }
         }
-
+        
         return {
             time: timeArray,
             amplitude: amplitudeArray,
@@ -1841,7 +2134,6 @@ export class RayTracer {
     }
 
     public render(pass: GPURenderPassEncoder, viewProjection: Float32Array): void {
-        
         this.rayRenderer.render(
             pass,
             viewProjection,
@@ -1916,26 +2208,43 @@ graph TD
 src\room\room-materials.ts:
 <code>
 export interface RoomMaterials {
-    left:   WallMaterial;
-    right:  WallMaterial;
-    top:    WallMaterial;
-    bottom: WallMaterial;
-    front:  WallMaterial;
-    back:   WallMaterial;
+    walls: WallMaterial;
+    ceiling: WallMaterial;
+    floor: WallMaterial;
 }
 
 export interface WallMaterial {
-    absorptionLow: number;   // 125-500Hz
-    absorptionMid: number;   // 500-2000Hz
-    absorptionHigh: number;  // 2000-8000Hz
+    // Keep the simple properties for manual UI control
+    absorptionLow?: number;
+    absorptionMid?: number;
+    absorptionHigh?: number;
 
-    scatteringLow: number;   // Low frequency scattering
-    scatteringMid: number;   // Mid frequency scattering
-    scatteringHigh: number;  // High frequency scattering
+    // Add the detailed 8-band properties from your presets
+    absorption63?: number;
+    absorption125?: number;
+    absorption250?: number;
+    absorption500?: number;
+    absorption1k?: number;
+    absorption2k?: number;
+    absorption4k?: number;
+    absorption8k?: number;
 
-    roughness: number;       // 0-1, affects reflection pattern
-    phaseShift: number;      // Fixed phase shift on reflection (radians)
-    phaseRandomization: number; // Max random phase variation (radians)
+    // --- We will do the same for scattering ---
+    scatteringLow?: number;
+    scatteringMid?: number;
+    scatteringHigh?: number;
+    scattering63?: number;
+    scattering125?: number;
+    scattering250?: number;
+    scattering500?: number;
+    scattering1k?: number;
+    scattering2k?: number;
+    scattering4k?: number;
+    scattering8k?: number;
+
+    roughness: number;
+    phaseShift: number;
+    phaseRandomization: number;
 }
 
 // Add standard material presets
@@ -1962,10 +2271,415 @@ export const MATERIAL_PRESETS = {
 };
 </code>
 
+src\room\room-presets.ts:
+<code>
+/**
+ * RoomPresets - Configuration for different room types with realistic acoustic properties
+ * 
+ * This file defines presets for various room types including cathedrals, studios,
+ * concert halls, and other acoustic environments. Each preset includes both
+ * geometric dimensions and material properties that affect sound propagation.
+ */
+
+import { RoomConfig } from './room';
+import { WallMaterial } from './room-materials';
+
+// Define interface for room presets
+export interface RoomPreset {
+  name: string;
+  description: string;
+  // Geometric properties
+  dimensions: {
+    width: number;
+    height: number;
+    depth: number;
+  };
+  // Material properties for different surfaces
+  materials: {
+    walls: Partial<WallMaterial>;
+    ceiling: Partial<WallMaterial>;
+    floor: Partial<WallMaterial>;
+  };
+  // Additional acoustic characteristics
+  characteristics: {
+    reverbTime: number; // RT60 in seconds
+    clarity: number; // Clarity index (C80)
+    warmth: number; // Warmth index (C50)
+    intimacy: boolean; // Whether the room feels intimate
+    diffusion: number; // Diffusion coefficient
+  };
+}
+
+// Helper to create 8-band properties from 3-band
+const createBands = (low: number, mid: number, high: number) => ({
+    absorption63: low,
+    absorption125: low,
+    absorption250: (low + mid) / 2,
+    absorption500: mid,
+    absorption1k: mid,
+    absorption2k: (mid + high) / 2,
+    absorption4k: high,
+    absorption8k: high,
+    
+    scattering63: low,
+    scattering125: low,
+    scattering250: (low + mid) / 2,
+    scattering500: mid,
+    scattering1k: mid,
+    scattering2k: (mid + high) / 2,
+    scattering4k: high,
+    scattering8k: high
+});
+
+// Export all room presets
+export const ROOM_PRESETS: { [key: string]: RoomPreset } = {
+  /**
+   * Cathedral - Large reverberant space with stone surfaces
+   * Characterized by long reverb times and strong early reflections
+   */
+  CATHEDRAL: {
+    name: "Cathedral",
+    description: "Large stone cathedral with high ceilings and long reverberation time",
+    dimensions: {
+      width: 30,
+      height: 40,
+      depth: 50
+    },
+    materials: {
+      walls: {
+        ...createBands(0.05, 0.04, 0.03),
+        roughness: 0.3,
+        phaseShift: 0.0,
+        phaseRandomization: 0.1
+      },
+      ceiling: {
+        ...createBands(0.04, 0.03, 0.02),
+        roughness: 0.35,
+        phaseShift: 0.0,
+        phaseRandomization: 0.1
+      },
+      floor: {
+        ...createBands(0.1, 0.08, 0.06),
+        roughness: 0.25,
+        phaseShift: 0.0,
+        phaseRandomization: 0.1
+      }
+    },
+    characteristics: {
+      reverbTime: 8.0,
+      clarity: -4.0,
+      warmth: -2.0,
+      intimacy: false,
+      diffusion: 0.7
+    }
+  },
+
+  /**
+   * Recording Studio - Small controlled environment
+   * Designed for minimal reflections and balanced frequency response
+   */
+  RECORDING_STUDIO: {
+    name: "Recording Studio",
+    description: "Professional recording studio with acoustic treatment for neutral sound",
+    dimensions: {
+      width: 6,
+      height: 3,
+      depth: 5
+    },
+    materials: {
+      walls: {
+        absorption63: 0.3, absorption125: 0.4, absorption250: 0.5, absorption500: 0.6,
+        absorption1k: 0.7, absorption2k: 0.8, absorption4k: 0.8, absorption8k: 0.8,
+        scattering63: 0.4, scattering125: 0.5, scattering250: 0.6, scattering500: 0.6,
+        scattering1k: 0.7, scattering2k: 0.8, scattering4k: 0.8, scattering8k: 0.8,
+        roughness: 0.6,
+        phaseShift: 0.0,
+        phaseRandomization: 0.2
+      },
+      ceiling: {
+        absorption63: 0.25, absorption125: 0.35, absorption250: 0.45, absorption500: 0.5,
+        absorption1k: 0.6, absorption2k: 0.7, absorption4k: 0.7, absorption8k: 0.7,
+        scattering63: 0.3, scattering125: 0.4, scattering250: 0.5, scattering500: 0.5,
+        scattering1k: 0.6, scattering2k: 0.7, scattering4k: 0.7, scattering8k: 0.7,
+        roughness: 0.5,
+        phaseShift: 0.0,
+        phaseRandomization: 0.2
+      },
+      floor: {
+        absorption63: 0.15, absorption125: 0.18, absorption250: 0.2, absorption500: 0.25,
+        absorption1k: 0.3, absorption2k: 0.3, absorption4k: 0.3, absorption8k: 0.3,
+        scattering63: 0.2, scattering125: 0.25, scattering250: 0.3, scattering500: 0.3,
+        scattering1k: 0.35, scattering2k: 0.4, scattering4k: 0.4, scattering8k: 0.4,
+        roughness: 0.3,
+        phaseShift: 0.0,
+        phaseRandomization: 0.1
+      }
+    },
+    characteristics: {
+      reverbTime: 0.3,
+      clarity: 2.0,
+      warmth: 1.0,
+      intimacy: true,
+      diffusion: 0.9
+    }
+  },
+
+  /**
+   * Concert Hall - Medium-large performance space
+   * Balanced acoustics for musical performances
+   */
+  CONCERT_HALL: {
+    name: "Concert Hall",
+    description: "Symphony concert hall with balanced acoustics for orchestral music",
+    dimensions: {
+      width: 25,
+      height: 15,
+      depth: 40
+    },
+    materials: {
+      walls: {
+        ...createBands(0.15, 0.12, 0.1),
+        roughness: 0.45,
+        phaseShift: 0.0,
+        phaseRandomization: 0.15
+      },
+      ceiling: {
+        ...createBands(0.12, 0.1, 0.08),
+        roughness: 0.4,
+        phaseShift: 0.0,
+        phaseRandomization: 0.15
+      },
+      floor: {
+        ...createBands(0.2, 0.18, 0.15),
+        roughness: 0.4,
+        phaseShift: 0.0,
+        phaseRandomization: 0.15
+      }
+    },
+    characteristics: {
+      reverbTime: 2.0,
+      clarity: 1.5,
+      warmth: 2.5,
+      intimacy: true,
+      diffusion: 0.8
+    }
+  },
+
+  /**
+   * Home Theater - Medium-sized dedicated viewing room
+   * Designed for clear dialogue and immersive surround sound
+   */
+  HOME_THEATER: {
+    name: "Home Theater",
+    description: "Dedicated home theater room with acoustic treatment for movie watching",
+    dimensions: {
+      width: 8,
+      height: 3,
+      depth: 10
+    },
+    materials: {
+      walls: {
+        ...createBands(0.25, 0.4, 0.6),
+        roughness: 0.5,
+        phaseShift: 0.0,
+        phaseRandomization: 0.15
+      },
+      ceiling: {
+        ...createBands(0.2, 0.35, 0.5),
+        roughness: 0.45,
+        phaseShift: 0.0,
+        phaseRandomization: 0.15
+      },
+      floor: {
+        ...createBands(0.1, 0.15, 0.2),
+        roughness: 0.3,
+        phaseShift: 0.0,
+        phaseRandomization: 0.1
+      }
+    },
+    characteristics: {
+      reverbTime: 0.4,
+      clarity: 3.0,
+      warmth: 1.5,
+      intimacy: true,
+      diffusion: 0.85
+    }
+  },
+
+  /**
+   * Classroom - Medium-sized educational space
+   * Optimized for speech intelligibility
+   */
+  CLASSROOM: {
+    name: "Classroom",
+    description: "Standard classroom with focus on speech intelligibility",
+    dimensions: {
+      width: 10,
+      height: 3,
+      depth: 8
+    },
+    materials: {
+      walls: {
+        ...createBands(0.15, 0.3, 0.4),
+        roughness: 0.4,
+        phaseShift: 0.0,
+        phaseRandomization: 0.1
+      },
+      ceiling: {
+        ...createBands(0.2, 0.4, 0.6),
+        roughness: 0.5,
+        phaseShift: 0.0,
+        phaseRandomization: 0.1
+      },
+      floor: {
+        ...createBands(0.1, 0.15, 0.2),
+        roughness: 0.3,
+        phaseShift: 0.0,
+        phaseRandomization: 0.1
+      }
+    },
+    characteristics: {
+      reverbTime: 0.6,
+      clarity: 2.5,
+      warmth: 1.0,
+      intimacy: true,
+      diffusion: 0.75
+    }
+  },
+
+  /**
+   * Bathroom - Small reflective tiled space
+   * Characterized by short, bright reverb and strong reflections
+   */
+  BATHROOM: {
+    name: "Bathroom",
+    description: "Small bathroom with tiled walls and bright, reflective acoustics",
+    dimensions: {
+      width: 2.5,
+      height: 2.5,
+      depth: 2
+    },
+    materials: {
+      walls: {
+        ...createBands(0.02, 0.02, 0.03),
+        roughness: 0.25,
+        phaseShift: 0.0,
+        phaseRandomization: 0.05
+      },
+      ceiling: {
+        ...createBands(0.05, 0.05, 0.06),
+        roughness: 0.3,
+        phaseShift: 0.0,
+        phaseRandomization: 0.05
+      },
+      floor: {
+        ...createBands(0.03, 0.03, 0.04),
+        roughness: 0.28,
+        phaseShift: 0.0,
+        phaseRandomization: 0.05
+      }
+    },
+    characteristics: {
+      reverbTime: 1.2,
+      clarity: -1.0,
+      warmth: -3.0,
+      intimacy: true,
+      diffusion: 0.6
+    }
+  },
+
+  /**
+   * Wood Panel Room - Medium-sized room with wood paneling
+   * Warm, resonant acoustics with natural wood reflections
+   */
+  WOOD_PANEL_ROOM: {
+    name: "Wood Panel Room",
+    description: "Room with wood paneling on walls and ceiling, creating warm acoustics",
+    dimensions: {
+      width: 7,
+      height: 3,
+      depth: 6
+    },
+    materials: {
+      walls: {
+        ...createBands(0.1, 0.08, 0.06),
+        roughness: 0.4,
+        phaseShift: 0.0,
+        phaseRandomization: 0.1
+      },
+      ceiling: {
+        ...createBands(0.08, 0.06, 0.05),
+        roughness: 0.35,
+        phaseShift: 0.0,
+        phaseRandomization: 0.1
+      },
+      floor: {
+        ...createBands(0.15, 0.12, 0.1),
+        roughness: 0.45,
+        phaseShift: 0.0,
+        phaseRandomization: 0.1
+      }
+    },
+    characteristics: {
+      reverbTime: 0.8,
+      clarity: 1.0,
+      warmth: 3.5,
+      intimacy: true,
+      diffusion: 0.7
+    }
+  },
+
+  /**
+   * Anechoic Chamber - Specialized acoustic space
+   * Designed to absorb all sound reflections
+   */
+  ANECHOIC_CHAMBER: {
+    name: "Anechoic Chamber",
+    description: "Specialized chamber with wedge absorbers to eliminate all reflections",
+    dimensions: {
+      width: 4,
+      height: 3,
+      depth: 4
+    },
+    materials: {
+      walls: {
+        ...createBands(0.95, 0.98, 0.99),
+        roughness: 0.9,
+        phaseShift: 0.0,
+        phaseRandomization: 0.3
+      },
+      ceiling: {
+        ...createBands(0.95, 0.98, 0.99),
+        roughness: 0.9,
+        phaseShift: 0.0,
+        phaseRandomization: 0.3
+      },
+      floor: {
+        ...createBands(0.95, 0.98, 0.99),
+        roughness: 0.9,
+        phaseShift: 0.0,
+        phaseRandomization: 0.3
+      }
+    },
+    characteristics: {
+      reverbTime: 0.05,
+      clarity: 10.0,
+      warmth: -5.0,
+      intimacy: false,
+      diffusion: 0.95
+    }
+  }
+};
+
+// Default room preset
+export const DEFAULT_ROOM_PRESET = ROOM_PRESETS.RECORDING_STUDIO;
+</code>
+
 src\room\room.ts:
 <code>
 import { mat4, vec3 } from 'gl-matrix';
 import { WallMaterial } from './room-materials';
+import { ROOM_PRESETS, RoomPreset } from './room-presets';
 
 enum Surface {
     FLOOR = 0.0,
@@ -1991,10 +2705,8 @@ export interface RoomMaterials {
     floor: WallMaterial;
 }
 
-// Import WallMaterial interface from room-materials.ts
-
 // Add default materials
-const DEFAULT_WALL_MATERIAL: WallMaterial = {
+export const DEFAULT_WALL_MATERIAL: WallMaterial = {
     absorptionLow: 0.3,
     absorptionMid: 0.2,
     absorptionHigh: 0.1,
@@ -2060,6 +2772,50 @@ export class Room {
             }],
         });
     }
+
+    /**
+     * Apply a room preset to configure the room dimensions and materials
+     * @param preset The room preset to apply
+     */
+    public applyPreset(preset: RoomPreset): void {
+        // Update dimensions
+        this.config.dimensions = { ...preset.dimensions };
+        
+        // Update materials, merging preset values with defaults
+        this.config.materials = {
+            walls: { ...DEFAULT_WALL_MATERIAL, ...preset.materials.walls },
+            ceiling: { ...DEFAULT_WALL_MATERIAL, ...preset.materials.ceiling },
+            floor: { ...DEFAULT_WALL_MATERIAL, ...preset.materials.floor }
+        };
+
+        // Reinitialize geometry with new dimensions
+        this.initializeGeometry();
+        
+        // Update view-projection matrix to account for new dimensions
+        this.updateViewProjection(this.canvasAspect);
+        
+        console.log(`Applied room preset: ${preset.name}`);
+    }
+
+    /**
+     * Get available room presets
+     * @returns Array of available room presets
+     */
+    public getPresets(): { [key: string]: RoomPreset } {
+        return ROOM_PRESETS;
+    }
+
+    /**
+     * Get a specific room preset by name
+     * @param name The name of the preset to retrieve
+     * @returns The room preset or undefined if not found
+     */
+    public getPreset(name: string): RoomPreset | undefined {
+        return ROOM_PRESETS[name as keyof typeof ROOM_PRESETS];
+    }
+
+    // Store canvas aspect ratio for view projection updates
+    private canvasAspect: number = 1.0;
 
     private initializeGeometry(): void {
         const { width, height, depth } = this.config.dimensions;
@@ -2288,6 +3044,9 @@ export class Room {
     }
 
     public updateViewProjection(aspect: number): void {
+        // Store aspect ratio for future use
+        this.canvasAspect = aspect;
+        
         // Create perspective projection matrix
         const fov = Math.PI / 4; // 45 degrees FOV
         mat4.perspective(this.projectionMatrix, fov, aspect, 0.1, 100.0);
@@ -2315,7 +3074,12 @@ export class Room {
         mat4.multiply(viewProjection, this.projectionMatrix, this.viewMatrix);
 
         // Update uniform buffer with new matrix
-        this.device.queue.writeBuffer(this.uniformBuffer, 0, viewProjection as Float32Array);
+        // Create a standard Float32Array with compatible ArrayBuffer
+        const matrixValues = Array.isArray(viewProjection) ?
+            viewProjection :
+            Array.from(viewProjection);
+        const matrixArray = new Float32Array(matrixValues);
+        this.device.queue.writeBuffer(this.uniformBuffer, 0, matrixArray);
     }
 
     public isPointInside(point: vec3): boolean {
@@ -2375,9 +3139,9 @@ interface RoomConfig {
         depth: number;
     };
     materials: {
-        walls: { absorption: number };
-        ceiling: { absorption: number };
-        floor: { absorption: number };
+        walls: { absorptionLow: number, absorptionMid: number, absorptionHigh: number };
+        ceiling: { absorptionLow: number, absorptionMid: number, absorptionHigh: number };
+        floor: { absorptionLow: number, absorptionMid: number, absorptionHigh: number };
     };
 }
 
@@ -2388,9 +3152,9 @@ interface RoomDimensions {
 }
 
 interface RoomMaterials {
-    walls: { absorption: number };
-    ceiling: { absorption: number };
-    floor: { absorption: number };
+    walls: { absorptionLow: number, absorptionMid: number, absorptionHigh: number };
+    ceiling: { absorptionLow: number, absorptionMid: number, absorptionHigh: number };
+    floor: { absorptionLow: number, absorptionMid: number, absorptionHigh: number };
 }
 
 export enum Surface {
@@ -2403,30 +3167,40 @@ export enum Surface {
 
 src\sound\audio-processor.ts:
 <code>
-/**
- * AudioProcessor
- *
- * This class integrates real-time audio processing using the Web Audio API.
- * It converts ray hit data (each with a time and energy value) into an impulse response
- * and plays that sound through the device's audio output.
- *
- * Methods:
- *   - processRayHits: Converts ray hit data into an impulse response.
- *   - playAudio: Plays the generated impulse response.
- *   - generateAndPlay: Convenience method combining the above two.
- *   - debugPlaySineWave: Plays a test sine wave for debug purposes.
- *   - playSoundWithImpulseResponse: Convolves a dry white noise signal with the impulse response and plays it.
- */
 import { Camera } from '../camera/camera';
 import { SpatialAudioProcessor } from './spatial-audio-processor';
 import { Room } from '../room/room';
 import { WaveformRenderer } from '../visualization/waveform-renderer';
-import { vec3 } from 'gl-matrix/vec3';
+import { vec3 } from 'gl-matrix';
+import { RayHit } from '../raytracer/raytracer';
+
+interface RoomMode {
+  frequency: number;
+  rt60: number;
+}
+
+const NUM_BANDS = 8;
+const BAND_CENTERS = [63, 125, 250, 500, 1000, 2000, 4000, 8000];
+
+// Helper to get total energy from a RayHit object
+const getTotalEnergy = (hit: RayHit): number => {
+    return (
+        (hit.energy63  || 0) + (hit.energy125 || 0) + (hit.energy250 || 0) +
+        (hit.energy500 || 0) + (hit.energy1k  || 0) + (hit.energy2k  || 0) +
+        (hit.energy4k  || 0) + (hit.energy8k  || 0)
+    );
+};
+
+// Helper to get average energy from a RayHit object
+const getAverageEnergy = (hit: RayHit): number => {
+    return getTotalEnergy(hit) / NUM_BANDS;
+};
 
 export class AudioProcessor {
   private audioCtx: AudioContext;
   private sampleRate: number;
   private impulseResponseBuffer: AudioBuffer | null;
+  private lastRayHits: RayHit[] | null = null;
   private lastImpulseData: Float32Array | null;
   private spatialProcessor: SpatialAudioProcessor;
   private room: Room;
@@ -2453,18 +3227,9 @@ export class AudioProcessor {
    * @param params - Additional parameters for spatial audio processing.
    */
   async processRayHits(
-    rayHits: Array<{
-        position: vec3,
-        energyLow: number,
-        energyMid: number,
-        energyHigh: number,
-        time: number,
-        phase: number,
-        frequency: number,
-        dopplerShift: number
-    }>,
+    rayHits: RayHit[],
     camera: Camera,
-    maxTime: number = 0.5,
+    maxTime: number = 2.0, // Increased default IR time for more reverb
     params = {
         speedOfSound: 343,
         maxDistance: 20,
@@ -2475,24 +3240,35 @@ export class AudioProcessor {
     }
   ): Promise<void> {
     try {
+        if (!rayHits || rayHits.length === 0) {
+            console.warn("No ray hits to process, skipping IR generation.");
+            return;
+        }
+        this.lastRayHits = rayHits;
+
         const sortedHits = [...rayHits].sort((a, b) => a.time - b.time);
+        const irDuration = Math.min(maxTime, (sortedHits[sortedHits.length - 1]?.time || 0) + 0.5);
+        const sampleCount = Math.ceil(irDuration * this.sampleRate);
 
-        const [leftIR, rightIR] = this.createImpulseResponseFromHits(sortedHits, maxTime);
+        // STEP 1: Generate ONE spectrally-rich broadband impulse response from reflections.
+        const [reflectionL, reflectionR] = this.createReflectionImpulse(sortedHits, sampleCount, camera);
 
-        // The rest of the function remains the same...
-        const sampleCount = leftIR.length;
+        // STEP 2: Generate a SEPARATE signal for the room modes.
+        const [modesL, modesR] = this.createRoomModesImpulse(this.room.config.dimensions, sampleCount);
+
+        // Apply a global decay envelope to the reflections. Modes handle their own decay.
         const envelope = this.generateEnvelope(sampleCount, sortedHits);
+        this.applyEnvelope(reflectionL, reflectionR, envelope);
 
-        // (Optional) You can still add room modes if you wish
-        const roomModes = this.calculateRoomModes(this.room.config.dimensions);
-        this.addRoomModes(leftIR, rightIR, roomModes);
+        // STEP 3 & 4: Synthesize the final IR by mixing the parts and normalizing.
+        this.impulseResponseBuffer = this._synthesizeFinalIR(
+            reflectionL, reflectionR, modesL, modesR
+        );
 
-        this.normalizeAndApplyEnvelope(leftIR, rightIR, envelope);
-        this.setupImpulseResponseBuffer(leftIR, rightIR);
-        this.lastImpulseData = leftIR;
-
-        // Debug: Log impulse response characteristics
-        this.debugImpulseResponse(leftIR, rightIR);
+        if (this.impulseResponseBuffer) {
+            this.lastImpulseData = this.impulseResponseBuffer.getChannelData(0);
+            this.debugImpulseResponse(this.impulseResponseBuffer.getChannelData(0), this.impulseResponseBuffer.getChannelData(1));
+        }
 
         console.log("Impulse response processed successfully.");
     } catch (error) {
@@ -2500,37 +3276,124 @@ export class AudioProcessor {
         throw error;
     }
   }
-
-  // Add this new function to the AudioProcessor class
-  private createImpulseResponseFromHits(
-      rayHits: any[],
-      maxTime: number
-  ): [Float32Array, Float32Array] {
-    const sampleCount = Math.ceil(maxTime * this.sampleRate);
+  
+  private createReflectionImpulse(rayHits: RayHit[], sampleCount: number, camera: Camera): [Float32Array, Float32Array] {
     const leftIR = new Float32Array(sampleCount).fill(0);
     const rightIR = new Float32Array(sampleCount).fill(0);
 
+    const sinc = (x: number) => x === 0 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x);
+    const impulseWidth = 8;
+    const impulse = new Float32Array(impulseWidth * 2 + 1);
+    for (let i = -impulseWidth; i <= impulseWidth; i++) {
+        impulse[i + impulseWidth] = sinc(i / 2) * (0.54 - 0.46 * Math.cos(2 * Math.PI * (i + impulseWidth) / (impulseWidth * 2))); // Sinc with Hamming
+    }
+
     for (const hit of rayHits) {
-        const time = Math.max(hit.time || 0, 0);
-        if (time < maxTime) {
-            const sampleIndex = Math.floor(time * this.sampleRate);
+        const time = hit.time || 0;
+        const sampleIndex = Math.floor(time * this.sampleRate);
+        if (sampleIndex >= sampleCount - impulseWidth) continue;
 
-            const energy = ( (hit.energyLow || 0) + (hit.energyMid || 0) + (hit.energyHigh || 0) ) / 3;
-            const amplitude = Math.sqrt(Math.max(energy, 0));
+        // FIX: Use the helper function to correctly calculate total energy from the 8 bands
+        const totalEnergy = getTotalEnergy(hit);
+        
+        const amplitude = Math.sqrt(Math.max(totalEnergy, 0));
+        if (!isFinite(amplitude) || amplitude === 0) continue;
 
-            const [leftGain, rightGain] = this.calculateSpatialGains(hit.position || [0, 0, 0]);
+        const [leftGain, rightGain] = this.calculateSpatialGains(hit.position || vec3.fromValues(0, 0, 0), camera);
 
-            if (sampleIndex < sampleCount && isFinite(amplitude)) {
-                leftIR[sampleIndex] += amplitude * leftGain;
-                rightIR[sampleIndex] += amplitude * rightGain;
+        // Create a simple filter based on energy distribution to add spectral color
+        const lowEnergy = (hit.energy63 + hit.energy125 + hit.energy250) / totalEnergy;
+        const midEnergy = (hit.energy500 + hit.energy1k + hit.energy2k) / totalEnergy;
+        const highEnergy = (hit.energy4k + hit.energy8k) / totalEnergy;
+        
+        // Color the impulse - this is a simplification but better than nothing
+        const coloredAmplitude = amplitude * (lowEnergy * 0.5 + midEnergy * 1.0 + highEnergy * 1.2);
+
+        for (let i = 0; i < impulse.length; i++) {
+            const idx = sampleIndex + i - impulseWidth;
+            if (idx >= 0 && idx < sampleCount) {
+                const impulseValue = impulse[i] * coloredAmplitude;
+                leftIR[idx] += impulseValue * leftGain;
+                rightIR[idx] += impulseValue * rightGain;
             }
         }
     }
-
     return [leftIR, rightIR];
   }
 
-  private applyWaveInterference(leftIR: Float32Array, rightIR: Float32Array, rayHits: any[]): void {
+  private createRoomModesImpulse(dimensions: { width: number; height: number; depth: number; }, sampleCount: number): [Float32Array, Float32Array] {
+    const modesL = new Float32Array(sampleCount).fill(0);
+    const modesR = new Float32Array(sampleCount).fill(0);
+    const modes = this.calculateRoomModes(dimensions);
+
+    modes.forEach(mode => {
+        const freq = mode.frequency;
+        const amplitude = 0.05; // Modes have a small, fixed amplitude.
+        const k = 6.907 / mode.rt60;
+        const phase = Math.random() * 2 * Math.PI;
+
+        for (let i = 0; i < sampleCount; i++) {
+            const t = i / this.sampleRate;
+            if (t > mode.rt60 * 1.5) break;
+
+            const decay = Math.exp(-k * t);
+            const sample = amplitude * decay * Math.sin(2 * Math.PI * freq * t + phase);
+            modesL[i] += sample;
+            modesR[i] += sample;
+        }
+    });
+    return [modesL, modesR];
+  }
+
+  private _synthesizeFinalIR(
+    reflectionL: Float32Array, reflectionR: Float32Array,
+    modesL: Float32Array, modesR: Float32Array
+  ): AudioBuffer | null {
+    const sampleCount = reflectionL.length;
+    if (sampleCount === 0) return null;
+
+    // --- MANUAL MIXING (Replaces OfflineAudioContext) ---
+    // This synchronous mixing is significantly faster than using an OfflineAudioContext,
+    // which introduces latency by scheduling the rendering asynchronously.
+    const finalL = new Float32Array(sampleCount);
+    const finalR = new Float32Array(sampleCount);
+
+    for (let i = 0; i < sampleCount; i++) {
+        finalL[i] = reflectionL[i] + modesL[i];
+        finalR[i] = reflectionR[i] + modesR[i];
+    }
+
+    // --- MASTER NORMALIZATION ---
+    let max = 0.0001; // Avoid division by zero
+    for (let i = 0; i < sampleCount; i++) {
+        max = Math.max(max, Math.abs(finalL[i]), Math.abs(finalR[i]));
+    }
+
+    const gain = 0.98 / max;
+    if (gain < 1.0) { // Only apply gain if it's clipping
+        for (let i = 0; i < sampleCount; i++) {
+            finalL[i] *= gain;
+            finalR[i] *= gain;
+        }
+    }
+
+    // --- CREATE FINAL AUDIOBUFFER ---
+    const finalBuffer = this.audioCtx.createBuffer(2, sampleCount, this.sampleRate);
+    finalBuffer.copyToChannel(finalL, 0);
+    finalBuffer.copyToChannel(finalR, 1);
+
+    return finalBuffer;
+  }
+
+  // Simplified envelope application
+  private applyEnvelope(leftIR: Float32Array, rightIR: Float32Array, envelope: Float32Array): void {
+      for (let i = 0; i < leftIR.length; i++) {
+          leftIR[i] *= envelope[i];
+          rightIR[i] *= envelope[i];
+      }
+  }
+
+  private applyWaveInterference(leftIR: Float32Array, rightIR: Float32Array, rayHits: RayHit[], camera: Camera): void {
     const timeStep = 1 / this.sampleRate;
     
     // Process each sample
@@ -2543,27 +3406,25 @@ export class AudioProcessor {
         for (const hit of rayHits) {
             if (hit.time <= currentTime) {
                 // Validate inputs to prevent NaN
-                const frequency = Math.max(hit.frequency || 440, 20); // Minimum 20Hz
-                const dopplerShift = Math.max(hit.dopplerShift || 1, 0.1); // Minimum 0.1
-                const phase = hit.phase || 0;
+                const frequency = 440; // Simplified
+                const dopplerShift = Math.max(hit.dopplerShift || 1, 0.1);
+                const phase = (hit.phase63 || 0); // Simplified
                 
                 // Calculate phase at current time
                 const timeSinceArrival = Math.max(currentTime - hit.time, 0);
                 const instantPhase = phase + 
                     2 * Math.PI * frequency * (1 + dopplerShift) * timeSinceArrival;
 
-                // Calculate amplitude with validation
-                const energyLow = Math.max(hit.energyLow || 0, 0);
-                const energyMid = Math.max(hit.energyMid || 0, 0);
-                const energyHigh = Math.max(hit.energyHigh || 0, 0);
-                const amplitude = Math.sqrt((energyLow + energyMid + energyHigh) / 3);
+                // FIX: Use helper function to get average energy
+                const avgEnergy = getAverageEnergy(hit);
+                const amplitude = Math.sqrt(avgEnergy);
 
                 // Add wave contribution with proper phase
                 const contribution = amplitude * Math.sin(instantPhase);
                 
                 // Validate position for spatial gains
-                const position = hit.position || [0, 0, 0];
-                const [leftGain, rightGain] = this.calculateSpatialGains(position);
+                const position = hit.position || vec3.fromValues(0, 0, 0);
+                const [leftGain, rightGain] = this.calculateSpatialGains(position, camera);
                 
                 // Add validated contributions
                 if (!isNaN(contribution) && isFinite(contribution)) {
@@ -2579,86 +3440,102 @@ export class AudioProcessor {
     }
   }
 
-  private calculateSpatialGains(position: vec3): [number, number] {
-    // Simple stereo panning based on x-position
-    // Could be enhanced with HRTF in the future
-    const x = position[0];
-    const maxPan = 0.8; // Maximum panning amount (0.8 = 80% to either side)
-    const pan = Math.max(-maxPan, Math.min(maxPan, x / 5)); // Normalize position to pan range
-        
-    // Convert pan to gains using constant power panning
-    const leftGain = Math.cos((pan + 1) * Math.PI / 4);
-    const rightGain = Math.sin((pan + 1) * Math.PI / 4);
-        
+  // --- FIX: Corrected spatialization logic ---
+  private calculateSpatialGains(hitPosition: vec3, camera: Camera): [number, number] {
+    const listenerPos = camera.getPosition();
+    const listenerFwd = camera.getFront();
+    const listenerUp = camera.getUp();
+
+    // Calculate the listener's right-hand vector
+    const listenerRight = vec3.cross(vec3.create(), listenerFwd, listenerUp);
+    vec3.normalize(listenerRight, listenerRight);
+
+    // --- THE FIX IS HERE ---
+    // Calculate the direction vector FROM the listener TOWARDS the sound hit.
+    // This is the correct vector to determine if something is to the left or right.
+    const fromListenerToHitDir = vec3.subtract(vec3.create(), hitPosition, listenerPos);
+    vec3.normalize(fromListenerToHitDir, fromListenerToHitDir);
+
+    // Project the direction to the sound onto the listener's right vector.
+    // This gives a value from -1 (fully to the listener's left) to +1 (fully to the right).
+    const pan = vec3.dot(fromListenerToHitDir, listenerRight);
+
+    // Use a constant power panning law to calculate gain for left and right channels.
+    // Angle ranges from 0 (fully left) to PI/2 (fully right).
+    const angle = (pan + 1.0) * Math.PI / 4.0; // Map pan range [-1, 1] to angle [0, PI/2]
+    const leftGain = Math.cos(angle);
+    const rightGain = Math.sin(angle);
+
     return [leftGain, rightGain];
   }
 
-  private calculateRT60(rayHits: Array<{ time: number, energyLow: number, energyMid: number, energyHigh: number }>): number {
-    if (rayHits.length === 0) {
-        return 1.0; // Default RT60 if no hits
-    }
-
+  private calculateRT60(rayHits: RayHit[]): number {
+    if (rayHits.length === 0) return 1.0;
     // Sort hits by time
     const sortedHits = [...rayHits].sort((a, b) => a.time - b.time);
 
-    // Calculate energy decay curve
-    const times: number[] = [];
-    const energies: number[] = [];
-    let totalEnergy = 0;
-
-    sortedHits.forEach(hit => {
-        times.push(hit.time);
-        // Average energy across frequency bands
-        const avgEnergy = (hit.energyLow + hit.energyMid + hit.energyHigh) / 3;
-        totalEnergy += avgEnergy;
-        energies.push(totalEnergy);
-    });
-
-    // Normalize energies
-    const maxEnergy = Math.max(...energies);
-    const normalizedEnergies = energies.map(e => e / maxEnergy);
-
-    // Find -60dB point (energy = 0.001)
-    let rt60Time = times[times.length - 1]; // Default to last time
-    for (let i = 0; i < normalizedEnergies.length; i++) {
-        if (normalizedEnergies[i] <= 0.001) { // -60dB
-            rt60Time = times[i];
-            break;
-        }
+    // Schröder integration method for a more robust RT60 calculation from impulse data
+    const energyCurve = new Float32Array(sortedHits.length);
+    let totalEnergySum = 0;
+    for (let i = sortedHits.length - 1; i >= 0; i--) {
+        totalEnergySum += getTotalEnergy(sortedHits[i]);
+        energyCurve[i] = totalEnergySum;
     }
+    
+    if (totalEnergySum === 0) return 1.0; // No energy, can't calculate
 
-    // Apply Sabine's formula correction based on room volume and surface area
-    const volume = this.room.getVolume();
-    const surfaceArea = this.room.getSurfaceArea();
+    // Normalize to dB
+    const energyDB = energyCurve.map(e => 10 * Math.log10(e / totalEnergySum));
+    
+    // Find T20 or T30 using linear regression, which is more robust than finding a single point
+    const startIndex = energyDB.findIndex(db => db < -5);
+    const endIndex = energyDB.findIndex(db => db < -25);
+    
+    if (startIndex === -1 || endIndex === -1 || startIndex >= endIndex) return sortedHits[sortedHits.length - 1].time;
 
-    // Get average absorption coefficient
-    const avgAbsorption = this.calculateAverageAbsorption();
+    const times: number[] = sortedHits.slice(startIndex, endIndex).map(hit => hit.time);
+    const dbs: number[] = energyDB.slice(startIndex, endIndex);
 
-    // Sabine's formula: RT60 = 0.161 * V / (A * S)
-    // where V is volume, A is average absorption, S is surface area
-    const sabineRT60 = 0.161 * volume / (avgAbsorption * surfaceArea);
+    // Simple linear regression to find the slope
+    let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+    for (let i = 0; i < times.length; i++) {
+        sumX += times[i];
+        sumY += dbs[i];
+        sumXY += times[i] * dbs[i];
+        sumX2 += times[i] * times[i];
+    }
+    const n = times.length;
+    const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+    
+    if (slope >= 0) return sortedHits[sortedHits.length - 1].time; // No decay
 
-    // Blend measured and theoretical RT60
-    return (rt60Time + sabineRT60) / 2;
+    const rt60 = -60 / slope;
+    
+    return isFinite(rt60) ? rt60 : 2.0;
   }
 
   private calculateAverageAbsorption(): number {
     const materials = this.room.config.materials;
+    const { walls, ceiling, floor } = materials;
     let totalAbsorption = 0;
-    let count = 0;
+    const numBands = 8;
 
-    // Calculate average absorption across all surfaces and frequency bands
-    Object.values(materials).forEach(material => {
-        totalAbsorption += material.absorptionLow;
-        totalAbsorption += material.absorptionMid;
-        totalAbsorption += material.absorptionHigh;
-        count += 3; // Three frequency bands
-    });
+    const getAvg = (mat: any) => {
+        let sum = 0;
+        for (let i = 0; i < numBands; i++) {
+            sum += mat[`absorption${BAND_CENTERS[i]}`] || 0;
+        }
+        return sum / numBands;
+    };
+    
+    totalAbsorption += getAvg(walls);
+    totalAbsorption += getAvg(ceiling);
+    totalAbsorption += getAvg(floor);
 
-    return totalAbsorption / count;
+    return totalAbsorption / 3;
   }
 
-  private generateEnvelope(sampleCount: number, rayHits: any[]): Float32Array {
+  private generateEnvelope(sampleCount: number, rayHits: RayHit[]): Float32Array {
     const envelope = new Float32Array(sampleCount);
 
     // Calculate RT60 from ray hits
@@ -2675,48 +3552,76 @@ export class AudioProcessor {
         // Late reverberation
         else {
             // Use Schroeder decay curve instead of simple exponential
-            envelope[i] = Math.exp(-6.91 * t / rt60);
+            const decay = Math.exp(-6.91 * t / rt60);
+            // Blend from early to late
+            const blendFactor = Math.min(1.0, (t - 0.05) / 0.1);
+            envelope[i] = (1 - blendFactor) * Math.exp(-3 * t) + blendFactor * decay;
         }
     }
 
     return envelope;
   }
 
-  private normalizeAndApplyEnvelope(leftIR: Float32Array, rightIR: Float32Array, envelope: Float32Array): void {
-    // Find maximum amplitude
-    let maxAmplitude = 0;
-    for (let i = 0; i < leftIR.length; i++) {
-        maxAmplitude = Math.max(maxAmplitude, Math.abs(leftIR[i]), Math.abs(rightIR[i]));
-    }
+  private _calculateFrequencyDependentRT60(frequency: number): number {
+      const { materials, dimensions } = this.room.config;
+      const volume = dimensions.width * dimensions.height * dimensions.depth;
+      const surfaceArea = 2 * (dimensions.width * dimensions.height + dimensions.height * dimensions.depth + dimensions.width * dimensions.depth);
 
-    // Normalize and apply envelope
-    if (maxAmplitude > 0) {
-        for (let i = 0; i < leftIR.length; i++) {
-            leftIR[i] = (leftIR[i] / maxAmplitude) * envelope[i];
-            rightIR[i] = (rightIR[i] / maxAmplitude) * envelope[i];
-        }
-    }
+      if (surfaceArea === 0) return 1.0; // Avoid division by zero
+
+      const getAbsorptionForFreq = (mat: any, freq: number) => {
+          // Logarithmic interpolation between bands
+          const log_f = Math.log(freq);
+          const logCenters = BAND_CENTERS.map(f => Math.log(f));
+          const absorptions = BAND_CENTERS.map(band => mat[`absorption${band}`] || 0);
+
+          if (log_f <= logCenters[0]) return absorptions[0];
+          if (log_f >= logCenters[NUM_BANDS - 1]) return absorptions[NUM_BANDS - 1];
+          for (let i = 1; i < NUM_BANDS; i++) {
+              if (log_f < logCenters[i]) {
+                  const ratio = (log_f - logCenters[i - 1]) / (logCenters[i] - logCenters[i - 1]);
+                  return absorptions[i - 1] + ratio * (absorptions[i] - absorptions[i - 1]);
+              }
+          }
+          return absorptions[NUM_BANDS-1];
+      }
+
+      const avgAlpha = (
+          getAbsorptionForFreq(materials.walls, frequency) +
+          getAbsorptionForFreq(materials.ceiling, frequency) +
+          getAbsorptionForFreq(materials.floor, frequency)
+      ) / 3;
+
+      return (avgAlpha > 0) ? (0.161 * volume) / (surfaceArea * avgAlpha) : 10.0;
   }
 
   private calculateRoomModes(dimensions: { width: number, height: number, depth: number }): RoomMode[] {
     const modes: RoomMode[] = [];
-    // Calculate axial, tangential, and oblique modes
-    // Add to array with frequencies and decay times
-    return modes;
-  }
+    const speedOfSound = 343;
+    const { width, height, depth } = dimensions;
 
-  private addRoomModes(leftIR: Float32Array, rightIR: Float32Array, modes: RoomMode[]): void {
-    // Add modal resonances to the impulse response
-    modes.forEach(mode => {
-        const freq = mode.frequency;
-        const decay = Math.exp(-3 * mode.decayTime / mode.rt60);
+    if (width <= 0 || height <= 0 || depth <= 0) return []; // Prevent division by zero
 
-        for (let t = 0; t < leftIR.length; t++) {
-            const sample = decay * Math.sin(2 * Math.PI * freq * t / this.sampleRate);
-            leftIR[t] += sample;
-            rightIR[t] += sample;
+    const maxN = 5; // Check modes up to this index
+    for (let nx = 0; nx <= maxN; nx++) {
+        for (let ny = 0; ny <= maxN; ny++) {
+            for (let nz = 0; nz <= maxN; nz++) {
+                if (nx === 0 && ny === 0 && nz === 0) continue;
+
+                const freq = (speedOfSound / 2) * Math.sqrt(
+                    (nx / width) ** 2 + (ny / height) ** 2 + (nz / depth) ** 2
+                );
+
+                if (freq < 300 && freq > 20) { // Only consider dominant, audible low-frequency modes
+                    modes.push({ 
+                        frequency: freq, 
+                        rt60: this._calculateFrequencyDependentRT60(freq) 
+                    });
+                }
+            }
         }
-    });
+    }
+    return modes;
   }
 
   /**
@@ -2744,8 +3649,12 @@ export class AudioProcessor {
    * @param camera - The camera object to use for spatial audio processing.
    * @param maxTime - Maximum duration of the impulse response.
    */
-  async generateAndPlay(rayHits: Array<{ time: number; energyLow: number; energyMid: number; energyHigh: number }>, camera: Camera, maxTime: number = 0.5): Promise<void> {
-    await this.processRayHits(rayHits, camera, maxTime);
+  async generateAndPlay(rayHits: RayHit[], camera: Camera, maxTime: number = 2.0): Promise<void> {
+    await this.processRayHits(
+        rayHits,
+        camera, 
+        maxTime
+    );
     this.playAudio();
   }
 
@@ -2759,7 +3668,7 @@ export class AudioProcessor {
    */
   async playSoundWithImpulseResponse(duration: number = 0.1): Promise<void> {
     if (!this.impulseResponseBuffer) {
-        console.warn("AudioProcessor: No impulse response available for convolution.");
+        console.warn("AudioProcessor: No impulse response available forconvolution.");
         return;
     }
 
@@ -2917,6 +3826,10 @@ export class AudioProcessor {
    * Debug method to analyze impulse response characteristics
    */
   private debugImpulseResponse(leftIR: Float32Array, rightIR: Float32Array): void {
+    if (!leftIR || leftIR.length === 0) {
+        console.log("=== Impulse Response Debug: No data to analyze. ===");
+        return;
+    }
     // Calculate basic statistics
     const leftMax = Math.max(...leftIR);
     const leftMin = Math.min(...leftIR);
@@ -3076,34 +3989,47 @@ src\sound\spatial-audio-processor.ts:
 import { vec3 } from 'gl-matrix';
 import { Camera } from '../camera/camera';
 
+// Define the 8 frequency bands explicitly for clarity and consistency
+export const FREQUENCY_BANDS_8 = [63, 125, 250, 500, 1000, 2000, 4000, 8000] as const;
+export type FrequencyBandType = typeof FREQUENCY_BANDS_8[number];
+
+// Updated RayHit interface to use 8 bands
+interface RayHit {
+    position: vec3;
+    time: number;
+    energy: Record<FrequencyBandType, number>; // Use Record for structured access
+    bounces: number;
+    phase: number;        // Phase of the wave at hit point
+    frequency: number;    // Frequency of the primary ray (Hz)
+    dopplerShift: number; // Doppler shift factor
+}
+
+// Updated RoomAcoustics interface for 8 bands
 interface RoomAcoustics {
-    rt60Low: number;
-    rt60Mid: number;
-    rt60High: number;
-    airAbsorptionLow: number;
-    airAbsorptionMid: number;
-    airAbsorptionHigh: number;
+    rt60_63: number;
+    rt60_125: number;
+    rt60_250: number;
+    rt60_500: number;
+    rt60_1k: number;
+    rt60_2k: number;
+    rt60_4k: number;
+    rt60_8k: number;
+    airAbsorption_63: number;
+    airAbsorption_125: number;
+    airAbsorption_250: number;
+    airAbsorption_500: number;
+    airAbsorption_1k: number;
+    airAbsorption_2k: number;
+    airAbsorption_4k: number;
+    airAbsorption_8k: number;
     earlyReflectionTime: number;
     roomVolume: number;
     totalSurfaceArea: number;
 }
 
-interface RayHit {
-    position: vec3;
-    time: number;
-    energyLow: number;
-    energyMid: number;
-    energyHigh: number;
-    bounces: number;
-    phase: number;        // Phase of the wave at hit point
-    frequency: number;    // Frequency of the ray
-    dopplerShift: number; // Doppler shift at this point
-}
-
-interface WaveProperties {
-    phase: number;
-    frequency: number;
-    dopplerShift: number;
+// Assumes the Room type is defined elsewhere in the project
+interface Room {
+    acoustics: RoomAcoustics;
 }
 
 export class SpatialAudioProcessor {
@@ -3115,8 +4041,6 @@ export class SpatialAudioProcessor {
     private spatialIRBuffer!: GPUBuffer;
     private paramsBuffer: GPUBuffer;
     private acousticsBuffer: GPUBuffer;
-    private wavePropertiesBuffer: GPUBuffer;
-    private outputBuffer: GPUBuffer;
     private sampleRate: number;
     private readonly WORKGROUP_SIZE = 256;
 
@@ -3124,7 +4048,6 @@ export class SpatialAudioProcessor {
         this.device = device;
         this.sampleRate = sampleRate;
 
-        // Create uniform buffers with proper alignment and labels
         this.listenerBuffer = device.createBuffer({
             size: 64,  // 4 vec3f (16 bytes each)
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -3138,24 +4061,12 @@ export class SpatialAudioProcessor {
         });
 
         this.acousticsBuffer = device.createBuffer({
-            size: 128, // 32 floats * 4 bytes
+            // 8 RT60s + 8 Air Absorptions + 3 others = 19 floats. Padded to 80 bytes.
+            size: 80,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-            label: 'Room Acoustics Buffer'
+            label: 'Room Acoustics Buffer (8-Band)'
         });
 
-        this.wavePropertiesBuffer = device.createBuffer({
-            size: 16, // 4 floats * 4 bytes per wave property
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-            label: 'Wave Properties Buffer'
-        });
-
-        this.outputBuffer = device.createBuffer({
-            size: 16, // 4 floats * 4 bytes
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-            label: 'Output Buffer'
-        });
-
-        // Initialize the pipeline and other buffers
         this.initializeAsync();
     }
 
@@ -3164,6 +4075,7 @@ export class SpatialAudioProcessor {
     }
 
     private async createPipeline(): Promise<void> {
+        // NOTE: The accompanying WGSL shader must be updated to match these changes.
         const shaderModule = this.device.createShaderModule({
             code: await fetch('/src/raytracer/shaders/spatial_audio.wgsl').then(r => r.text()),
             label: 'Spatial Audio Shader'
@@ -3171,46 +4083,35 @@ export class SpatialAudioProcessor {
 
         const bindGroupLayout = this.device.createBindGroupLayout({
             entries: [
-                {
+                { // Listener data (camera pos, orientation)
                     binding: 0,
                     visibility: GPUShaderStage.COMPUTE,
-                    buffer: { type: 'uniform', minBindingSize: 64 }
+                    buffer: { type: 'uniform' }
                 },
-                {
+                { // Input ray hits from the ray tracer
                     binding: 1,
                     visibility: GPUShaderStage.COMPUTE,
                     buffer: { type: 'read-only-storage' }
                 },
-                {
+                { // Output impulse response data
                     binding: 2,
                     visibility: GPUShaderStage.COMPUTE,
-                    buffer: { type: 'storage', minBindingSize: 96 } // Updated size for RayHit with wave properties
+                    buffer: { type: 'storage' }
                 },
-                {
+                { // General audio parameters
                     binding: 3,
                     visibility: GPUShaderStage.COMPUTE,
-                    buffer: { type: 'uniform', minBindingSize: 48 }
+                    buffer: { type: 'uniform' }
                 },
-                {
+                { // Room acoustic properties (8-band)
                     binding: 4,
                     visibility: GPUShaderStage.COMPUTE,
-                    buffer: { type: 'uniform', minBindingSize: 108 }
-                },
-                {
-                    binding: 5,
-                    visibility: GPUShaderStage.COMPUTE,
-                    buffer: { type: 'read-only-storage', minBindingSize: 128 }
-                },
-                {
-                    binding: 6,
-                    visibility: GPUShaderStage.COMPUTE,
-                    buffer: { type: 'storage', minBindingSize: 16 }
+                    buffer: { type: 'uniform' }
                 }
             ],
             label: 'Spatial Audio Bind Group Layout'
         });
 
-        // Create pipeline layout and compute pipeline
         const pipelineLayout = this.device.createPipelineLayout({
             bindGroupLayouts: [bindGroupLayout],
             label: 'Spatial Audio Pipeline Layout'
@@ -3227,13 +4128,11 @@ export class SpatialAudioProcessor {
     }
 
     private createOrResizeBuffers(hitCount: number): void {
-        // Calculate buffer sizes with proper alignment
-        const rayHitSize = 80; // Size of RayHit struct in shader (20 floats * 4 bytes)
-        const rayHitsSize = Math.max(hitCount * rayHitSize, rayHitSize);
-        const wavePropsSize = Math.max(hitCount * 16, 16); // 4 floats * 4 bytes per wave property
+        // Size of RayHit struct in shader: 16 floats * 4 bytes/float = 64 bytes
+        const rayHitStructSize = 64;
+        const rayHitsSize = Math.max(hitCount * rayHitStructSize, rayHitStructSize);
         const spatialIRSize = Math.max(hitCount * 16, 16); // vec4f per hit
 
-        // Create or resize ray hits buffer
         if (!this.rayHitsBuffer || this.rayHitsBuffer.size < rayHitsSize) {
             if (this.rayHitsBuffer) this.rayHitsBuffer.destroy();
             this.rayHitsBuffer = this.device.createBuffer({
@@ -3243,17 +4142,6 @@ export class SpatialAudioProcessor {
             });
         }
 
-        // Create or resize wave properties buffer
-        if (!this.wavePropertiesBuffer || this.wavePropertiesBuffer.size < wavePropsSize) {
-            if (this.wavePropertiesBuffer) this.wavePropertiesBuffer.destroy();
-            this.wavePropertiesBuffer = this.device.createBuffer({
-                size: wavePropsSize,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-                label: 'Wave Properties Buffer'
-            });
-        }
-
-        // Create or resize spatial IR buffer
         if (!this.spatialIRBuffer || this.spatialIRBuffer.size < spatialIRSize) {
             if (this.spatialIRBuffer) this.spatialIRBuffer.destroy();
             this.spatialIRBuffer = this.device.createBuffer({
@@ -3262,8 +4150,7 @@ export class SpatialAudioProcessor {
                 label: 'Spatial IR Buffer'
             });
 
-            // Initialize spatialIR buffer with zeros
-            const zeros = new Float32Array(hitCount * 4); // vec4f per hit
+            const zeros = new Float32Array(hitCount * 4);
             this.device.queue.writeBuffer(this.spatialIRBuffer, 0, zeros);
         }
 
@@ -3279,8 +4166,6 @@ export class SpatialAudioProcessor {
                 { binding: 2, resource: { buffer: this.spatialIRBuffer } },
                 { binding: 3, resource: { buffer: this.paramsBuffer } },
                 { binding: 4, resource: { buffer: this.acousticsBuffer } },
-                { binding: 5, resource: { buffer: this.wavePropertiesBuffer } },
-                { binding: 6, resource: { buffer: this.outputBuffer } }
             ],
             label: 'Spatial Audio Bind Group'
         });
@@ -3288,155 +4173,91 @@ export class SpatialAudioProcessor {
 
     public async processSpatialAudio(
         camera: Camera,
-        rayHits: Array<{
-            position: vec3;
-            time: number;
-            energyLow: number;
-            energyMid: number;
-            energyHigh: number;
-            phase: number;
-            frequency: number;
-            dopplerShift: number
-        }>,
+        rayHits: Array<RayHit>,
         params: any,
         room: Room
     ): Promise<[Float32Array, Float32Array]> {
-        if (rayHits.length === 0) {
+        if (!rayHits || rayHits.length === 0) {
             console.warn('No ray hits to process');
             return [new Float32Array(0), new Float32Array(0)];
         }
 
-        // Verify ray hit data
-        console.log(`Processing ${rayHits.length} ray hits`);
-        console.log('Sample ray hit:', rayHits[0]);
-
-        // Ensure buffers are properly sized
         this.createOrResizeBuffers(rayHits.length);
 
-        // Prepare ray hits data
-        const rayHitsData = new Float32Array(rayHits.length * 20);
-        const wavePropsData = new Float32Array(rayHits.length * 4);
+        // Prepare ray hits data for the GPU buffer (16 floats per hit)
+        const rayHitsData = new Float32Array(rayHits.length * 16);
 
-        // Fill ray hits and wave properties data with validation
         rayHits.forEach((hit, i) => {
-            const baseIndex = i * 20;
+            const baseIndex = i * 16;
             
-            // Validate position
             const position = hit.position || vec3.create();
             rayHitsData[baseIndex] = position[0];
             rayHitsData[baseIndex + 1] = position[1];
             rayHitsData[baseIndex + 2] = position[2];
             
-            // Validate time
             rayHitsData[baseIndex + 3] = Math.max(hit.time || 0, 0);
-            
-            // Calculate and validate energy values
-            const maxEnergy = Math.max(
-                Math.max(hit.energyLow || 0, hit.energyMid || 0),
-                hit.energyHigh || 0
-            );
-            
-            if (maxEnergy === 0) {
-                console.warn(`Ray hit ${i} has zero energy`);
-            }
 
-            // Store energy values
-            rayHitsData[baseIndex + 7] = maxEnergy;
-            
-            // Store frequency bands with validation
-            rayHitsData[baseIndex + 8] = Math.max(hit.energyLow || 0, 0);
-            rayHitsData[baseIndex + 9] = Math.max(hit.energyLow * 0.8 + (hit.energyMid || 0) * 0.2, 0);
-            rayHitsData[baseIndex + 10] = Math.max(hit.energyLow * 0.7 + (hit.energyMid || 0) * 0.3, 0);
-            rayHitsData[baseIndex + 11] = Math.max(hit.energyMid || 0, 0);
-            rayHitsData[baseIndex + 12] = Math.max(hit.energyMid || 0, 0);
-            rayHitsData[baseIndex + 13] = Math.max((hit.energyMid || 0) * 0.3 + (hit.energyHigh || 0) * 0.7, 0);
-            rayHitsData[baseIndex + 14] = Math.max((hit.energyHigh || 0) * 0.8 + (hit.energyMid || 0) * 0.2, 0);
-            rayHitsData[baseIndex + 15] = Math.max(hit.energyHigh || 0, 0);
+            // Pack 8 energy bands, ensuring order matches FREQUENCY_BANDS_8
+            FREQUENCY_BANDS_8.forEach((band, bandIndex) => {
+                rayHitsData[baseIndex + 4 + bandIndex] = Math.max(hit.energy?.[band] || 0, 0);
+            });
 
-            // Store wave properties with validation
-            rayHitsData[baseIndex + 16] = hit.phase || 0;
-            rayHitsData[baseIndex + 17] = Math.max(hit.frequency || 440, 20); // Minimum 20Hz
-            rayHitsData[baseIndex + 18] = Math.max(hit.dopplerShift || 1, 0.1); // Minimum 0.1
-            rayHitsData[baseIndex + 19] = 1.0;
-
-            // Store wave properties in separate buffer
-            const waveBaseIndex = i * 4;
-            wavePropsData[waveBaseIndex] = hit.phase || 0;
-            wavePropsData[waveBaseIndex + 1] = Math.max(hit.frequency || 440, 20);
-            wavePropsData[waveBaseIndex + 2] = Math.max(hit.dopplerShift || 1, 0.1);
-            wavePropsData[waveBaseIndex + 3] = 1.0;
+            rayHitsData[baseIndex + 12] = hit.bounces || 0;
+            rayHitsData[baseIndex + 13] = hit.phase || 0;
+            rayHitsData[baseIndex + 14] = Math.max(hit.frequency || 440, 20);
+            rayHitsData[baseIndex + 15] = Math.max(hit.dopplerShift || 1, 0.1);
         });
 
-        // Write validated data to GPU buffers
         this.device.queue.writeBuffer(this.rayHitsBuffer, 0, rayHitsData);
-        this.device.queue.writeBuffer(this.wavePropertiesBuffer, 0, wavePropsData);
 
-        // Update listener data
         const front = camera.getFront();
-        const forward = new Float32Array([front[0], front[1], front[2]]);
         const position = camera.getPosition();
         const up = camera.getUp();
         
-        // Calculate right vector as cross product of front and up
         const right = vec3.create();
         vec3.cross(right, front, up);
         vec3.normalize(right, right);
         
         const listenerData = new Float32Array([
-            position[0], position[1], position[2],
-            0, // padding
-            forward[0], forward[1], forward[2],
-            0, // padding
-            up[0], up[1], up[2],
-            0, // padding
-            right[0], right[1], right[2],
-            0  // padding
+            position[0], position[1], position[2], 0,
+            front[0],    front[1],    front[2],    0,
+            up[0],       up[1],       up[2],       0,
+            right[0],    right[1],    right[2],    0
         ]);
         this.device.queue.writeBuffer(this.listenerBuffer, 0, listenerData);
 
-        // Create command encoder and pass
         const commandEncoder = this.device.createCommandEncoder();
         const computePass = commandEncoder.beginComputePass();
-
         computePass.setPipeline(this.computePipeline);
         computePass.setBindGroup(0, this.bindGroup);
 
-        // Dispatch workgroups
         const workgroupCount = Math.ceil(rayHits.length / this.WORKGROUP_SIZE);
         computePass.dispatchWorkgroups(workgroupCount);
         computePass.end();
 
-        // Create buffer for reading results
         const readbackBuffer = this.device.createBuffer({
-            size: rayHits.length * 16, // vec4f per hit
+            size: this.spatialIRBuffer.size,
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
         });
 
-        // Copy results to readback buffer
         commandEncoder.copyBufferToBuffer(
-            this.spatialIRBuffer,
-            0,
-            readbackBuffer,
-            0,
-            rayHits.length * 16
+            this.spatialIRBuffer, 0,
+            readbackBuffer, 0,
+            this.spatialIRBuffer.size
         );
 
-        // Submit commands
         this.device.queue.submit([commandEncoder.finish()]);
 
-        // Read results
         await readbackBuffer.mapAsync(GPUMapMode.READ);
-        const results = new Float32Array(readbackBuffer.getMappedRange());
+        const resultsData = new Float32Array(readbackBuffer.getMappedRange());
 
-        // Separate left and right channels
         const leftChannel = new Float32Array(rayHits.length);
         const rightChannel = new Float32Array(rayHits.length);
         for (let i = 0; i < rayHits.length; i++) {
-            leftChannel[i] = results[i * 4];
-            rightChannel[i] = results[i * 4 + 1];
+            leftChannel[i] = resultsData[i * 4];
+            rightChannel[i] = resultsData[i * 4 + 1];
         }
 
-        // Cleanup
         readbackBuffer.unmap();
         readbackBuffer.destroy();
 
@@ -3795,15 +4616,17 @@ export class WaveformRenderer {
 src\main.ts:
 <code>
 import { Room, RoomConfig } from './room/room';
+import { ROOM_PRESETS, RoomPreset } from './room/room-presets';
 import { Surface } from './room/types';
 import { Camera } from './camera/camera';
 import { vec3 } from 'gl-matrix';
 import * as dat from 'dat.gui';
 import { Sphere } from './objects/sphere';
 import { SphereRenderer } from './objects/sphere-renderer';
-import { RayTracer } from './raytracer/raytracer';
+import { RayTracer, RayHit } from './raytracer/raytracer';
 import { AudioProcessor } from './sound/audio-processor';
 import { WaveformRenderer } from './visualization/waveform-renderer';
+import { DEFAULT_WALL_MATERIAL } from './room/room';
 
 export class Main {
     private canvas: HTMLCanvasElement;
@@ -3817,6 +4640,11 @@ export class Main {
     private gui: dat.GUI;
     private sphere: Sphere;
     private sphereRenderer: SphereRenderer;
+    private roomDimensionControllers: {
+        width: dat.GUIController;
+        height: dat.GUIController;
+        depth: dat.GUIController;
+    };
     private sourceControllers: {
         x: dat.GUIController;
         y: dat.GUIController;
@@ -3826,7 +4654,8 @@ export class Main {
     private audioProcessor: AudioProcessor;
     private waveformRenderer: WaveformRenderer;
     private sourceParams = {
-        sourcePower: 0
+        // Change sourcePower to a more realistic default, e.g., 90 dB SPL (a loud shout)
+        sourcePower: 90
     };
     private soundFileParams = {
         selectedFile: 'loop.mp3',
@@ -3847,31 +4676,14 @@ export class Main {
             alphaMode: 'premultiplied',
         });
 
-        // Initialize room config
+        // Initialize room config with a default preset
+        const defaultPreset = ROOM_PRESETS.RECORDING_STUDIO;
         this.roomConfig = {
-            dimensions: { width: 8, height: 3, depth: 5 },
+            dimensions: { ...defaultPreset.dimensions },
             materials: {
-                walls: {
-                    absorption: 0.1,
-                    absorptionLow: 0.15,
-                    absorptionMid: 0.1,
-                    absorptionHigh: 0.05,
-                    scattering: 0.1
-                },
-                ceiling: {
-                    absorption: 0.2,
-                    absorptionLow: 0.25,
-                    absorptionMid: 0.2,
-                    absorptionHigh: 0.15,
-                    scattering: 0.1
-                },
-                floor: {
-                    absorption: 0.1,
-                    absorptionLow: 0.15,
-                    absorptionMid: 0.1,
-                    absorptionHigh: 0.05,
-                    scattering: 0.2
-                }
+                walls: { ...DEFAULT_WALL_MATERIAL, ...defaultPreset.materials.walls },
+                ceiling: { ...DEFAULT_WALL_MATERIAL, ...defaultPreset.materials.ceiling },
+                floor: { ...DEFAULT_WALL_MATERIAL, ...defaultPreset.materials.floor }
             }
         };
 
@@ -3928,16 +4740,33 @@ export class Main {
     private setupDebugUI(): void {
         this.gui = new dat.GUI();
 
+        const roomPresetNames = Object.keys(ROOM_PRESETS);
+        const roomPresetParams = {
+            selectedPreset: 'RECORDING_STUDIO' // Default preset
+        };
+
+        const roomPresetsFolder = this.gui.addFolder('Room Presets');
+        roomPresetsFolder.add(roomPresetParams, 'selectedPreset', roomPresetNames)
+            .name('Select Preset')
+            .onChange((presetName: string) => {
+                const preset = ROOM_PRESETS[presetName];
+                if (preset) {
+                    this.applyRoomPreset(preset);
+                }
+            });
+        roomPresetsFolder.open();
+
         const roomFolder = this.gui.addFolder('Room Dimensions');
-        roomFolder.add(this.roomConfig.dimensions, 'width', 2, 20).onChange(() => this.updateRoom());
-        roomFolder.add(this.roomConfig.dimensions, 'height', 2, 10).onChange(() => this.updateRoom());
-        roomFolder.add(this.roomConfig.dimensions, 'depth', 2, 20).onChange(() => this.updateRoom());
+        this.roomDimensionControllers = {
+            width: roomFolder.add(this.roomConfig.dimensions, 'width', 2, 60).onChange(() => this.updateRoom()),
+            height: roomFolder.add(this.roomConfig.dimensions, 'height', 2, 60).onChange(() => this.updateRoom()),
+            depth: roomFolder.add(this.roomConfig.dimensions, 'depth', 2, 60).onChange(() => this.updateRoom())
+        };
 
         const materialsFolder = this.gui.addFolder('Materials');
-        materialsFolder.add(this.roomConfig.materials.walls, 'absorption', 0, 1);
-        materialsFolder.add(this.roomConfig.materials.ceiling, 'absorption', 0, 1);
-        materialsFolder.add(this.roomConfig.materials.floor, 'absorption', 0, 1);
-
+        materialsFolder.add(this.room.config.materials.walls, 'absorption1k', 0, 1, 0.01).name('Walls Abs (1k)').onChange(() => this.updateRoom());
+        materialsFolder.add(this.room.config.materials.walls, 'scattering1k', 0, 1, 0.01).name('Walls Scat (1k)').onChange(() => this.updateRoom());
+        
         // Create a data object for the sound source position
         const sourcePosition = {
             x: 0,
@@ -3970,16 +4799,12 @@ export class Main {
                 })
         };
 
-        // Add source power control
-        sourceFolder.add(this.sourceParams, 'sourcePower', -60, 20)
-            .name('Power (dB)')
-            .onChange((value: number) => {
-                this.sourceParams = {
-                    ...this.sourceParams,
-                    sourcePower: value
-                };
-                // Recalculate IR when power changes
-                this.calculateIR();
+        // Update the source power controller with a realistic range
+        sourceFolder.add(this.sourceParams, 'sourcePower', 60, 120) // 60dB (conversation) to 120dB (pain threshold)
+            .name('Power (dB SPL)')
+            .onChange(() => {
+                // No need to immediately recalculate, it will be used on the next "Calculate IR" press
+                console.log(`Source power set to: ${this.sourceParams.sourcePower} dB`);
             });
 
         // Add ray tracing controls
@@ -3989,7 +4814,7 @@ export class Main {
                 await this.calculateIR();
             }
         };
-        rayTracingFolder.add(rayTracingControls, 'calculateIR').name('Calculate IR');
+        rayTracingFolder.add(rayTracingControls, 'calculateIR').name('Calculate & Visualize IR');
 
         // --- Audio Debug Controls ---
         const audioFolder = this.gui.addFolder('Audio Debug');
@@ -4004,7 +4829,7 @@ export class Main {
         const soundFileFolder = this.gui.addFolder('Sound Files');
 
         // ADD YOUR MP3 FILE HERE
-        soundFileFolder.add(this.soundFileParams, 'selectedFile', ['loop.mp3', 'snare.mp3', 'top_loop.mp3'])
+        soundFileFolder.add(this.soundFileParams, 'selectedFile', ['loop.mp3', 'snare.mp3', 'top_loop.mp3','KoolTheGang-Summertime_MONO.mp3'])
             .name('Select Sound')
             .onChange((value: string) => {
                 this.soundFileParams.selectedFile = value;
@@ -4035,23 +4860,38 @@ export class Main {
     }
 
     private updateRoom(): void {
-        // Recreate room with new dimensions
+        // Recreate room with new dimensions and materials
         this.room = new Room(this.device, this.roomConfig);
 
         // Ensure camera stays within room bounds
         this.constrainCamera();
 
         // Update source position slider ranges
-        this.sourceControllers.x.min(-this.roomConfig.dimensions.width/2)
-            .max(this.roomConfig.dimensions.width/2);
-        this.sourceControllers.y.min(0).max(this.roomConfig.dimensions.height);
-        this.sourceControllers.z.min(-this.roomConfig.dimensions.depth/2)
-            .max(this.roomConfig.dimensions.depth/2);
+        this.sourceControllers.x.min(-this.roomConfig.dimensions.width/2 + 0.2)
+            .max(this.roomConfig.dimensions.width/2 - 0.2);
+        this.sourceControllers.y.min(0.2).max(this.roomConfig.dimensions.height - 0.2);
+        this.sourceControllers.z.min(-this.roomConfig.dimensions.depth/2 + 0.2)
+            .max(this.roomConfig.dimensions.depth/2 - 0.2);
 
         // Keep sphere at current position unless it's outside new bounds
         const currentPos = this.sphere.getPosition();
         const validPos = this.room.getClosestValidPosition(currentPos);
         this.sphere.setPosition(validPos);
+    }
+
+    private applyRoomPreset(preset: RoomPreset): void {
+        this.roomConfig.dimensions = { ...preset.dimensions };
+        this.roomConfig.materials.walls = { ...DEFAULT_WALL_MATERIAL, ...preset.materials.walls };
+        this.roomConfig.materials.ceiling = { ...DEFAULT_WALL_MATERIAL, ...preset.materials.ceiling };
+        this.roomConfig.materials.floor = { ...DEFAULT_WALL_MATERIAL, ...preset.materials.floor };
+        
+        // Update the GUI display to reflect the new preset values
+        for (const i in this.roomDimensionControllers) {
+            (this.roomDimensionControllers as any)[i].updateDisplay();
+        }
+        this.gui.updateDisplay(); // Update all controllers
+
+        this.updateRoom();
     }
 
     private constrainCamera(): void {
@@ -4110,28 +4950,24 @@ export class Main {
         if (this.keys['a']) this.camera.moveRight(-deltaTime);
         if (this.keys['d']) this.camera.moveRight(deltaTime);
         if (this.keys[' ']) this.camera.moveUp(deltaTime);
-        if (this.keys['shift']) this.camera.moveUp(-deltaTime);
+        if (this.keys['c']) this.camera.moveUp(-deltaTime); // Use C for down to avoid conflict with Shift
     }
 
     public render(deltaTime: number): void {
         // Handle input
         this.handleInput(deltaTime);
+        this.constrainCamera(); // Constrain camera after input handling
 
         // Update room's view projection with camera
         const aspect = this.canvas.width / this.canvas.height;
         const viewProjection = this.camera.getViewProjection(aspect);
-        this.device.queue.writeBuffer(
-            this.room['uniformBuffer'], // Accessing private member, might need to add a public method
-            0,
-            viewProjection as Float32Array
-        );
-
+        
         // Begin render pass
         const commandEncoder = this.device.createCommandEncoder();
         const renderPass = commandEncoder.beginRenderPass({
             colorAttachments: [{
                 view: this.context.getCurrentTexture().createView(),
-                clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+                clearValue: { r: 0.05, g: 0.05, b: 0.1, a: 1.0 },
                 loadOp: 'clear',
                 storeOp: 'store',
             }],
@@ -4176,12 +5012,13 @@ export class Main {
     }
 
     private async calculateIR(): Promise<void> {
-        await this.rayTracer.calculateRayPaths();
+        // This now correctly uses the camera's current position at the time of the button press.
+        await this.rayTracer.calculateRayPaths(this.camera);
         const hits = this.rayTracer.getRayHits();
         await this.audioProcessor.processRayHits(
             hits,
             this.camera,
-            0.5,
+            2.0, // IR duration
             {
                 speedOfSound: 343,
                 maxDistance: 20,
@@ -4202,7 +5039,7 @@ export class Main {
             this.stopSound();
 
             // Load and play the selected sound file
-            const soundPath = `src/soundfile/${this.soundFileParams.selectedFile}`;
+            const soundPath = `/soundfile/${this.soundFileParams.selectedFile}`;
             await this.audioProcessor.loadAndPlaySoundFile(soundPath);
 
             this.soundFileParams.isPlaying = true;
@@ -4221,8 +5058,6 @@ export class Main {
             console.error('Error stopping sound:', error);
         }
     }
-
-
 }
 
 // Animation loop

@@ -35,6 +35,27 @@ export interface RoomPreset {
   };
 }
 
+// Helper to create 8-band properties from 3-band
+const createBands = (low: number, mid: number, high: number) => ({
+    absorption63: low,
+    absorption125: low,
+    absorption250: (low + mid) / 2,
+    absorption500: mid,
+    absorption1k: mid,
+    absorption2k: (mid + high) / 2,
+    absorption4k: high,
+    absorption8k: high,
+    
+    scattering63: low,
+    scattering125: low,
+    scattering250: (low + mid) / 2,
+    scattering500: mid,
+    scattering1k: mid,
+    scattering2k: (mid + high) / 2,
+    scattering4k: high,
+    scattering8k: high
+});
+
 // Export all room presets
 export const ROOM_PRESETS: { [key: string]: RoomPreset } = {
   /**
@@ -51,34 +72,19 @@ export const ROOM_PRESETS: { [key: string]: RoomPreset } = {
     },
     materials: {
       walls: {
-        absorptionLow: 0.05,
-        absorptionMid: 0.04,
-        absorptionHigh: 0.03,
-        scatteringLow: 0.1,
-        scatteringMid: 0.15,
-        scatteringHigh: 0.2,
+        ...createBands(0.05, 0.04, 0.03),
         roughness: 0.3,
         phaseShift: 0.0,
         phaseRandomization: 0.1
       },
       ceiling: {
-        absorptionLow: 0.04,
-        absorptionMid: 0.03,
-        absorptionHigh: 0.02,
-        scatteringLow: 0.1,
-        scatteringMid: 0.15,
-        scatteringHigh: 0.2,
+        ...createBands(0.04, 0.03, 0.02),
         roughness: 0.35,
         phaseShift: 0.0,
         phaseRandomization: 0.1
       },
       floor: {
-        absorptionLow: 0.1,
-        absorptionMid: 0.08,
-        absorptionHigh: 0.06,
-        scatteringLow: 0.2,
-        scatteringMid: 0.25,
-        scatteringHigh: 0.3,
+        ...createBands(0.1, 0.08, 0.06),
         roughness: 0.25,
         phaseShift: 0.0,
         phaseRandomization: 0.1
@@ -107,34 +113,28 @@ export const ROOM_PRESETS: { [key: string]: RoomPreset } = {
     },
     materials: {
       walls: {
-        absorptionLow: 0.3,
-        absorptionMid: 0.6,
-        absorptionHigh: 0.8,
-        scatteringLow: 0.4,
-        scatteringMid: 0.6,
-        scatteringHigh: 0.8,
+        absorption63: 0.3, absorption125: 0.4, absorption250: 0.5, absorption500: 0.6,
+        absorption1k: 0.7, absorption2k: 0.8, absorption4k: 0.8, absorption8k: 0.8,
+        scattering63: 0.4, scattering125: 0.5, scattering250: 0.6, scattering500: 0.6,
+        scattering1k: 0.7, scattering2k: 0.8, scattering4k: 0.8, scattering8k: 0.8,
         roughness: 0.6,
         phaseShift: 0.0,
         phaseRandomization: 0.2
       },
       ceiling: {
-        absorptionLow: 0.25,
-        absorptionMid: 0.5,
-        absorptionHigh: 0.7,
-        scatteringLow: 0.3,
-        scatteringMid: 0.5,
-        scatteringHigh: 0.7,
+        absorption63: 0.25, absorption125: 0.35, absorption250: 0.45, absorption500: 0.5,
+        absorption1k: 0.6, absorption2k: 0.7, absorption4k: 0.7, absorption8k: 0.7,
+        scattering63: 0.3, scattering125: 0.4, scattering250: 0.5, scattering500: 0.5,
+        scattering1k: 0.6, scattering2k: 0.7, scattering4k: 0.7, scattering8k: 0.7,
         roughness: 0.5,
         phaseShift: 0.0,
         phaseRandomization: 0.2
       },
       floor: {
-        absorptionLow: 0.15,
-        absorptionMid: 0.2,
-        absorptionHigh: 0.3,
-        scatteringLow: 0.2,
-        scatteringMid: 0.3,
-        scatteringHigh: 0.4,
+        absorption63: 0.15, absorption125: 0.18, absorption250: 0.2, absorption500: 0.25,
+        absorption1k: 0.3, absorption2k: 0.3, absorption4k: 0.3, absorption8k: 0.3,
+        scattering63: 0.2, scattering125: 0.25, scattering250: 0.3, scattering500: 0.3,
+        scattering1k: 0.35, scattering2k: 0.4, scattering4k: 0.4, scattering8k: 0.4,
         roughness: 0.3,
         phaseShift: 0.0,
         phaseRandomization: 0.1
@@ -163,34 +163,19 @@ export const ROOM_PRESETS: { [key: string]: RoomPreset } = {
     },
     materials: {
       walls: {
-        absorptionLow: 0.15,
-        absorptionMid: 0.12,
-        absorptionHigh: 0.1,
-        scatteringLow: 0.3,
-        scatteringMid: 0.4,
-        scatteringHigh: 0.5,
+        ...createBands(0.15, 0.12, 0.1),
         roughness: 0.45,
         phaseShift: 0.0,
         phaseRandomization: 0.15
       },
       ceiling: {
-        absorptionLow: 0.12,
-        absorptionMid: 0.1,
-        absorptionHigh: 0.08,
-        scatteringLow: 0.25,
-        scatteringMid: 0.35,
-        scatteringHigh: 0.45,
+        ...createBands(0.12, 0.1, 0.08),
         roughness: 0.4,
         phaseShift: 0.0,
         phaseRandomization: 0.15
       },
       floor: {
-        absorptionLow: 0.2,
-        absorptionMid: 0.18,
-        absorptionHigh: 0.15,
-        scatteringLow: 0.35,
-        scatteringMid: 0.45,
-        scatteringHigh: 0.55,
+        ...createBands(0.2, 0.18, 0.15),
         roughness: 0.4,
         phaseShift: 0.0,
         phaseRandomization: 0.15
@@ -219,34 +204,19 @@ export const ROOM_PRESETS: { [key: string]: RoomPreset } = {
     },
     materials: {
       walls: {
-        absorptionLow: 0.25,
-        absorptionMid: 0.4,
-        absorptionHigh: 0.6,
-        scatteringLow: 0.35,
-        scatteringMid: 0.5,
-        scatteringHigh: 0.7,
+        ...createBands(0.25, 0.4, 0.6),
         roughness: 0.5,
         phaseShift: 0.0,
         phaseRandomization: 0.15
       },
       ceiling: {
-        absorptionLow: 0.2,
-        absorptionMid: 0.35,
-        absorptionHigh: 0.5,
-        scatteringLow: 0.3,
-        scatteringMid: 0.45,
-        scatteringHigh: 0.6,
+        ...createBands(0.2, 0.35, 0.5),
         roughness: 0.45,
         phaseShift: 0.0,
         phaseRandomization: 0.15
       },
       floor: {
-        absorptionLow: 0.1,
-        absorptionMid: 0.15,
-        absorptionHigh: 0.2,
-        scatteringLow: 0.2,
-        scatteringMid: 0.25,
-        scatteringHigh: 0.3,
+        ...createBands(0.1, 0.15, 0.2),
         roughness: 0.3,
         phaseShift: 0.0,
         phaseRandomization: 0.1
@@ -275,34 +245,19 @@ export const ROOM_PRESETS: { [key: string]: RoomPreset } = {
     },
     materials: {
       walls: {
-        absorptionLow: 0.15,
-        absorptionMid: 0.3,
-        absorptionHigh: 0.4,
-        scatteringLow: 0.3,
-        scatteringMid: 0.4,
-        scatteringHigh: 0.5,
+        ...createBands(0.15, 0.3, 0.4),
         roughness: 0.4,
         phaseShift: 0.0,
         phaseRandomization: 0.1
       },
       ceiling: {
-        absorptionLow: 0.2,
-        absorptionMid: 0.4,
-        absorptionHigh: 0.6,
-        scatteringLow: 0.35,
-        scatteringMid: 0.5,
-        scatteringHigh: 0.65,
+        ...createBands(0.2, 0.4, 0.6),
         roughness: 0.5,
         phaseShift: 0.0,
         phaseRandomization: 0.1
       },
       floor: {
-        absorptionLow: 0.1,
-        absorptionMid: 0.15,
-        absorptionHigh: 0.2,
-        scatteringLow: 0.2,
-        scatteringMid: 0.25,
-        scatteringHigh: 0.3,
+        ...createBands(0.1, 0.15, 0.2),
         roughness: 0.3,
         phaseShift: 0.0,
         phaseRandomization: 0.1
@@ -331,34 +286,19 @@ export const ROOM_PRESETS: { [key: string]: RoomPreset } = {
     },
     materials: {
       walls: {
-        absorptionLow: 0.02,
-        absorptionMid: 0.02,
-        absorptionHigh: 0.03,
-        scatteringLow: 0.1,
-        scatteringMid: 0.15,
-        scatteringHigh: 0.2,
+        ...createBands(0.02, 0.02, 0.03),
         roughness: 0.25,
         phaseShift: 0.0,
         phaseRandomization: 0.05
       },
       ceiling: {
-        absorptionLow: 0.05,
-        absorptionMid: 0.05,
-        absorptionHigh: 0.06,
-        scatteringLow: 0.15,
-        scatteringMid: 0.2,
-        scatteringHigh: 0.25,
+        ...createBands(0.05, 0.05, 0.06),
         roughness: 0.3,
         phaseShift: 0.0,
         phaseRandomization: 0.05
       },
       floor: {
-        absorptionLow: 0.03,
-        absorptionMid: 0.03,
-        absorptionHigh: 0.04,
-        scatteringLow: 0.12,
-        scatteringMid: 0.18,
-        scatteringHigh: 0.22,
+        ...createBands(0.03, 0.03, 0.04),
         roughness: 0.28,
         phaseShift: 0.0,
         phaseRandomization: 0.05
@@ -387,34 +327,19 @@ export const ROOM_PRESETS: { [key: string]: RoomPreset } = {
     },
     materials: {
       walls: {
-        absorptionLow: 0.1,
-        absorptionMid: 0.08,
-        absorptionHigh: 0.06,
-        scatteringLow: 0.25,
-        scatteringMid: 0.35,
-        scatteringHigh: 0.45,
+        ...createBands(0.1, 0.08, 0.06),
         roughness: 0.4,
         phaseShift: 0.0,
         phaseRandomization: 0.1
       },
       ceiling: {
-        absorptionLow: 0.08,
-        absorptionMid: 0.06,
-        absorptionHigh: 0.05,
-        scatteringLow: 0.2,
-        scatteringMid: 0.3,
-        scatteringHigh: 0.4,
+        ...createBands(0.08, 0.06, 0.05),
         roughness: 0.35,
         phaseShift: 0.0,
         phaseRandomization: 0.1
       },
       floor: {
-        absorptionLow: 0.15,
-        absorptionMid: 0.12,
-        absorptionHigh: 0.1,
-        scatteringLow: 0.3,
-        scatteringMid: 0.4,
-        scatteringHigh: 0.5,
+        ...createBands(0.15, 0.12, 0.1),
         roughness: 0.45,
         phaseShift: 0.0,
         phaseRandomization: 0.1
@@ -443,34 +368,19 @@ export const ROOM_PRESETS: { [key: string]: RoomPreset } = {
     },
     materials: {
       walls: {
-        absorptionLow: 0.95,
-        absorptionMid: 0.98,
-        absorptionHigh: 0.99,
-        scatteringLow: 0.9,
-        scatteringMid: 0.95,
-        scatteringHigh: 0.98,
+        ...createBands(0.95, 0.98, 0.99),
         roughness: 0.9,
         phaseShift: 0.0,
         phaseRandomization: 0.3
       },
       ceiling: {
-        absorptionLow: 0.95,
-        absorptionMid: 0.98,
-        absorptionHigh: 0.99,
-        scatteringLow: 0.9,
-        scatteringMid: 0.95,
-        scatteringHigh: 0.98,
+        ...createBands(0.95, 0.98, 0.99),
         roughness: 0.9,
         phaseShift: 0.0,
         phaseRandomization: 0.3
       },
       floor: {
-        absorptionLow: 0.95,
-        absorptionMid: 0.98,
-        absorptionHigh: 0.99,
-        scatteringLow: 0.9,
-        scatteringMid: 0.95,
-        scatteringHigh: 0.98,
+        ...createBands(0.95, 0.98, 0.99),
         roughness: 0.9,
         phaseShift: 0.0,
         phaseRandomization: 0.3
